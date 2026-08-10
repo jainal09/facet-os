@@ -580,7 +580,8 @@ static bool pmu_pwrkey_pressed(void) {
 #define QMI_REG_CTRL2    0x03
 #define QMI_REG_CTRL7    0x08
 #define QMI_REG_AX_L     0x35
-#define QMI_TILT_TH      6500      /* ~0.26 g at 16384 LSB/g */
+#define QMI_TILT_TH      6500      /* ~0.4 g at 16384 LSB/g (+-2 g range) */
+#define QMI_TILT_MARGIN  3000      /* ~0.18 g the winning axis must lead by */
 #define QMI_VOTES_NEEDED 8         /* x100 ms of agreement before rotating */
 
 extern esp_lcd_touch_handle_t bsp_touch_handle(void);
@@ -722,12 +723,17 @@ static void imu_poll(void) {
     s_acc_y = (int16_t)((d[3] << 8) | d[2]);
     s_acc_z = (int16_t)((d[5] << 8) | d[4]);
 
-    if (abs(s_acc_x) > QMI_TILT_TH || abs(s_acc_y) > QMI_TILT_TH) {
-        if (abs(s_acc_x) > abs(s_acc_y)) {
+    /* The dominant axis must lead the other by a clear margin. Held near 45
+     * degrees the two axes trade places on noise alone, and the vote counter
+     * cannot help — it happily counts eight samples of a wrong answer. */
+    int ax = abs(s_acc_x), ay = abs(s_acc_y);
+    if (ax > QMI_TILT_TH || ay > QMI_TILT_TH) {
+        if (ax > ay + QMI_TILT_MARGIN) {
             s_base_rot = (s_acc_x > 0) ? 1 : 3;
-        } else {
+        } else if (ay > ax + QMI_TILT_MARGIN) {
             s_base_rot = (s_acc_y > 0) ? 2 : 0;
         }
+        /* ambiguous: keep the orientation we already have */
     }
     int want = rot_from_base(s_base_rot);
 

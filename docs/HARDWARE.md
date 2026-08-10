@@ -198,8 +198,18 @@ re-laying out.
 
 IMU setup: probe 0x6B then 0x6A, `WHO_AM_I` (0x00) = 0x05; `CTRL1(0x02)=0x40`
 auto-increment, `CTRL2(0x03)=0x06` accel ±2 g @ 125 Hz, `CTRL7(0x08)=0x01` accel
-on / gyro off; accel data at `0x35` (6 bytes LE). Require ~0.4 g of tilt held
-~800 ms before committing, or it flaps while the device is being handled.
+on / gyro off; accel data at `0x35` (6 bytes LE), ±2 g = 16384 LSB/g.
+
+Two independent gates are needed, and the second is easy to miss:
+
+- **Magnitude:** require ~0.4 g of tilt (6500 LSB) before considering a change
+  at all, or a device lying flat rotates on noise.
+- **Margin:** require the dominant axis to lead the other by ~0.18 g (3000 LSB),
+  and keep the current orientation when neither does. Held near 45° the two axes
+  trade places on noise, and a vote counter **cannot** fix this — it will
+  happily count eight consecutive samples of the wrong answer. Symptom: the
+  screen flips back and forth every few seconds while the device sits still on
+  a desk at an angle.
 
 ## 7. AXP2101 PMU
 
@@ -376,6 +386,12 @@ it independently will need the same ones:
     `static const uint8_t sx[]` piled up against the left edge. The compiler does
     warn (`-Woverflow`); don't let warnings accumulate to the point where a real
     one is invisible.
+12. **A vote counter is not hysteresis.** Autorotate flipped back and forth every
+    few seconds on a stationary desk despite requiring eight consecutive
+    agreeing samples — near 45° the input itself is genuinely ambiguous, so the
+    counter just confirms whichever wrong answer arrived first. Debounce fixes
+    *noise*; it does not fix an ambiguous *decision*. Add a margin the winner
+    must beat, and hold the current state when nothing wins (§6).
 
 ## 11. Debugging method that worked
 
