@@ -1,0 +1,30 @@
+# Secrets. The build reads .env and generates build/generated/credentials.h.
+.env
+*.env
+!.env.example
+main/credentials.h
+
+# Build output
+build/
+sdkconfig
+sdkconfig.old
+
+# Fetched by the IDF component manager from main/idf_component.yml +
+# dependencies.lock. ~250 MB, fully reproducible — `idf.py build` restores it.
+managed_components/
+
+# Flash backups (16 MB each)
+*.bin
+!partitions.csv
+
+# Captured serial logs and telemetry pulled off the card
+*.log
+pwrlog*.csv
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+*.swp
+*.bak
+*.bak.*

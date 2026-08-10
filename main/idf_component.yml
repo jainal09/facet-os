@@ -1,0 +1,10 @@
+## IDF Component Manager Manifest File
+# The board BSP is vendored in components/esp32_s3_touch_amoled_2_16
+# (forked from waveshare/esp32_s3_touch_amoled_2_16 v2.0.1 to expose
+# draw-buffer size/placement). Its own manifest pulls the CO5300,
+# CST9217, and esp_lvgl_adapter drivers.
+dependencies:
+  idf: ">=5.5.0"
+  lvgl/lvgl:
+    version: "9.*"
+    public: true

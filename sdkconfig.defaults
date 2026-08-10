@@ -1,0 +1,148 @@
+# Facet — Waveshare ESP32-S3-Touch-AMOLED-2.16
+# ESP32-S3 rev v0.2, 8MB OCTAL PSRAM (AP_3v3), 16MB quad flash
+#
+# Every setting below was arrived at on real hardware and several of them are
+# load-bearing in non-obvious ways. Read docs/HARDWARE.md before changing any
+# of the PSRAM, cache, or power-management entries — the two failure modes they
+# guard against both present as a completely silent, unflashable board.
+
+CONFIG_IDF_TARGET="esp32s3"
+
+#### PSRAM — this board has OCTAL PSRAM; quad mode would fail to init
+CONFIG_SPIRAM=y
+CONFIG_SPIRAM_MODE_OCT=y
+# 40 MHz, not 80: octal PSRAM init at 80 MHz is marginal on this board and
+# intermittently HANGS inside esp_psram_init — before the console exists, so
+# you get "boot: Loaded app from partition" and then nothing at all, no crash
+# dump, and esptool can't sync either. Only a true power cycle clears it.
+# We don't need the bandwidth: draw buffers live in internal SRAM, and PSRAM
+# only holds LVGL objects, TLS buffers and the LVGL task stack.
+CONFIG_SPIRAM_SPEED_40M=y
+CONFIG_SPIRAM_USE_MALLOC=y
+CONFIG_SPIRAM_TRY_ALLOCATE_WIFI_LWIP=y
+CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL=128
+CONFIG_SPIRAM_MALLOC_RESERVE_INTERNAL=32768
+
+#### Flash — 16MB part (esptool eFuse says quad, 3.3V); QIO per Waveshare demo
+CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
+CONFIG_ESPTOOLPY_FLASHMODE_QIO=y
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
+
+#### XIP from PSRAM + cache tuning (Waveshare demo) — code/rodata served
+#### from octal PSRAM so Wi-Fi flash operations don't stall LVGL rendering
+CONFIG_COMPILER_OPTIMIZATION_PERF=y
+# XIP-from-PSRAM disabled: copying .text/.rodata into PSRAM happens before the
+# console exists, so when it misbehaves you get a silent hang (bootloader says
+# "Loaded app" then nothing). It was only here to keep Wi-Fi flash operations
+# from stalling the display while the VPN hammered flash; that load is gone and
+# there is plenty of frame-rate headroom, so run from flash cache instead.
+# CONFIG_SPIRAM_FETCH_INSTRUCTIONS is not set
+# CONFIG_SPIRAM_RODATA is not set
+# CONFIG_SPIRAM_XIP_FROM_PSRAM is not set
+# Default caches: PSRAM draw buffers bounce through internal DMA staging on
+# this adapter regardless of cache-line size, so buffers live in internal RAM
+# (direct DMA) and the cache budget goes to the heap instead.
+CONFIG_IDF_EXPERIMENTAL_FEATURES=y
+
+#### LVGL 9 (configured via Kconfig, per Waveshare demo)
+# CLIB malloc (2 draw units wedge with a custom PSRAM allocator); small-alloc
+# spill to PSRAM comes from SPIRAM_MALLOC_ALWAYSINTERNAL=128 instead: an
+# LVGL object is ~150-250 B, so at this threshold widget trees land in PSRAM
+CONFIG_LV_USE_CLIB_MALLOC=y
+CONFIG_LV_USE_CLIB_STRING=y
+CONFIG_LV_USE_CLIB_SPRINTF=y
+CONFIG_LV_DEF_REFR_PERIOD=15
+CONFIG_LV_OS_FREERTOS=y
+CONFIG_LV_OBJ_STYLE_CACHE=y
+# 2 draw units (vendor value): 1 unit + LV_USE_OS stalls LVGL9 render dispatch
+# after the first frame (measured fps=0.0 across all 1-unit builds)
+CONFIG_LV_DRAW_SW_DRAW_UNIT_CNT=2
+CONFIG_LV_ATTRIBUTE_FAST_MEM_USE_IRAM=y
+CONFIG_LV_USE_SYSMON=y
+# LVGL's fps/CPU overlay draws an ugly grey box over the UI
+CONFIG_LV_USE_PERF_MONITOR=n
+
+#### CPU / FreeRTOS
+CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_240=y
+CONFIG_FREERTOS_HZ=1000
+CONFIG_FREERTOS_TIMER_TASK_STACK_DEPTH=4096
+CONFIG_ESP_MAIN_TASK_STACK_SIZE=8192
+CONFIG_ESP_TASK_WDT_TIMEOUT_S=30
+
+#### TLS — outbound HTTPS to the Funnel endpoint and to Unsplash
+CONFIG_ESP_TLS_USING_MBEDTLS=y
+# TLS sessions (~40KB+ each) allocate from PSRAM. With them on the internal
+# heap a handshake drove internal free down to ~1.5 KB and a second concurrent
+# session could not come up at all.
+CONFIG_MBEDTLS_EXTERNAL_MEM_ALLOC=y
+CONFIG_MBEDTLS_SSL_PROTO_TLS1_2=y
+CONFIG_MBEDTLS_CERTIFICATE_BUNDLE=y
+CONFIG_MBEDTLS_CERTIFICATE_BUNDLE_DEFAULT_CMN=y
+CONFIG_MBEDTLS_CHACHA20_C=y
+CONFIG_MBEDTLS_POLY1305_C=y
+CONFIG_MBEDTLS_CHACHAPOLY_C=y
+CONFIG_MBEDTLS_HKDF_C=y
+
+#### lwIP — generous TCP window so a streamed asset download is not the
+#### bottleneck; the fragmentation entries are left from the VPN era and are
+#### harmless
+CONFIG_LWIP_IPV4=y
+CONFIG_LWIP_IP4_FRAG=y
+CONFIG_LWIP_IP4_REASSEMBLY=y
+CONFIG_LWIP_MAX_SOCKETS=16
+CONFIG_LWIP_SO_RCVBUF=y
+CONFIG_LWIP_TCPIP_RECVMBOX_SIZE=64
+CONFIG_LWIP_TCP_SND_BUF_DEFAULT=32768
+CONFIG_LWIP_TCP_WND_DEFAULT=32768
+
+#### Wi-Fi — low-latency tuning (AMPDU off trades throughput for latency)
+CONFIG_ESP_WIFI_STATIC_RX_BUFFER_NUM=8
+CONFIG_ESP_WIFI_DYNAMIC_RX_BUFFER_NUM=24
+CONFIG_ESP_WIFI_AMPDU_TX_ENABLED=n
+CONFIG_ESP_WIFI_AMPDU_RX_ENABLED=n
+
+CONFIG_LOG_DEFAULT_LEVEL_INFO=y
+
+#### Display robustness + internal SRAM relief
+# BSP init failures return NULL instead of assert/panic (no crash-loop lockout)
+CONFIG_BSP_ERROR_CHECK=n
+# Let the LVGL adapter task stack live in PSRAM (stack_in_psram=true)
+CONFIG_SPIRAM_ALLOW_STACK_EXTERNAL_MEMORY=y
+
+#### Lock-screen typography (fonts live in flash, not RAM)
+CONFIG_LV_FONT_MONTSERRAT_20=y
+CONFIG_LV_FONT_MONTSERRAT_48=y
+
+#### Power management
+# DFS lets the CPU drop to 80 MHz whenever nothing holds a performance lock.
+# Tickless idle is enabled so automatic light sleep can be switched on later
+# without another config change.
+CONFIG_PM_ENABLE=y
+CONFIG_FREERTOS_USE_TICKLESS_IDLE=y
+# NOT PM_DFS_INIT_AUTO: it sets min_freq to the XTAL (40 MHz) at startup, which
+# drops APB below 80 MHz and kills the USB-Serial/JTAG console — the app then
+# blocks forever on its first log write and the board looks dead. DFS is
+# configured explicitly in code with min_freq 80 instead.
+
+#### microSD: long filenames (default is 8.3 only, which silently fails to
+#### create anything with a >8 char stem — e.g. "telemetry.csv")
+CONFIG_FATFS_LFN_HEAP=y
+CONFIG_FATFS_MAX_LFN=64
+
+#### Images from the SD card
+# LVGL's own POSIX FS driver (drive letter 'S') plus TJpgDec, which decodes
+# baseline JPEG in blocks rather than slurping the file into RAM.
+CONFIG_LV_USE_FS_POSIX=y
+CONFIG_LV_FS_POSIX_LETTER=83
+CONFIG_LV_USE_TJPGD=y
+# imgix (Unsplash's CDN) always emits PROGRESSIVE jpeg, which TJpgD cannot
+# decode — it silently yields a 0x0 image. PNG is bigger on the wire but
+# decodes reliably, and 400 KB is nothing against a 32 GB card.
+CONFIG_LV_USE_LODEPNG=y
+# LVGL's image cache defaults to ZERO, which means a file-backed image is
+# re-decoded for every partial draw strip — 15 full PNG decodes per frame with
+# 32-row buffers, so the wallpaper painted band by band like dial-up.
+# 3 MB of cache lives in PSRAM and holds the decoded 480x480 bitmap resident.
+CONFIG_LV_CACHE_DEF_SIZE=3145728
+CONFIG_LV_IMAGE_HEADER_CACHE_DEF_CNT=8
