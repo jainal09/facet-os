@@ -1,0 +1,81 @@
+.env.example
+  s_57e4cf4a7836a6::t_e09e7f64dceb39 1-22
+LICENSE
+  s_57e4cf4a7836a6::t_3b8ef13bd4deb5 1-21
+components/esp32_s3_touch_amoled_2_16/CMakeLists.txt
+  s_57e4cf4a7836a6::t_9291684118f15b 1-19
+components/esp32_s3_touch_amoled_2_16/Kconfig
+  s_57e4cf4a7836a6::t_80f536ee3a5f88 1-84
+components/esp32_s3_touch_amoled_2_16/LICENSE
+  s_57e4cf4a7836a6::t_420a384e9d8efd 1-202
+components/esp32_s3_touch_amoled_2_16/README.md
+  s_57e4cf4a7836a6::t_145147989bceae 1-9
+components/esp32_s3_touch_amoled_2_16/esp32_s3_touch_amoled_2_16.c
+  s_57e4cf4a7836a6::t_7505250b86d1ba 1-670
+components/esp32_s3_touch_amoled_2_16/idf_component.yml
+  s_57e4cf4a7836a6::t_111853c0cbb387 1-28
+components/esp32_s3_touch_amoled_2_16/include/bsp/config.h
+  s_57e4cf4a7836a6::t_663e6dac476af9 1-10
+components/esp32_s3_touch_amoled_2_16/include/bsp/display.h
+  s_57e4cf4a7836a6::t_cb3851e7d70a79 1-121
+components/esp32_s3_touch_amoled_2_16/include/bsp/esp-bsp.h
+  s_57e4cf4a7836a6::t_02956757b158bc 1-2
+components/esp32_s3_touch_amoled_2_16/include/bsp/esp32_s3_touch_amoled_2_16.h
+  s_57e4cf4a7836a6::t_75080d06f9f503 1-302
+components/esp32_s3_touch_amoled_2_16/include/bsp/touch.h
+  s_57e4cf4a7836a6::t_d229ee4e286ce9 1-35
+components/esp32_s3_touch_amoled_2_16/include/ml_draw_buf_cfg.h
+  s_57e4cf4a7836a6::t_3bc3d7ac5ef4df 1-9
+components/esp32_s3_touch_amoled_2_16/priv_include/bsp_err_check.h
+  s_57e4cf4a7836a6::t_bdc9113534d173 1-52
+dependencies.lock
+  s_57e4cf4a7836a6::t_38b8a70c4f35f5 1-298
+main/app_icons_64.c
+  s_57e4cf4a7836a6::t_654275d0febc4a 1-757
+main/hud_clock_76.c
+  s_57e4cf4a7836a6::t_d190c9e674c5b6 1-1945
+main/hud_fonts.h
+  s_57e4cf4a7836a6::t_c91f66cfaac521 1-18
+main/hud_text_18.c
+  s_57e4cf4a7836a6::t_3835460adaa5a4 1-1507
+.gitignore
+  s_57e4cf4a7836a6::t_55e78df7e98a3a 1-30
+CLAUDE.md
+  s_57e4cf4a7836a6::t_32a0cefd3cc799 1-89
+CMakeLists.txt
+  s_57e4cf4a7836a6::t_f2955e2d73cace 1-4
+README.md
+  s_57e4cf4a7836a6::t_8922eb8a6f45e7 1-112
+docs/ARCHITECTURE.md
+  s_57e4cf4a7836a6::t_a18d59d6a8a00f 1-205
+docs/HARDWARE.md
+  s_57e4cf4a7836a6::t_10d22ac46f4094 1-391
+main/CMakeLists.txt
+  s_57e4cf4a7836a6::t_5fb5a88109e6a8 1-55
+main/credentials.h.in
+  s_57e4cf4a7836a6::t_7cadf26b516968 1-20
+main/idf_component.yml
+  s_57e4cf4a7836a6::t_e6956f68060b6b 1-10
+main/main.c
+  s_57e4cf4a7836a6::t_438b17a4025548 1-2842
+partitions.csv
+  s_57e4cf4a7836a6::t_0a45b62755bc31 1-6
+sdkconfig.defaults
+  s_57e4cf4a7836a6::t_b73c08f271b1a8 1-148
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.22",
+  "base_commit_sha": "2f7ea951aa477807e3b4c0a8d9d0094a715d29cc",
+  "prompts": {},
+  "sessions": {
+    "s_57e4cf4a7836a6": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "79540328-5c96-430d-b4c5-de35687f549e",
+        "model": "claude-opus-5"
+      },
+      "human_author": "Jainal Gosaliya <jainal09gosalia@gmail.com>"
+    }
+  }
+}
