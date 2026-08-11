@@ -41,6 +41,21 @@
     font-family:inherit;
   }
   input:focus { outline:none; border-color:var(--accent); }
+  /* The eye sits inside the field, so the field needs room for it and the
+     wrapper is the positioning context. */
+  .pwwrap { position:relative; }
+  .pwwrap input { padding-right:52px; }
+  .eye {
+    position:absolute; right:4px; top:0; bottom:0; width:48px;
+    display:flex; align-items:center; justify-content:center;
+    background:none; border:none; padding:0; min-height:0;
+    color:var(--dim); cursor:pointer;
+  }
+  .eye:active { background:none; color:var(--accent); }
+  .eye svg { width:22px; height:22px; display:block; }
+  .eye .slash { display:none; }
+  .eye[aria-pressed="true"] { color:var(--accent); }
+  .eye[aria-pressed="true"] .slash { display:block; }
   input.code {
     text-align:center; letter-spacing:14px; font-size:28px; font-variant-numeric:tabular-nums;
     padding-left:14px; text-indent:14px;
@@ -51,7 +66,17 @@
     border:1px solid var(--line); background:#0A0E14; min-height:auto;
   }
   .net:active { background:var(--line); color:var(--ink); }
-  .net .name { flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  /* Name and badge stack, so a long SSID never has to share its line and get
+     ellipsised by a label that is not part of it. */
+  .net .main { flex:1; min-width:0; display:flex; flex-direction:column;
+               align-items:flex-start; gap:3px; }
+  .net .name { max-width:100%; overflow:hidden; text-overflow:ellipsis;
+               white-space:nowrap; }
+  .pill {
+    font-size:10px; letter-spacing:1.2px; text-transform:uppercase;
+    color:var(--dim); background:var(--line); border-radius:6px;
+    padding:2px 7px; line-height:1.4;
+  }
   .net .meta { color:var(--dim); font-size:12px; font-variant-numeric:tabular-nums; flex:none; }
   .net.current { border-color:var(--ok); }
   .net.current .name::before { content:"\2713  "; color:var(--ok); }
@@ -61,6 +86,26 @@
   .bars i:nth-child(1){height:4px} .bars i:nth-child(2){height:7px}
   .bars i:nth-child(3){height:10px} .bars i:nth-child(4){height:14px}
   .lock { color:var(--dim); font-size:12px; flex:none; }
+  /* Row actions live behind a three-dot control, the way a phone does it. The
+     previous design put them in a card below the fold, so tapping a network
+     looked like it did nothing at all. */
+  .dots {
+    flex:none; width:34px; height:34px; min-height:34px; padding:0; margin-left:2px;
+    border:none; background:none; color:var(--dim); font-size:20px; line-height:1;
+    border-radius:9px;
+  }
+  .dots:active { background:var(--line); color:var(--ink); }
+  .sheet {
+    position:fixed; inset:0; z-index:20; display:flex;
+    align-items:flex-end; justify-content:center;
+    background:rgba(0,0,0,.55); padding:16px;
+  }
+  .sheet > .card { width:100%; max-width:520px; animation:rise .16s ease-out; }
+  @keyframes rise { from { transform:translateY(14px); opacity:0 } }
+  @media (prefers-reduced-motion:reduce) { .sheet > .card { animation:none } }
+  .sheet .netname { color:var(--mid); font-size:15px; margin-bottom:12px;
+                    word-break:break-all; }
+  .sheet button { margin-bottom:8px; }
   .status { font-size:14px; color:var(--mid); min-height:21px; }
   .status.err { color:var(--bad); }
   .status.ok  { color:var(--ok); }
@@ -106,15 +151,40 @@
   <div class="hint" id="rescanHint">Captured when pairing started.</div>
 </div>
 
-<div class="card hide" id="cardPass">
+<div class="sheet hide" id="sheetMenu">
+  <div class="card">
+    <h2>Network</h2>
+    <div class="netname" id="menuName"></div>
+    <button id="menuConnect">Connect</button>
+    <button class="ghost" id="menuPassword">Enter a different password</button>
+    <button class="ghost danger" id="menuForget">Forget this network</button>
+    <button class="ghost" id="menuCancel">Cancel</button>
+  </div>
+</div>
+
+<div class="sheet hide" id="sheetPass"><div class="card" id="cardPass">
   <h2 id="passTitle">Password</h2>
-  <input id="inPass" type="password" autocomplete="current-password" placeholder="Network password">
+  <div class="pwwrap">
+    <input id="inPass" type="password" autocomplete="current-password"
+           autocapitalize="none" autocorrect="off" spellcheck="false"
+           placeholder="Network password">
+    <button class="eye" id="btnEye" type="button" aria-pressed="false"
+            aria-label="Show password" aria-controls="inPass">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"
+           stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <path d="M1.6 12S5.3 5.4 12 5.4 22.4 12 22.4 12 18.7 18.6 12 18.6 1.6 12 1.6 12Z"/>
+        <circle cx="12" cy="12" r="3.2"/>
+        <line class="slash" x1="3.2" y1="20.8" x2="20.8" y2="3.2"/>
+      </svg>
+    </button>
+  </div>
   <div style="height:10px"></div>
+  <div class="hint" id="passHint"></div>
   <div class="row">
     <button class="ghost" id="btnPassCancel">Back</button>
     <button id="btnJoin">Join</button>
   </div>
-</div>
+</div></div>
 
 <div class="card">
   <h2>Status</h2>
@@ -133,12 +203,16 @@ const C_DATA  = "f9a30005-0b45-4f7e-9c2a-6d1e8b3c7a51";
 const C_STATE = "f9a30006-0b45-4f7e-9c2a-6d1e8b3c7a51";
 
 const CMD_HELLO = 0x01, CMD_SCAN = 0x02, CMD_JOIN = 0x03,
-      CMD_WIFI_OFF = 0x04, CMD_BYE = 0x05, CMD_RESCAN = 0x06;
+      CMD_BYE = 0x05, CMD_RESCAN = 0x06,
+      CMD_JOIN_SAVED = 0x07, CMD_FORGET = 0x08;
 const RSP_APLIST = 0x81;
 
 /* State numbering is the wire contract with ble_prov.h — index, don't reorder. */
 const ST_HANDOFF = 4, ST_DONE = 5;
-const ERRS = ["", "Wrong code.", "Too many wrong codes — start pairing again on the cube.",
+const ERRS = ["",
+              "Wrong code. Check the six digits on the cube right now — they "
+              + "change every time pairing starts.",
+              "Too many wrong codes. Press PAIR on the cube again for a fresh code.",
               "", "Something failed on the cube.",
               ""];   /* 5 = rescan refused: expected, reported under the button */
 
@@ -160,7 +234,7 @@ const enc = new TextEncoder();
 let chars = {};          /* the five characteristics                        */
 let sessionKey = null;   /* AES-GCM CryptoKey                               */
 let txCtr = 0n, rxCtr = 0n;
-let lastSeq = -1;
+let lastSeq = 0;    /* matches the cube's initial data_seq */
 let selected = null;     /* the network being joined                        */
 let currentSsid = "";
 
@@ -183,12 +257,15 @@ function resetSession() {
   chars = {};
   sessionKey = null;
   txCtr = 0n; rxCtr = 0n;
-  lastSeq = -1;
+  lastSeq = 0;
   handedOff = false;
   selected = null;
   currentSsid = "";
   $("inCode").value = "";
   $("inPass").value = "";
+  unlocking = false;
+  $("btnCode").disabled = false;
+  pwShown(false);
   $("netList").innerHTML = "";
   $("rescanHint").textContent = "Captured when pairing started.";
   $("btnRescan").disabled = false;
@@ -283,10 +360,14 @@ async function readAplist() {
   const nets = [];
   for (let i = 0; i < count && o < pt.length; i++) {
     const len = pt[o++];
-    const ssid = new TextDecoder().decode(pt.slice(o, o + len)); o += len;
+    /* Keep the raw octets. An SSID is arbitrary bytes; decoding to a JS string
+       and re-encoding turns anything non-UTF-8 into U+FFFD and can inflate the
+       byte length past the cube's 32-byte field. Decode for display only. */
+    const raw = pt.slice(o, o + len);
+    const ssid = new TextDecoder().decode(raw); o += len;
     const rssi = (pt[o++] << 24) >> 24;            /* sign-extend one byte */
-    const secure = pt[o++] === 1;
-    nets.push({ ssid, rssi, secure });
+    const flags = pt[o++];
+    nets.push({ ssid, raw, rssi, secure: !!(flags & 1), saved: !!(flags & 2) });
   }
   renderNets(nets);
 }
@@ -314,42 +395,82 @@ function renderNets(nets) {
     const b = document.createElement("button");
     b.className = "net" + (isCur ? " current" : "");
     b.innerHTML =
-      `<span class="name"></span>` +
+      `<span class="main">` +
+        (net.saved ? `<span class="pill">saved</span>` : ``) +
+        `<span class="name"></span>` +
+      `</span>` +
       `<span class="lock">${net.secure ? "\u{1F512}" : ""}</span>` +
       bars(net.rssi) +
       `<span class="meta">${net.rssi}</span>`;
     b.querySelector(".name").textContent = net.ssid;   /* never innerHTML — an
                                                           SSID is attacker-chosen */
-    b.onclick = () => (isCur ? offerDisconnect(net) : pick(net));
+    /* Always pick(). "Currently connected" is captured before the cube takes
+       Wi-Fi down for the session, so by the time you are looking at this list
+       the cube is offline and "disconnect" would be a nonsense action — while
+       the network you were on is exactly the one you most likely want back. */
+    /* Tapping the row does the obvious thing: join a saved network straight
+       away, ask for a password otherwise. Everything else lives behind the
+       dots, so the common case is one tap and nothing sits below the fold —
+       which is what made the previous layout feel like a dead tap. */
+    b.onclick = () => (net.saved ? useSaved(net) : askPassword(net));
+
+    const dots = document.createElement("button");
+    dots.className = "dots";
+    dots.type = "button";
+    dots.setAttribute("aria-label", "Actions for " + net.ssid);
+    dots.textContent = "\u22EE";
+    dots.onclick = (ev) => { ev.stopPropagation(); openMenu(net); };
+    b.appendChild(dots);
     list.appendChild(b);
   }
   show("cardNets", true);
 }
 
-function pick(net) {
+function openMenu(net) {
   selected = net;
-  if (!net.secure) return join("");
-  $("passTitle").textContent = "Password";
+  $("menuName").textContent = net.ssid;
+  /* Connect-with-saved and Forget only mean anything for a network we hold a
+     password for; an open network has nothing to type. */
+  show("menuConnect", !!net.saved);
+  show("menuForget", !!net.saved);
+  show("menuPassword", !!net.secure);
+  show("sheetMenu", true);
+}
+
+function askPassword(net) {
+  selected = net;
+  show("sheetMenu", false);
+  if (!net.secure) return join("");        /* open network: nothing to type */
+  $("passTitle").textContent = net.ssid;
   $("inPass").value = "";
-  show("cardPass", true);
+  pwShown(false);
+  $("passHint").textContent = net.saved
+    ? "This replaces the password the cube already has for this network."
+    : "";
+  show("sheetPass", true);
   $("inPass").focus();
 }
 
-async function offerDisconnect(net) {
-  if (!confirm(`Disconnect from ${net.ssid}?`)) return;
-  say("Disconnecting…", "work");
-  await send(new Uint8Array([CMD_WIFI_OFF]));
+async function useSaved(net) {
+  selected = net;
+  show("sheetMenu", false);
+  const ssid = net.raw || enc.encode(net.ssid);
+  const msg = new Uint8Array(2 + ssid.length);
+  msg[0] = CMD_JOIN_SAVED; msg[1] = ssid.length; msg.set(ssid, 2);
+  say(`Connecting to ${net.ssid} with the saved password…`, "work");
+  try { await send(msg); } catch (e) { say(e.message || String(e), "err"); }
 }
 
+
 async function join(pass) {
-  const ssid = enc.encode(selected.ssid);
+  const ssid = selected.raw || enc.encode(selected.ssid);
   const pw = enc.encode(pass);
   const msg = new Uint8Array(2 + ssid.length + 1 + pw.length);
   let o = 0;
   msg[o++] = CMD_JOIN;
   msg[o++] = ssid.length; msg.set(ssid, o); o += ssid.length;
   msg[o++] = pw.length;   msg.set(pw, o);
-  show("cardPass", false);
+  show("sheetPass", false);
   say(`Joining ${selected.ssid}…`, "work");
   await send(msg);
 }
@@ -370,30 +491,46 @@ async function onState(ev) {
       + "found when pairing started.";
   }
 
-  if (err && ERRS[err]) {
-    say(ERRS[err], "err");
-    if (err === 1) { sessionKey = null; show("cardCode", true); show("cardNets", false); }
-  } else if (state === ST_HANDOFF || state === ST_DONE) {
+  /* State first. err is sticky on the cube until something clears it, so a
+     late frame arriving during the 1.2 s hand-off window used to win and turn a
+     successful join into "Wrong code". */
+  if (state === ST_HANDOFF || state === ST_DONE) {
     handedOff = true;
     say("Sent. The cube is switching Bluetooth off and joining — watch its screen.", "ok");
-    show("cardNets", false); show("cardPass", false); show("cardCode", false);
+    show("cardNets", false); show("sheetPass", false); show("cardCode", false);
     /* Pairing again needs a fresh code from the cube, so offer the way back
        rather than leaving the page with nothing to press. */
     show("cardConnect", true);
+    $("hintSupport").textContent =
+      "To pair again, press PAIR on the cube first — it stops advertising "
+      + "once it has your credentials.";
+  } else if (err && ERRS[err]) {
+    say(ERRS[err], "err");
+    if (err === 1) { sessionKey = null; show("cardCode", true); show("cardNets", false); }
+    /* Terminal errors used to leave every card hidden and nothing pressable. */
+    if (err === 2 || err === 4) { show("cardConnect", true); }
   } else if (state === 3 && sessionKey && !err) {
     say("Ready.", "ok");
   }
 
-  /* The cube bumps the sequence whenever DATA changes; that is the only cue
-     to re-read it, since notifications carry no payload of their own. */
-  if (sessionKey && seq !== lastSeq) {
+  /* The cube bumps the sequence whenever DATA changes; that is the only cue to
+     re-read it, since notifications carry no payload of their own.
+     seq 0 means "nothing has ever been staged" — the counter only leaves 0 once
+     a list is built. Reading on 0 asks for a list that does not exist and gets
+     an ATT error, which is what "could not read the list - 2" was.
+     Also require AUTHED: before that there is nothing readable by definition. */
+  if (sessionKey && state >= 3 && seq !== 0 && seq !== lastSeq) {
     lastSeq = seq;
     try {
       await readAplist();
     } catch (e) {
       /* Swallowing this hid the only symptom the user can see: the cube says it
          sent a list and the phone shows nothing at all. */
-      say("Got the list but could not read it: " + (e.message || e), "err");
+      /* Include name and any numeric code: a bare "2" is an ATT error from the
+         GATT layer, not one of our messages, and the two need different fixes. */
+      const detail = [e && e.name, e && e.message, e && e.code]
+        .filter(x => x !== undefined && x !== null && x !== "").join(" / ");
+      say("Could not read the list — " + (detail || String(e)), "err");
       console.warn("aplist", e);
     }
   }
@@ -415,7 +552,7 @@ $("btnConnect").onclick = async () => {
         say("Cube disconnected.", "err");
       }
       sessionKey = null;
-      show("cardNets", false); show("cardPass", false); show("cardCode", false);
+      show("cardNets", false); show("sheetPass", false); show("cardCode", false);
       show("cardConnect", true);
     });
 
@@ -439,9 +576,18 @@ $("btnConnect").onclick = async () => {
   }
 };
 
+let unlocking = false;
 $("btnCode").onclick = async () => {
+  /* Two taps start two key exchanges. The second one replaces the cube's
+     session key while the first HELLO is still in flight, so BOTH are rejected
+     and BOTH count against the five-attempt lockout — two impatient taps burn
+     four tries and the third leaves you locked out, telling you "wrong code"
+     while you type the right one. */
+  if (unlocking) return;
   const code = $("inCode").value.trim();
   if (!/^\d{6}$/.test(code)) { say("Six digits, please.", "err"); return; }
+  unlocking = true;
+  $("btnCode").disabled = true;
   try {
     say("Checking…", "work");
     await handshake(code);
@@ -451,6 +597,9 @@ $("btnCode").onclick = async () => {
   } catch (e) {
     sessionKey = null;
     say(e.message || String(e), "err");
+  } finally {
+    unlocking = false;
+    $("btnCode").disabled = false;
   }
 };
 
@@ -482,8 +631,48 @@ $("btnRescan").onclick = async () => {
   }
 };
 
-$("btnJoin").onclick = () => join($("inPass").value).catch(e => say(e.message, "err"));
-$("btnPassCancel").onclick = () => show("cardPass", false);
+$("menuCancel").onclick   = () => show("sheetMenu", false);
+$("menuConnect").onclick  = () => useSaved(selected);
+$("menuPassword").onclick = () => askPassword(selected);
+/* Tapping the dimmed backdrop dismisses, the way a phone sheet does. */
+$("sheetMenu").onclick = (e) => { if (e.target === $("sheetMenu")) show("sheetMenu", false); };
+$("sheetPass").onclick = (e) => { if (e.target === $("sheetPass")) show("sheetPass", false); };
+
+$("menuForget").onclick = async () => {
+  try {
+    const ssid = selected.raw || enc.encode(selected.ssid);
+    const msg = new Uint8Array(2 + ssid.length);
+    msg[0] = CMD_FORGET; msg[1] = ssid.length; msg.set(ssid, 2);
+    await send(msg);
+    selected.saved = false;
+    show("sheetMenu", false);
+    say(`Forgot ${selected.ssid}. Tap it again to set a new password.`, "ok");
+  } catch (e) { say(e.message || String(e), "err"); }
+};
+
+$("btnJoin").onclick = () => {
+  const pw = $("inPass").value;
+  /* WPA2 keys are 8-63 characters. Sending a shorter one costs a whole pairing
+     round trip to find out, because the cube tears Bluetooth down to try it. */
+  if (selected && selected.secure && pw.length < 8) {
+    $("passHint").textContent = "That is too short — Wi-Fi passwords are at "
+      + "least 8 characters.";
+    return;
+  }
+  join(pw).catch(e => say(e.message, "err"));
+};
+$("btnPassCancel").onclick = () => show("sheetPass", false);
+
+/* Show/hide the password. A Wi-Fi key is long, mixed-case and usually read off
+   a router label, so typing it blind into a phone is the easiest thing to get
+   wrong here — and a wrong one costs a whole pairing round trip to find out. */
+function pwShown(on) {
+  const f = $("inPass"), b = $("btnEye");
+  f.type = on ? "text" : "password";
+  b.setAttribute("aria-pressed", String(on));
+  b.setAttribute("aria-label", on ? "Hide password" : "Show password");
+}
+$("btnEye").onclick = () => { pwShown($("inPass").type === "password"); $("inPass").focus(); };
 $("inCode").onkeydown = (e) => { if (e.key === "Enter") $("btnCode").click(); };
 $("inPass").onkeydown = (e) => { if (e.key === "Enter") $("btnJoin").click(); };
 
