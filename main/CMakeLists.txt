@@ -18,8 +18,22 @@ set(NTP_SERVER       "pool.ntp.org")
 set(UNSPLASH_KEY     "")
 set(UNSPLASH_QUERY   "space,nebula,astronomy")
 
+# Seed a .env on first configure so the file always exists from here on.
+# CMAKE_CONFIGURE_DEPENDS cannot watch a path that does not exist yet, so
+# without this the fresh-clone flow — build once with no .env, then create one
+# and build again — silently reuses the stale header and the device boots with
+# no credentials. .env is gitignored, so writing it here cannot dirty the repo.
+if(NOT EXISTS "${FACET_ENV_FILE}" AND EXISTS "${CMAKE_SOURCE_DIR}/.env.example")
+    configure_file("${CMAKE_SOURCE_DIR}/.env.example" "${FACET_ENV_FILE}" COPYONLY)
+    message(WARNING
+        "Created ${FACET_ENV_FILE} from .env.example. "
+        "Fill in WIFI_SSID and WIFI_PASSWORD, then build again — until you do, "
+        "the device will boot without network credentials.")
+endif()
+
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${FACET_ENV_FILE}")
+
 if(EXISTS "${FACET_ENV_FILE}")
-    set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${FACET_ENV_FILE}")
     file(STRINGS "${FACET_ENV_FILE}" _facet_env_lines)
     foreach(_line IN LISTS _facet_env_lines)
         if(_line MATCHES "^[ \t]*(#|$)")
