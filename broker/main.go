@@ -134,6 +134,7 @@ func main() {
 	mux.HandleFunc("/callback", b.handleCallback)
 	mux.HandleFunc("/token", b.handleToken)
 	mux.HandleFunc("/art", b.handleArt)
+	mux.HandleFunc("/art.bin", b.handleArt)
 
 	srv := &http.Server{
 		Addr:              cfg.addr,
@@ -371,18 +372,27 @@ func (b *broker) handleArt(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	key := sha256.Sum256([]byte(raw + "|" + strconv.Itoa(size)))
-	path := filepath.Join(b.cfg.cacheDir, hex.EncodeToString(key[:])+".jpg")
+	// .bin means a pre-decoded RGB565 bitmap in LVGL's own container: the device
+	// then does no decoding at all, and LVGL streams rows off the card per draw
+	// chunk rather than holding a decoded frame.
+	rawOut := strings.HasSuffix(r.URL.Path, ".bin")
+	ext := ".jpg"
+	if rawOut {
+		ext = ".bin"
+	}
+
+	key := sha256.Sum256([]byte(raw + "|" + strconv.Itoa(size) + "|" + ext))
+	path := filepath.Join(b.cfg.cacheDir, hex.EncodeToString(key[:])+ext)
 
 	if data, err := os.ReadFile(path); err == nil {
 		b.mu.Lock()
 		b.artHits++
 		b.mu.Unlock()
-		serveJPEG(w, data)
+		serveArt(w, data, rawOut)
 		return
 	}
 
-	data, err := b.transcode(raw, size)
+	data, err := b.transcode(raw, size, rawOut)
 	if err != nil {
 		log.Printf("art: %v", err)
 		http.Error(w, "upstream", http.StatusBadGateway)
@@ -399,10 +409,10 @@ func (b *broker) handleArt(w http.ResponseWriter, r *http.Request) {
 	if err := os.WriteFile(tmp, data, 0o644); err == nil {
 		_ = os.Rename(tmp, path)
 	}
-	serveJPEG(w, data)
+	serveArt(w, data, rawOut)
 }
 
-func (b *broker) transcode(src string, size int) ([]byte, error) {
+func (b *broker) transcode(src string, size int, rawOut bool) ([]byte, error) {
 	res, err := b.http.Get(src)
 	if err != nil {
 		return nil, err
@@ -415,6 +425,9 @@ func (b *broker) transcode(src string, size int) ([]byte, error) {
 	img, _, err := image.Decode(io.LimitReader(res.Body, artMaxBytes))
 	if err != nil {
 		return nil, fmt.Errorf("decode: %w", err)
+	}
+	if rawOut {
+		return encodeLVGLBin(img, size)
 	}
 	return encodeSquare(img, size)
 }
@@ -452,8 +465,71 @@ type stringWriter struct{ b *strings.Builder }
 
 func (s *stringWriter) Write(p []byte) (int, error) { return s.b.Write(p) }
 
-func serveJPEG(w http.ResponseWriter, data []byte) {
-	w.Header().Set("Content-Type", "image/jpeg")
+// LVGL 9 binary image format. Verified against the vendored source:
+// lv_image_dsc.h gives a 12-byte little-endian header, and lv_bin_decoder.c
+// registers get_area for RGB565 — so LVGL reads only the rows it needs for each
+// draw chunk directly off the SD card.
+const (
+	lvImageHeaderMagic  = 0x19 // LV_IMAGE_HEADER_MAGIC
+	lvColorFormatRGB565 = 0x12 // LV_COLOR_FORMAT_RGB565
+)
+
+// encodeLVGLBin produces a pre-decoded RGB565 bitmap in LVGL's own container.
+//
+// This is the endpoint worth using. A JPEG saves bandwidth but costs the device a
+// full decode — and worse, the firmware's baseline decoder never populates LVGL's
+// image cache, so it re-decodes once per draw chunk, fifteen times a frame,
+// forever. Handing over raw pixels moves that work to a machine that has CPU to
+// spare and leaves the cube doing nothing but reading bytes.
+//
+// Costs 11x the bytes of the JPEG. That is the right trade here: Wi-Fi is
+// abundant on this device and internal SRAM and CPU are not.
+func encodeLVGLBin(img image.Image, size int) ([]byte, error) {
+	scaled := image.NewRGBA(image.Rect(0, 0, size, size))
+	bnds := img.Bounds()
+	side := bnds.Dx()
+	if bnds.Dy() < side {
+		side = bnds.Dy()
+	}
+	crop := image.Rect(0, 0, side, side).
+		Add(image.Pt(bnds.Min.X+(bnds.Dx()-side)/2, bnds.Min.Y+(bnds.Dy()-side)/2))
+	draw.CatmullRom.Scale(scaled, scaled.Bounds(), img, crop, draw.Over, nil)
+
+	stride := size * 2
+	out := make([]byte, 12+stride*size)
+
+	out[0] = lvImageHeaderMagic
+	out[1] = lvColorFormatRGB565
+	// flags [2:4] and reserved [10:12] stay zero
+	putU16(out[4:], uint16(size))   // w
+	putU16(out[6:], uint16(size))   // h
+	putU16(out[8:], uint16(stride)) // bytes per row
+
+	o := 12
+	for y := 0; y < size; y++ {
+		for x := 0; x < size; x++ {
+			r, g, b, _ := scaled.At(x, y).RGBA() // 16-bit per channel
+			// RGB565, little-endian, which is what LVGL expects on ESP32.
+			v := uint16(r>>11)<<11 | uint16(g>>10)<<5 | uint16(b>>11)
+			out[o] = byte(v)
+			out[o+1] = byte(v >> 8)
+			o += 2
+		}
+	}
+	return out, nil
+}
+
+func putU16(b []byte, v uint16) {
+	b[0] = byte(v)
+	b[1] = byte(v >> 8)
+}
+
+func serveArt(w http.ResponseWriter, data []byte, rawOut bool) {
+	if rawOut {
+		w.Header().Set("Content-Type", "application/octet-stream")
+	} else {
+		w.Header().Set("Content-Type", "image/jpeg")
+	}
 	w.Header().Set("Content-Length", strconv.Itoa(len(data)))
 	// Art for a given track never changes, so let anything in between keep it.
 	w.Header().Set("Cache-Control", "public, max-age=604800, immutable")

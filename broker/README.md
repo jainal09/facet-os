@@ -41,6 +41,7 @@ format arriving at one known size is worth keeping.
 | `GET /callback` | — | Registered redirect URI; exchanges the code for tokens |
 | `GET /token?c=CODE` | Bearer | Cube polls this; returns the refresh token **once**, then forgets it |
 | `GET /art?u=URL&s=240` | Bearer | Fetch, centre-crop, scale, re-encode as baseline JPEG, cache |
+| `GET /art.bin?u=URL&s=240` | Bearer | Same, but returns a pre-decoded RGB565 bitmap in LVGL's binary format — **the device does no decoding at all** |
 
 ## Security
 
@@ -111,6 +112,7 @@ Verified end to end through Funnel from the public internet:
 | `GET /v1/me/player/devices` | 815 B |
 | Spotify cover art, 300x300 | 27,469 B, **SOF0 — baseline** |
 | Same through `/art?s=240` | 10,532 B (38%), baseline, ~185 ms |
+| Same through `/art.bin?s=240` | 115,212 B raw RGB565, ~209 ms (49 ms cached) |
 | Refresh token -> access token | 379 B, `expires_in=3600` |
 
 Two findings that changed the firmware plan:

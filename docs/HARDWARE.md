@@ -314,6 +314,15 @@ UI task), cache to the card, decode from the card when shown. Nothing preloaded.
   unset and nothing calls `esp_lv_decoder_init()` — confirmed with `nm` on the
   ELF, not just from config. Turn both on if JPEG is ever needed on screen.
   Neither decoder handles progressive JPEG, so the source still has to cooperate.
+- **A server can skip the device's decoder entirely.** LVGL 9's binary image
+  decoder is compiled in and always registered (`lv_bin_decoder.c`), needs a
+  `.bin` extension, and — the part that matters — supports `get_area` for
+  `RGB565`, so LVGL reads only the rows a draw chunk needs directly from the
+  card. Hand it a 12-byte header (`lv_image_dsc.h`: magic `0x19`, cf `0x12` for
+  RGB565, then w/h/stride as little-endian u16) followed by raw pixels and the
+  device does no decoding at all, needs no decoder config, and never holds a
+  decoded frame. Costs ~11x the bytes of an equivalent JPEG, which is the right
+  trade when CPU and internal SRAM are the scarce resources and Wi-Fi is not.
 - **Spotify's cover art is baseline JPEG** (`SOF0`, verified against a real
   `i.scdn.co` URL — 300x300 came back 27 KB). So it is decodable here without
   help. It still hits the no-caching problem above, so either enable

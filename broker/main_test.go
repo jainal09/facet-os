@@ -125,3 +125,60 @@ func findSOF(b []byte) byte {
 	}
 	return 0
 }
+
+// The LVGL binary header is a wire format the firmware parses with no
+// validation beyond a magic byte, so a wrong field here shows as a garbled or
+// blank tile with no error anywhere. Pin every byte.
+func TestEncodeLVGLBinHeader(t *testing.T) {
+	src := image.NewRGBA(image.Rect(0, 0, 600, 300))
+	const size = 240
+
+	out, err := encodeLVGLBin(src, size)
+	if err != nil {
+		t.Fatalf("encode: %v", err)
+	}
+
+	wantLen := 12 + size*size*2
+	if len(out) != wantLen {
+		t.Fatalf("length %d, want %d (12-byte header + w*h*2)", len(out), wantLen)
+	}
+	if out[0] != lvImageHeaderMagic {
+		t.Errorf("magic 0x%02X, want 0x%02X", out[0], lvImageHeaderMagic)
+	}
+	if out[1] != lvColorFormatRGB565 {
+		t.Errorf("cf 0x%02X, want 0x%02X (LV_COLOR_FORMAT_RGB565)", out[1], lvColorFormatRGB565)
+	}
+	if got := uint16(out[2]) | uint16(out[3])<<8; got != 0 {
+		t.Errorf("flags %d, want 0", got)
+	}
+	if got := uint16(out[4]) | uint16(out[5])<<8; got != size {
+		t.Errorf("w %d, want %d", got, size)
+	}
+	if got := uint16(out[6]) | uint16(out[7])<<8; got != size {
+		t.Errorf("h %d, want %d", got, size)
+	}
+	if got := uint16(out[8]) | uint16(out[9])<<8; got != size*2 {
+		t.Errorf("stride %d, want %d", got, size*2)
+	}
+	if got := uint16(out[10]) | uint16(out[11])<<8; got != 0 {
+		t.Errorf("reserved %d, want 0", got)
+	}
+}
+
+// RGB565 must be little-endian or every colour comes out wrong on the panel.
+func TestEncodeLVGLBinPixelOrder(t *testing.T) {
+	src := image.NewRGBA(image.Rect(0, 0, 8, 8))
+	for y := 0; y < 8; y++ {
+		for x := 0; x < 8; x++ {
+			src.Set(x, y, color.RGBA{0xFF, 0x00, 0x00, 0xFF}) // pure red
+		}
+	}
+	out, err := encodeLVGLBin(src, 8)
+	if err != nil {
+		t.Fatalf("encode: %v", err)
+	}
+	// Pure red in RGB565 is 0xF800; little-endian on the wire is 0x00 then 0xF8.
+	if out[12] != 0x00 || out[13] != 0xF8 {
+		t.Fatalf("first pixel bytes %02X %02X, want 00 F8 (0xF800 little-endian)", out[12], out[13])
+	}
+}
