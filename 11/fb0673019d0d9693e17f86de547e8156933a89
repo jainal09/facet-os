@@ -1,0 +1,42 @@
+broker/main.go
+  s_57e4cf4a7836a6::t_16561776cd16bc 138
+  s_57e4cf4a7836a6::t_a015228731f778 139
+broker/static/provision.html
+  s_69fa2eb4e2987f::t_c7345f1f6da43c 136,142,193-194,367,371-372,458-481
+  s_69fa2eb4e2987f::t_6b3466160474cd 151-157,235,274,360,391-398
+  s_69fa2eb4e2987f::t_9865994bad9279 139-141,144-148,176-192,195-196,376-384,406,410-416,482
+  s_69fa2eb4e2987f::t_221e66093e2539 143,363-366,368-370
+  s_69fa2eb4e2987f::t_60e7e5f5e74847 72-78,106
+broker/Dockerfile
+  s_57e4cf4a7836a6::t_16561776cd16bc 12-15
+broker/provision_test.go
+  s_69fa2eb4e2987f::t_7b7bc5ca059e12 1-58
+broker/provision.go
+  s_69fa2eb4e2987f::t_fed61502568c4c 1-22,24-57,59
+  s_69fa2eb4e2987f::t_931bf6aa9cdeed 23
+  s_69fa2eb4e2987f::t_0f605dc6466bb4 58
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.22",
+  "base_commit_sha": "11fb0673019d0d9693e17f86de547e8156933a89",
+  "prompts": {},
+  "sessions": {
+    "s_57e4cf4a7836a6": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "79540328-5c96-430d-b4c5-de35687f549e",
+        "model": "claude-opus-5"
+      },
+      "human_author": "Jainal Gosaliya <jainal09gosalia@gmail.com>"
+    },
+    "s_69fa2eb4e2987f": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "ab961f6a-cc54-4961-a6f3-991f7a281329",
+        "model": "claude-opus-5"
+      },
+      "human_author": "Jainal Gosaliya <jainal09gosalia@gmail.com>"
+    }
+  }
+}
