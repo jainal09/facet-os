@@ -1,0 +1,35 @@
+.env.example
+  s_57e4cf4a7836a6::t_3d1279e09d1f05 28-33
+main/main.c
+  s_57e4cf4a7836a6::t_985eda13a40333 2357-2358
+  s_57e4cf4a7836a6::t_d9016fa9a579be 2966
+  s_57e4cf4a7836a6::t_2b3d0c234a5609 2546-2551,2553,2557-2569
+  s_57e4cf4a7836a6::t_cad3cec963642f 2039-2082
+  s_57e4cf4a7836a6::t_7813f4d6bb3c2b 490-493,496
+  s_57e4cf4a7836a6::t_6211ef24e43d50 2221-2223,2225-2236
+  s_57e4cf4a7836a6::t_297b11fbda6d28 494-495
+  s_57e4cf4a7836a6::t_b8873d31060820 2130-2176,2179-2183,2187
+  s_57e4cf4a7836a6::t_446e6bcce2f249 222-225
+  s_57e4cf4a7836a6::t_6521a74f999e72 1996-2009,2013,2015-2024
+  s_57e4cf4a7836a6::t_1914c3a755a42f 2252-2258
+  s_57e4cf4a7836a6::t_36ec3daf5e7071 2014,2104,2864
+  s_57e4cf4a7836a6::t_f5762b80f61995 2245-2251,2259-2280
+docs/ARCHITECTURE.md
+  s_57e4cf4a7836a6::t_c61ce1e8ef240f 163-194
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.22",
+  "base_commit_sha": "5a65480c61be10329e299ab53177212b32a469ec",
+  "prompts": {},
+  "sessions": {
+    "s_57e4cf4a7836a6": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "79540328-5c96-430d-b4c5-de35687f549e",
+        "model": "claude-opus-5"
+      },
+      "human_author": "Jainal Gosaliya <jainal09gosalia@gmail.com>"
+    }
+  }
+}
