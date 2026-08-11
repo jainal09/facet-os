@@ -302,11 +302,26 @@ no lock and mutate in place, so the handle is confined to the `spotify` task
 (stack in PSRAM) and touch callbacks only ever enqueue. Taps are optimistic: the
 icon flips immediately and the next poll confirms rather than discovers.
 
-**Album art is decoded by the broker, not the device.** It returns LVGL's RGB565
-`.bin` format, so `lv_bin_decoder` streams rows off the card per draw chunk and
-the device runs no image decoder at all — which sidesteps TJpgD never populating
-the image cache. Ask for **exactly the size that gets drawn**: the cover is 148 px,
-so `SP_ART_PX` is 148, and the file is 43 KB rather than 115 KB.
+**Album art is decoded by the broker and rendered from PSRAM.** The broker returns
+LVGL's RGB565 `.bin` format, so the device runs no image decoder at all — which
+sidesteps TJpgD never populating the image cache. Ask for **exactly the size that
+gets drawn**: the cover is 148 px, so `SP_ART_PX` is 148, and that is 43 KB rather
+than 115 KB.
+
+It used to land on the card, where `lv_bin_decoder` streams rows per draw chunk.
+That is cheap for a full-size image and stops being cheap twice over: it is ~15
+card reads per frame, and the streaming path collapses the moment the image must be
+**scaled**, which the lock screen does drawing a 148 px cover into a 100 px slot.
+43,824 bytes against 8 MB of free PSRAM removes the card from the write path and
+the render path both, and an in-memory `lv_image_dsc_t` is the fastest form LVGL
+has — no decoder, no file I/O, a direct blit.
+
+Two things that buys, beyond speed. The fetch **swaps the image in itself** rather
+than leaving it ready for the next 400 ms UI tick, which was up to 400 ms of dead
+wait; it already held the lock to drop the cache. And because nothing decodes the
+bytes on the way through, the header is **validated before use** — magic, colour
+format and both dimensions — since a short body or a broker answering with
+something else would otherwise be blitted straight to the panel as garbage.
 
 That number is load-bearing in a second way. The cover has to end above the track
 title, and for three commits it did not — `SP_ART_PX` stayed at 240 through the

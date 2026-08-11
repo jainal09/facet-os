@@ -233,6 +233,15 @@ static i2c_master_dev_handle_t s_axp;
  * that owns the download sink. */
 static uint32_t s_dl_accent;
 
+/* Declared up here because sp_fetch_art() swaps the cover in itself — it sits
+ * above the screen code but needs the widgets and the PSRAM buffer. */
+static lv_obj_t *s_sp_art, *s_sp_art_ph;
+static char s_sp_art_shown[160];  /* which art the widgets are showing */
+static uint8_t *s_sp_art_buf;            /* PSRAM, SP_ART_BYTES */
+static lv_image_dsc_t s_sp_art_dsc;      /* points into s_sp_art_buf + header */
+static bool asset_fetch_mem(const char *url, const char *bearer,
+                            uint8_t *buf, size_t cap, size_t *out_len);
+
 static lv_obj_t *s_lock_time, *s_lock_date, *s_lock_batt;
 static lv_obj_t *s_lock_sweep, *s_lock_batt_arc;
 
@@ -3146,8 +3155,15 @@ static void pomo_poll(int64_t t) {
  * uses the same number: asking the broker for exactly the drawn size means no
  * scaling and a 43 KB file instead of 115 KB. */
 #define SP_ART_PX     148
-#define SP_ART_PATH   WALL_DIR "/art.bin"
-#define SP_ART_LV     "S:" WALL_DIR "/art.bin"
+/* The cover lives in PSRAM, not on the card. LVGL's bin decoder can stream rows
+ * off FATFS per draw chunk, which is what made a file cheap — but that is ~15 card
+ * reads per frame, and it collapses the moment the image has to be scaled (the
+ * lock screen draws this 148 px cover into a 100 px slot). 43,824 bytes against
+ * 8 MB of free PSRAM removes the card from both the write and the render path, and
+ * an in-memory descriptor needs no decoder at all: LVGL blits RGB565 straight out
+ * of the buffer. */
+#define SP_ART_HDR    12
+#define SP_ART_BYTES  (SP_ART_HDR + SP_ART_PX * SP_ART_PX * 2)
 
 typedef enum {
     SP_CMD_POLL = 1,
@@ -3671,17 +3687,63 @@ static void sp_fetch_art(void) {
     }
     url[n] = '\0';
 
-    if (asset_fetch_auth(url, SP_ART_PATH, BROKER_TOKEN)) {
+    if (!s_sp_art_buf) {
+        s_sp_art_buf = heap_caps_malloc(SP_ART_BYTES, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        if (!s_sp_art_buf) { ESP_LOGE(TAG, "spotify: no PSRAM for art"); return; }
+    }
+
+    size_t got = 0;
+    bool ok = asset_fetch_mem(url, BROKER_TOKEN, s_sp_art_buf, SP_ART_BYTES, &got);
+
+    /* Trust the bytes only if they are the shape that was asked for. A short body
+     * or a broker that answered with something else would otherwise be blitted
+     * straight to the panel as garbage — there is no decoder in this path to
+     * reject it on the way through. */
+    if (ok && got == SP_ART_BYTES) {
+        uint16_t w = (uint16_t)(s_sp_art_buf[4] | (s_sp_art_buf[5] << 8));
+        uint16_t h = (uint16_t)(s_sp_art_buf[6] | (s_sp_art_buf[7] << 8));
+        if (s_sp_art_buf[0] != 0x19 || s_sp_art_buf[1] != 0x12 ||
+            w != SP_ART_PX || h != SP_ART_PX) {
+            ESP_LOGW(TAG, "spotify: art header wrong (%02x %02x %ux%u)",
+                     s_sp_art_buf[0], s_sp_art_buf[1], w, h);
+            ok = false;
+        }
+    } else if (ok) {
+        ESP_LOGW(TAG, "spotify: art short (%u of %u)", (unsigned)got, SP_ART_BYTES);
+        ok = false;
+    }
+
+    if (ok) {
         snprintf(s_sp_art_have, sizeof(s_sp_art_have), "%s", s_sp_art_url);
-        /* same path, new bytes — LVGL would otherwise keep serving the old one */
+        s_sp_art_dsc.header.magic = LV_IMAGE_HEADER_MAGIC;
+        s_sp_art_dsc.header.cf    = LV_COLOR_FORMAT_RGB565;
+        s_sp_art_dsc.header.w     = SP_ART_PX;
+        s_sp_art_dsc.header.h     = SP_ART_PX;
+        s_sp_art_dsc.header.stride = SP_ART_PX * 2;
+        s_sp_art_dsc.data      = s_sp_art_buf + SP_ART_HDR;
+        s_sp_art_dsc.data_size = SP_ART_PX * SP_ART_PX * 2;
+
+        /* Swap it in here. This function already holds the lock to drop the cache,
+         * and the alternative was leaving the image ready on this task while the
+         * 400 ms UI timer got round to it — up to 400 ms of dead wait for nothing. */
         if (ui_lock()) {
-            lv_image_cache_drop(SP_ART_LV);
+            lv_image_cache_drop(&s_sp_art_dsc);   /* same pointer, new bytes */
+            if (s_sp_art) {
+                lv_image_set_src(s_sp_art, &s_sp_art_dsc);
+                lv_obj_remove_flag(s_sp_art, LV_OBJ_FLAG_HIDDEN);
+                if (s_sp_art_ph) lv_obj_add_flag(s_sp_art_ph, LV_OBJ_FLAG_HIDDEN);
+            }
+            if (s_lock_np_art) {
+                lv_image_set_src(s_lock_np_art, &s_sp_art_dsc);
+                lv_obj_remove_flag(s_lock_np_art, LV_OBJ_FLAG_HIDDEN);
+            }
             bsp_display_unlock();
         }
+        snprintf(s_sp_art_shown, sizeof(s_sp_art_shown), "%s", s_sp_art_have);
         s_sp_art_ready = true;
         s_sp_art_failed[0] = '\0';
         if (s_dl_accent) s_sp_accent = s_dl_accent;
-        ESP_LOGI(TAG, "spotify: art updated");
+        ESP_LOGI(TAG, "spotify: art updated (%u B, psram)", (unsigned)got);
     } else {
         snprintf(s_sp_art_failed, sizeof(s_sp_art_failed), "%s", s_sp_art_url);
         s_sp_art_failed_at = now_ms();
@@ -3772,7 +3834,7 @@ static void sp_init(void) {
 
 /* ---- the screen ---- */
 
-static lv_obj_t *s_sp_art, *s_sp_art_ph, *s_sp_lbl_track, *s_sp_lbl_artist;
+static lv_obj_t *s_sp_lbl_track, *s_sp_lbl_artist;
 static lv_obj_t *s_sp_btn_play_lbl, *s_sp_btn_shuf, *s_sp_btn_dev;
 static lv_obj_t *s_sp_btn_prev, *s_sp_btn_next, *s_sp_btn_like;
 /* The volume HUD: a vertical fill beside the cover plus a glyph that goes to
@@ -3784,7 +3846,6 @@ static int s_sp_devlit = -1;     /* last device-button tint, -1 = unset */
 static lv_obj_t *s_sp_devpanel, *s_sp_devlist;
 static lv_obj_t *s_sp_scr;      /* the MUSIC screen, for the accent backdrop */
 static uint32_t s_sp_bg_drawn;  /* last backdrop colour, 0 = unset */
-static char s_sp_art_shown[160];
 
 /* Circular button placed by centre, in absolute screen coordinates.
  *
@@ -4180,8 +4241,10 @@ static void sp_timer_cb(lv_timer_t *t) {
                        strcmp(s_sp_art_have, s_sp_art_url) == 0;
 
     if (art_current && strcmp(s_sp_art_shown, s_sp_art_have) != 0) {
+        /* sp_fetch_art() swaps the image in itself now, so this only catches a
+         * cover that arrived while MUSIC was closed and the widgets did not exist. */
         snprintf(s_sp_art_shown, sizeof(s_sp_art_shown), "%s", s_sp_art_have);
-        lv_image_set_src(s_sp_art, SP_ART_LV);
+        lv_image_set_src(s_sp_art, &s_sp_art_dsc);
         lv_obj_remove_flag(s_sp_art, LV_OBJ_FLAG_HIDDEN);
         lv_obj_add_flag(s_sp_art_ph, LV_OBJ_FLAG_HIDDEN);
     } else if (!art_current && !lv_obj_has_flag(s_sp_art, LV_OBJ_FLAG_HIDDEN)) {
@@ -4577,6 +4640,14 @@ static void rtc_store(void) {
 
 static FILE *s_dl_file;
 
+/* Album art goes to PSRAM rather than onto the card, so the download sink is
+ * switchable. Only one download is ever in flight — the wallpaper fetch and the
+ * art fetch are each serialised behind their own task and neither reenters — so a
+ * pair of file-scope sinks is safe and keeps one event handler and one set of
+ * progress counters serving both. */
+static uint8_t *s_dl_mem;
+static size_t   s_dl_mem_cap, s_dl_mem_len;
+
 static void wall_png(int slot, char *out, size_t n) {
     snprintf(out, n, WALL_DIR "/w%d.png", slot);
 }
@@ -4648,8 +4719,18 @@ static esp_err_t dl_evt(esp_http_client_event_t *e) {
             /* Rides the art fetch, so the tint costs no request and no bytes. */
             s_dl_accent = (uint32_t)strtoul(e->header_value, NULL, 16);
         }
-    } else if (e->event_id == HTTP_EVENT_ON_DATA && s_dl_file && e->data_len > 0) {
-        fwrite(e->data, 1, e->data_len, s_dl_file);
+    } else if (e->event_id == HTTP_EVENT_ON_DATA && e->data_len > 0 &&
+               (s_dl_file || s_dl_mem)) {
+        if (s_dl_mem) {
+            size_t n = (size_t)e->data_len;
+            if (s_dl_mem_len + n > s_dl_mem_cap) n = s_dl_mem_cap - s_dl_mem_len;
+            if (n) {
+                memcpy(s_dl_mem + s_dl_mem_len, e->data, n);
+                s_dl_mem_len += n;
+            }
+        } else {
+            fwrite(e->data, 1, e->data_len, s_dl_file);
+        }
         s_dl_got += e->data_len;
         s_dl_kb = (int)(s_dl_got / 1024);
         if (s_dl_total > 0) {
@@ -4658,6 +4739,39 @@ static esp_err_t dl_evt(esp_http_client_event_t *e) {
         }
     }
     return ESP_OK;
+}
+
+/* Fetch into a caller-owned buffer. Same client and event handler as the file
+ * path, minus the .part-and-rename dance: a partial body cannot leave anything
+ * behind when the destination is memory, and the caller checks the length. */
+static bool asset_fetch_mem(const char *url, const char *bearer,
+                            uint8_t *buf, size_t cap, size_t *out_len) {
+    s_dl_total = 0; s_dl_got = 0; s_dl_pct = 0; s_dl_kb = 0; s_dl_accent = 0;
+    s_dl_mem = buf; s_dl_mem_cap = cap; s_dl_mem_len = 0;
+
+    esp_http_client_config_t cfg = {
+        .url = url,
+        .crt_bundle_attach = esp_crt_bundle_attach,
+        .timeout_ms = 12000,
+        .event_handler = dl_evt,
+        .max_redirection_count = 5,
+    };
+    esp_http_client_handle_t c = esp_http_client_init(&cfg);
+    bool ok = false;
+    if (c) {
+        if (bearer && bearer[0]) {
+            char auth[96];
+            snprintf(auth, sizeof(auth), "Bearer %.72s", bearer);
+            esp_http_client_set_header(c, "Authorization", auth);
+        }
+        esp_err_t err = esp_http_client_perform(c);
+        int status = esp_http_client_get_status_code(c);
+        ok = (err == ESP_OK && status == 200);
+        esp_http_client_cleanup(c);
+    }
+    *out_len = s_dl_mem_len;
+    s_dl_mem = NULL; s_dl_mem_cap = s_dl_mem_len = 0;
+    return ok;
 }
 
 static bool asset_fetch_auth(const char *url, const char *path, const char *bearer) {
@@ -5148,7 +5262,7 @@ static void lock_np_refresh(void) {
     bool art_ok = s_sp_art_ready && s_sp_art_url[0] &&
                   strcmp(s_sp_art_have, s_sp_art_url) == 0;
     if (art_ok && lv_obj_has_flag(s_lock_np_art, LV_OBJ_FLAG_HIDDEN)) {
-        lv_image_set_src(s_lock_np_art, SP_ART_LV);
+        lv_image_set_src(s_lock_np_art, &s_sp_art_dsc);
         lv_obj_remove_flag(s_lock_np_art, LV_OBJ_FLAG_HIDDEN);
     } else if (!art_ok && !lv_obj_has_flag(s_lock_np_art, LV_OBJ_FLAG_HIDDEN)) {
         lv_obj_add_flag(s_lock_np_art, LV_OBJ_FLAG_HIDDEN);
