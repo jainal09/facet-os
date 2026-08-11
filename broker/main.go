@@ -135,6 +135,8 @@ func main() {
 	mux.HandleFunc("/token", b.handleToken)
 	mux.HandleFunc("/art", b.handleArt)
 	mux.HandleFunc("/art.bin", b.handleArt)
+	// Wi-Fi setup UI. Unauthenticated by design — see provision.go.
+	mux.HandleFunc("/provision", b.handleProvision)
 
 	srv := &http.Server{
 		Addr:              cfg.addr,

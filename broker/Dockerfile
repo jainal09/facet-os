@@ -9,6 +9,10 @@ COPY go.mod go.sum ./
 RUN go mod download
 
 COPY *.go ./
+# The provisioning page is //go:embed-ed into the binary, so it has to be in
+# the build context. Without this the build fails at compile time rather than
+# shipping an image that 404s.
+COPY static/ ./static/
 
 # The tests assert that the album-art output is baseline JPEG, which is the one
 # property the firmware cannot work without. Running them here means a

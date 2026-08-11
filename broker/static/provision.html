@@ -69,6 +69,13 @@
   .row { display:flex; gap:10px; }
   .row > * { flex:1; }
   .hint { color:var(--dim); font-size:12px; margin-top:10px; }
+  .spin {
+    display:inline-block; width:14px; height:14px; vertical-align:-2px;
+    margin-right:8px; border:2px solid var(--line); border-top-color:var(--accent);
+    border-radius:50%; animation:spin .7s linear infinite;
+  }
+  @keyframes spin { to { transform:rotate(360deg); } }
+  @media (prefers-reduced-motion:reduce) { .spin { animation-duration:2.4s; } }
   code { background:#0A0E14; padding:2px 6px; border-radius:5px; font-size:13px; }
 </style>
 </head>
@@ -96,6 +103,7 @@
   <h2>Networks</h2>
   <div id="netList"></div>
   <button class="ghost" id="btnRescan">Scan again</button>
+  <div class="hint" id="rescanHint">Captured when pairing started.</div>
 </div>
 
 <div class="card hide" id="cardPass">
@@ -125,14 +133,28 @@ const C_DATA  = "f9a30005-0b45-4f7e-9c2a-6d1e8b3c7a51";
 const C_STATE = "f9a30006-0b45-4f7e-9c2a-6d1e8b3c7a51";
 
 const CMD_HELLO = 0x01, CMD_SCAN = 0x02, CMD_JOIN = 0x03,
-      CMD_WIFI_OFF = 0x04, CMD_BYE = 0x05;
+      CMD_WIFI_OFF = 0x04, CMD_BYE = 0x05, CMD_RESCAN = 0x06;
 const RSP_APLIST = 0x81;
 
-const ST = ["off","advertising","linked","ready","joining","joined","error"];
-const ERRS = ["", "Wrong code.", "Too many wrong codes — restart pairing on the cube.",
-              "That network refused the password.", "Something failed on the cube."];
+/* State numbering is the wire contract with ble_prov.h — index, don't reorder. */
+const ST_HANDOFF = 4, ST_DONE = 5;
+const ERRS = ["", "Wrong code.", "Too many wrong codes — start pairing again on the cube.",
+              "", "Something failed on the cube.",
+              ""];   /* 5 = rescan refused: expected, reported under the button */
+
+/* Set once the cube has taken the credentials, so the disconnect that follows
+ * reads as success rather than as a fault. The cube closes Bluetooth on purpose:
+ * it cannot run both radios at once, so it has to let go to join Wi-Fi. */
+let handedOff = false;
 
 const $ = (id) => document.getElementById(id);
+
+/* A GATT read hands back a DataView, and `dv.buffer` is the WHOLE underlying
+ * buffer — which equals the value only if the implementation happened to
+ * allocate it that way. Chrome does; Bluefy is a separate WebKit-based
+ * implementation and there is no spec guarantee either way. Respecting
+ * byteOffset/byteLength is correct against both and costs nothing. */
+const bytes = (dv) => new Uint8Array(dv.buffer, dv.byteOffset, dv.byteLength);
 const enc = new TextEncoder();
 
 let chars = {};          /* the five characteristics                        */
@@ -150,6 +172,27 @@ function say(msg, kind) {
   el.className = "status" + (kind ? " " + kind : "");
 }
 function show(id, on) { $(id).classList.toggle("hide", !on); }
+
+/* Everything that belongs to one pairing session, cleared in one place.
+ * The cube restarts its own counters on every session — a fresh key, tx/rx from
+ * zero, data_seq from zero — so anything remembered from the previous one is
+ * actively wrong. lastSeq was the sharp edge: left at its old value, the page
+ * decides it has already seen the network list the cube is now advertising as
+ * new, and silently shows nothing. */
+function resetSession() {
+  chars = {};
+  sessionKey = null;
+  txCtr = 0n; rxCtr = 0n;
+  lastSeq = -1;
+  handedOff = false;
+  selected = null;
+  currentSsid = "";
+  $("inCode").value = "";
+  $("inPass").value = "";
+  $("netList").innerHTML = "";
+  $("rescanHint").textContent = "Captured when pairing started.";
+  $("btnRescan").disabled = false;
+}
 
 /* ---- crypto ------------------------------------------------------------
  * Mirrors ble_prov.c exactly: ECDH P-256 -> HKDF-SHA256 salted with the six
@@ -189,7 +232,7 @@ async function unseal(frame) {
 
 async function handshake(code) {
   /* 1. the cube's ephemeral point */
-  const pub = new Uint8Array((await chars.pub.readValue()).buffer);
+  const pub = bytes(await chars.pub.readValue());
   if (pub.length !== 66 || pub[0] !== 1) throw new Error("unexpected protocol version");
   const cubePoint = pub.slice(1);
 
@@ -228,7 +271,7 @@ async function send(bytes) {
 }
 
 async function readAplist() {
-  const raw = new Uint8Array((await chars.data.readValue()).buffer);
+  const raw = bytes(await chars.data.readValue());
   const pt = await unseal(raw);
   if (pt[0] !== RSP_APLIST) throw new Error("unexpected payload");
 
@@ -314,26 +357,45 @@ async function join(pass) {
 /* ---- state notifications ----------------------------------------------- */
 
 async function onState(ev) {
-  const v = new Uint8Array(ev.target.value.buffer);
+  const v = bytes(ev.target.value);
   const [state, err, seq] = v;
+
+  if (err === 5) {
+    /* Not a fault: the cube turns Wi-Fi off to free the memory Bluetooth needs,
+       so a live rescan does not fit yet. Said once, quietly, where the button
+       that caused it is. */
+    $("btnRescan").disabled = false;
+    $("rescanHint").textContent =
+      "Live rescan does not fit alongside Bluetooth yet. Showing the networks "
+      + "found when pairing started.";
+  }
 
   if (err && ERRS[err]) {
     say(ERRS[err], "err");
     if (err === 1) { sessionKey = null; show("cardCode", true); show("cardNets", false); }
-  } else if (state === 4) {
-    say("Joining…", "work");
-  } else if (state === 5) {
-    say("Connected. You can close this page.", "ok");
-    show("cardNets", false); show("cardPass", false);
-  } else if (state === 3 && sessionKey) {
-    if (!err) say("Ready.", "ok");
+  } else if (state === ST_HANDOFF || state === ST_DONE) {
+    handedOff = true;
+    say("Sent. The cube is switching Bluetooth off and joining — watch its screen.", "ok");
+    show("cardNets", false); show("cardPass", false); show("cardCode", false);
+    /* Pairing again needs a fresh code from the cube, so offer the way back
+       rather than leaving the page with nothing to press. */
+    show("cardConnect", true);
+  } else if (state === 3 && sessionKey && !err) {
+    say("Ready.", "ok");
   }
 
   /* The cube bumps the sequence whenever DATA changes; that is the only cue
      to re-read it, since notifications carry no payload of their own. */
   if (sessionKey && seq !== lastSeq) {
     lastSeq = seq;
-    try { await readAplist(); } catch (e) { console.warn("aplist", e); }
+    try {
+      await readAplist();
+    } catch (e) {
+      /* Swallowing this hid the only symptom the user can see: the cube says it
+         sent a list and the phone shows nothing at all. */
+      say("Got the list but could not read it: " + (e.message || e), "err");
+      console.warn("aplist", e);
+    }
   }
 }
 
@@ -341,10 +403,17 @@ async function onState(ev) {
 
 $("btnConnect").onclick = async () => {
   try {
+    resetSession();
     say("Looking for the cube…", "work");
     const dev = await navigator.bluetooth.requestDevice({ filters: [{ services: [SVC] }] });
     dev.addEventListener("gattserverdisconnected", () => {
-      say("Cube disconnected.", "err");
+      /* Expected after a hand-off — the cube closes Bluetooth to free the
+         memory Wi-Fi needs. Only a disconnect before that is a fault. */
+      if (handedOff) {
+        say("Sent. The cube is joining now — watch its screen.", "ok");
+      } else {
+        say("Cube disconnected.", "err");
+      }
       sessionKey = null;
       show("cardNets", false); show("cardPass", false); show("cardCode", false);
       show("cardConnect", true);
@@ -386,8 +455,31 @@ $("btnCode").onclick = async () => {
 };
 
 $("btnRescan").onclick = async () => {
-  try { say("Scanning…", "work"); await send(new Uint8Array([CMD_SCAN])); }
-  catch (e) { say(e.message || String(e), "err"); }
+  const btn = $("btnRescan");
+  if (btn.disabled) return;
+  btn.disabled = true;
+  const seqBefore = lastSeq;
+  $("rescanHint").innerHTML = '<span class="spin"></span>Scanning — the cube is '
+    + 'switching Wi-Fi back on, this takes a few seconds.';
+  try {
+    await send(new Uint8Array([CMD_RESCAN]));
+    /* The cube answers by bumping data_seq, which onState() turns into a fresh
+       read. Wait for that rather than guessing a duration — bringing Wi-Fi up,
+       scanning and taking it down again takes several seconds and varies. */
+    const ok = await new Promise((resolve) => {
+      const t0 = Date.now();
+      const iv = setInterval(() => {
+        if (lastSeq !== seqBefore) { clearInterval(iv); resolve(true); }
+        else if (Date.now() - t0 > 20000) { clearInterval(iv); resolve(false); }
+      }, 200);
+    });
+    $("rescanHint").textContent = ok ? "Updated just now."
+                                     : "No answer from the cube — try again.";
+  } catch (e) {
+    $("rescanHint").textContent = e.message || String(e);
+  } finally {
+    btn.disabled = false;
+  }
 };
 
 $("btnJoin").onclick = () => join($("inPass").value).catch(e => say(e.message, "err"));
