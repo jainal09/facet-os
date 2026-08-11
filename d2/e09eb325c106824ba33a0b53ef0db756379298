@@ -1,0 +1,25 @@
+main/main.c
+  s_57e4cf4a7836a6::t_cf2a5fab24747b 239
+  s_57e4cf4a7836a6::t_5978385cbc5c4d 4643-4650,4722-4733,4744-4774
+  s_57e4cf4a7836a6::t_482a963a237b64 3158-3166,3690-3716,3718-3728,3730-3739,3742,3746,4244-4245,4247,5265
+  s_57e4cf4a7836a6::t_e6abd618e2a79e 236-238,240-244,3837
+  s_57e4cf4a7836a6::t_65990a5049a188 4775-4776
+docs/ARCHITECTURE.md
+  s_57e4cf4a7836a6::t_60d0a141d7e653 305-324
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.22",
+  "base_commit_sha": "d2e09eb325c106824ba33a0b53ef0db756379298",
+  "prompts": {},
+  "sessions": {
+    "s_57e4cf4a7836a6": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "79540328-5c96-430d-b4c5-de35687f549e",
+        "model": "claude-opus-5"
+      },
+      "human_author": "Jainal Gosaliya <jainal09gosalia@gmail.com>"
+    }
+  }
+}
