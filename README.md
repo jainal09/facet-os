@@ -36,13 +36,24 @@ and not PSRAM, is what decides whether a feature fits. Facet is built around it:
 | **CONTROL** | Settings and diagnostics in one scrolling column of cards: wallpaper pool with a live download bar, rotation calibration, battery and drain rate, network, system counters | Fetch a new wallpaper |
 | **FOCUS** | A Pomodoro timer you drive by turning the cube. Rotate to pick 60/30/10/5 and start; lay it flat to pause | Cancel the session |
 | **PIP** | A virtual pet on a tiny planet — wanders, stargazes, dances, naps | Play with it |
-| **WI-FI** | Shows the joined network, scan list, on-screen keyboard; tap the connected network to disconnect | Rescan |
 
 Sound is authored, not sampled — see
 [assets/sounds/CREDITS.md](assets/sounds/CREDITS.md).
 
 Plus a lock screen: a HUD clock with a battery ring and a sweeping arc, backed
 by SNTP and a battery-backed RTC so the time is right the instant it wakes.
+
+### Wi-Fi setup from your phone
+
+There is no on-screen keyboard any more. CONTROL has a **PAIR** card: press it,
+the cube shows a six-digit code and turns Wi-Fi off, and a web page on your
+phone talks to it over Bluetooth — network list, real keyboard, done. Networks
+you have joined before are marked *saved* and reconnect without a password.
+
+The two radios cannot run at once on this board, so pairing takes Wi-Fi down for
+the duration and restores it however the session ends. See
+[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the shape and
+[docs/HARDWARE.md §7g](docs/HARDWARE.md) for the measurements behind it.
 
 ## The three keys
 

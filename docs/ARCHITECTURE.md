@@ -411,6 +411,64 @@ panel appears the clock drops to `hud_clock_48` and moves up, the divider hides,
 and the transport gets 76/88/76 px with real padding. The clock has nothing below
 it worth protecting.
 
+## Wi-Fi setup from a phone
+
+Typing a WPA2 password on a 480x480 panel with an on-screen keyboard was the
+worst interaction this device had. It is now done from a phone over Web
+Bluetooth: the phone renders the scan list with a real keyboard under it and
+hands credentials back over an encrypted GATT link. The old WI-FI app and its
+on-screen keyboard are gone entirely — 278 lines and thirteen widgets — which is
+also what returned the drawer to a clean 2x2.
+
+**The radios take turns.** BLE needs ~26 KB of internal SRAM while running and a
+session leaves ~42 KB free *only because Wi-Fi is fully deinitialised first*
+(HARDWARE.md §7g). So a pairing session is: scan -> `esp_wifi_deinit()` -> BLE ->
+hand off -> re-init -> join. `wifi_init()` is split for this: `wifi_init_once()`
+holds everything that must happen exactly once per boot (netif, event loop,
+handlers) and `wifi_driver_up()`/`wifi_driver_down()` cycle around it. Creating a
+second netif leaks the first and then asserts, so that split is not cosmetic.
+
+**Wi-Fi is restored when a session ends for ANY reason** — handed off, timed out,
+stopped, phone walked away, or the stack refusing to start — through a single
+block that every exit route funnels into. Restoring only after a successful
+hand-off would strand the cube offline until reboot every time someone opened
+pairing and wandered off, which is the likeliest way this gets used wrong.
+
+**Known networks.** The device used to remember exactly one, so "saved" could
+only ever mean the network it was last on. It now keeps eight `{ssid, pass}`
+pairs in NVS — not on the card, which is removable and these are plaintext —
+seeded at boot from the boot credential and updated on every confirmed join.
+Eviction is least-recently-joined; a plain insertion order made the network you
+use daily the first casualty of one hotel. The scan list carries a per-AP flag
+bit so the phone can offer to reuse a password without asking for it, and a
+Forget that removes exactly one entry.
+
+**No flash writes while the radio is up.** The BT controller executes from flash
+and an erase stalls it; `SPI_FLASH_AUTO_SUSPEND` is unavailable on this board's
+XMC part. Every NVS writer therefore consults `ble_prov_nvs_blocked()` and its
+dirty flag survives to the next pass. Credentials are held *pending* and
+committed on GOT_IP rather than on submission, so a wrong password cannot
+overwrite a working one.
+
+**Threading.** GATT callbacks run on the NimBLE host task and do nothing but
+copy bytes and raise a flag; all real work happens in `ble_prov_poll()` on the
+main task. Frames arrive in a **ring queue**, not a single slot: the main loop
+only drains every 20 ms, and a phone that writes twice in that window — which the
+page does, HELLO then SCAN — silently lost the first frame and judged the second
+in its place. That one cost several rounds of debugging and presented as "wrong
+code" for a correct code.
+
+**Authentication** is ECDH P-256 plus a six-digit code shown on the panel, mixed
+into HKDF so a phone that never saw the screen cannot complete the exchange;
+everything after is AES-GCM. Five wrong attempts ends the session and stops
+advertising — the limit is what makes six digits worth anything, so it must
+close the session rather than merely refuse the frame.
+
+The phone page is served by the broker at `/provision`, because Web Bluetooth
+requires a secure context and that service already has a real certificate behind
+Tailscale Funnel. It is inert markup holding no secret, so it is deliberately
+unauthenticated: reaching a cube needs radio range *and* the code on its screen.
+
 ## Sound
 
 Clips are authored offline and embedded in flash via `EMBED_FILES` (~99 KB),

@@ -837,6 +837,34 @@ it independently will need the same ones:
     `nm` on the ELF that its symbols are actually present before believing any
     figure. Real answer for BLE: **+5,032 B**, not 672.
 
+19. **One buffer shared by two writers is not a buffer, it is a race — and it
+    fails silently.** This board hit the same shape three times in one feature.
+    A GATT write callback runs on the NimBLE host task; the main loop reads what
+    it left every 20 ms. Any phone that writes twice inside that window
+    overwrites the first frame, and the second is then judged in its place. The
+    symptoms were never "a frame was lost": they were *"wrong code" for a
+    correct code*, and a list that silently never appeared. Fixes, in the order
+    they were needed: give each characteristic its own storage; then a ring
+    queue for repeat writes to the SAME characteristic; then publish the payload
+    before the index that exposes it (`__ATOMIC_RELEASE`/`ACQUIRE`), since only
+    the index was declared volatile. Also double-buffer anything a GATT read
+    serves — NimBLE re-invokes the access callback for *every* Read Blob Request
+    and slices by offset, so a value rewritten mid-read hands the peer the head
+    of one payload and the tail of another.
+20. **A GATT read returns a DataView, and `dv.buffer` is not the value.** It is
+    the whole underlying buffer, which equals the value only if the
+    implementation happened to allocate it that way. Chrome does; Bluefy is a
+    separate WebKit implementation and nothing in the spec requires it. Always
+    `new Uint8Array(dv.buffer, dv.byteOffset, dv.byteLength)`. The failure is
+    silent and total — every read decrypts to garbage — and it will not
+    reproduce in desktop Chrome.
+21. **Two agents flashing from different snapshots of one tree looks exactly
+    like a regression.** A working feature "disappeared" because the other
+    session built from its commits while the work was still uncommitted in the
+    shared working tree. The boot log settles it in one line: the app version
+    string and any log line the new code adds. Commit before handing the board
+    over, and check `git status` before believing a regression report.
+
 ## 11. Debugging method that worked
 
 - Log a one-line periodic status with everything at once: uptime, wall clock,
