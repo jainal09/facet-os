@@ -1,0 +1,37 @@
+broker/facet-broker.service
+  s_57e4cf4a7836a6::t_b86f6bd569d4e8 1-41
+broker/README.md
+  s_57e4cf4a7836a6::t_5dcd6286fdd0ec 1-108
+broker/main.go
+  s_57e4cf4a7836a6::t_67c9d9d1767185 1-68,71-500
+  s_57e4cf4a7836a6::t_dbd4327693e06c 69-70
+broker/main_test.go
+  s_57e4cf4a7836a6::t_dbd4327693e06c 1-127
+broker/go.mod
+  s_57e4cf4a7836a6::t_7192096d48bb02 1-5
+docs/HARDWARE.md
+  s_57e4cf4a7836a6::t_5785432e77a3cb 302-316
+  s_57e4cf4a7836a6::t_7724139d262363 403-437
+.gitignore
+  s_57e4cf4a7836a6::t_b4dc9880f8590b 31-35
+broker/broker.env.example
+  s_57e4cf4a7836a6::t_b86f6bd569d4e8 1-16
+broker/go.sum
+  s_57e4cf4a7836a6::t_48e805b51e02b6 1-2
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.22",
+  "base_commit_sha": "782abe897b6db56447e2830b684df03ed94b8cae",
+  "prompts": {},
+  "sessions": {
+    "s_57e4cf4a7836a6": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "79540328-5c96-430d-b4c5-de35687f549e",
+        "model": "claude-opus-5"
+      },
+      "human_author": "Jainal Gosaliya <jainal09gosalia@gmail.com>"
+    }
+  }
+}
