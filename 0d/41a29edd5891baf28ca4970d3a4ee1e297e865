@@ -1,0 +1,29 @@
+web/provision.html
+  s_69fa2eb4e2987f::t_c6b1355de937c2 1-406
+main/main.c
+  s_57e4cf4a7836a6::t_7d0faaad5044c4 233-239,1874-1876,4084-4086,4319,4328-4329
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.22",
+  "base_commit_sha": "0d41a29edd5891baf28ca4970d3a4ee1e297e865",
+  "prompts": {},
+  "sessions": {
+    "s_57e4cf4a7836a6": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "79540328-5c96-430d-b4c5-de35687f549e",
+        "model": "claude-opus-5"
+      },
+      "human_author": "Jainal Gosaliya <jainal09gosalia@gmail.com>"
+    },
+    "s_69fa2eb4e2987f": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "ab961f6a-cc54-4961-a6f3-991f7a281329",
+        "model": "claude-opus-5"
+      },
+      "human_author": "Jainal Gosaliya <jainal09gosalia@gmail.com>"
+    }
+  }
+}
