@@ -99,6 +99,29 @@ CONFIG_LWIP_TCP_WND_DEFAULT=32768
 #### Wi-Fi — low-latency tuning (AMPDU off trades throughput for latency)
 CONFIG_ESP_WIFI_STATIC_RX_BUFFER_NUM=8
 CONFIG_ESP_WIFI_DYNAMIC_RX_BUFFER_NUM=24
+
+# 16 static TX buffers at ~1.6 KB each is 25.6 KB of the scarcest pool on this
+# board, and it was IDF's default rather than anyone's decision. This device's
+# largest transmission is an HTTP GET header — every heavy transfer it makes is
+# inbound (a 43 KB cover, a 400 KB wallpaper), which is what RX buffers are for.
+# 16 -> 4 returns ~19.2 KB.
+#
+# 4 rather than 8 because of a measurement, not a preference: with 8, bringing
+# Wi-Fi up beside a live BLE session for the phone's rescan left **2,156 bytes**
+# of internal free — worse than the 1,223 that made the on-device VPN unshippable,
+# and the same starvation condition behind the LVGL-lock freeze. It worked three
+# times in a row, which is the dangerous kind of working. 4 buys ~6.4 KB more.
+#
+# RX deliberately stays at 8: inbound is the direction this device actually uses,
+# so the two are not symmetric and trimming RX would cost real throughput.
+#
+# Kept STATIC, not switched to dynamic: Kconfig is explicit that static is the
+# right choice when PSRAM is enabled, so the count is the lever, not the
+# allocation strategy. ESP_WIFI_IRAM_OPT/RX_IRAM_OPT are the larger block still
+# on the table (>10 KB and >17 KB) but are deliberately left alone here — they
+# move code out of IRAM, and changing both at once would make any throughput
+# regression impossible to attribute.
+CONFIG_ESP_WIFI_STATIC_TX_BUFFER_NUM=4
 CONFIG_ESP_WIFI_AMPDU_TX_ENABLED=n
 CONFIG_ESP_WIFI_AMPDU_RX_ENABLED=n
 
@@ -112,6 +135,10 @@ CONFIG_SPIRAM_ALLOW_STACK_EXTERNAL_MEMORY=y
 
 #### Lock-screen typography (fonts live in flash, not RAM)
 CONFIG_LV_FONT_MONTSERRAT_20=y
+# 36 for MUSIC's skip buttons against 48 for play/pause. Nothing sits between 20
+# and 48 by default, and 20 in a 96 px circle was the "timid icon" problem this
+# was meant to fix. Flash-only cost; the symbol glyphs come with it.
+CONFIG_LV_FONT_MONTSERRAT_36=y
 CONFIG_LV_FONT_MONTSERRAT_48=y
 
 #### Power management
