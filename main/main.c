@@ -137,6 +137,14 @@ static lv_timer_t  *s_app_timer;             /* owned by the running app */
  * inside one of its own touch callbacks would free the object mid-event. */
 static void app_request(int idx) { s_req_app = idx; }
 
+/* 0 when not associated. Worth having on the status line: a bulk transfer that
+ * stalls for 12 s is a link symptom, and this board can sit on a range extender
+ * where sustained downloads behave very differently from short API calls. */
+static int wifi_rssi(void) {
+    wifi_ap_record_t ap;
+    return (esp_wifi_sta_get_ap_info(&ap) == ESP_OK) ? ap.rssi : 0;
+}
+
 /* ---- home screen ---- */
 static lv_obj_t *s_scr_home;
 static lv_obj_t *s_status_label;
@@ -4082,8 +4090,21 @@ static bool sp_art_get(const char *art_url, uint8_t *buf, uint32_t *accent_out) 
     url[n] = '\0';
 
     size_t got = 0;
-    if (!asset_fetch_mem(url, BROKER_TOKEN, NULL, NULL, buf, SP_ART_BYTES, &got))
-        return false;
+    bool ok = asset_fetch_mem(url, BROKER_TOKEN, NULL, NULL, buf, SP_ART_BYTES, &got);
+
+    /* A body that started and stopped is a stalled link, not a refusal. The server
+     * side is ruled out — it serves this in 4-157 ms and tolerates a reader
+     * trickling 1 KB every 3 s for 75 s — so the far end did not give up on us.
+     * Retrying immediately recovers what a 30 s backoff would have made a visible
+     * gap. Only once, and only for a partial: a genuine 4xx retried in a loop is
+     * how you turn one bad response into a hammering. */
+    if (!ok && got > 0 && got < SP_ART_BYTES) {
+        ESP_LOGW(TAG, "spotify: art stalled at %u/%u (rssi %d) — retrying once",
+                 (unsigned)got, SP_ART_BYTES, wifi_rssi());
+        got = 0;
+        ok = asset_fetch_mem(url, BROKER_TOKEN, NULL, NULL, buf, SP_ART_BYTES, &got);
+    }
+    if (!ok) return false;
 
     /* Nothing decodes these bytes on the way through, so a short body or a broker
      * answering with something else would be blitted to the panel as garbage.
@@ -6908,12 +6929,12 @@ void app_main(void) {
                     strftime(clock, sizeof(clock), "%H:%M:%S", &tinfo);
                 }
             }
-            ESP_LOGI(TAG, "uptime=%llds clock=%s scr=%d idle=%lu/%llds wifi=%s screen=%s batt=%d%% %dmV%s fps=%u.%u "
+            ESP_LOGI(TAG, "uptime=%llds clock=%s scr=%d idle=%lu/%llds wifi=%s%d screen=%s batt=%d%% %dmV%s fps=%u.%u "
                           "rot=%d sd=%lu pet[%d/%d/%d]%s",
                      (long long)(t / 1000), clock, (int)s_app,
                      (unsigned long)lv_display_get_inactive_time(NULL),
                      (long long)((t - s_last_btn) / 1000),
-                     s_wifi_up ? "up" : "down",
+                     s_wifi_up ? "up" : "down", wifi_rssi(),
                      s_screen_on ? "on" : "off",
                      (int)s_batt_pct, (int)s_batt_mv,
                      s_batt_charging ? " CHG" : "",
