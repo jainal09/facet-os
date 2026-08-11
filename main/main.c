@@ -4747,6 +4747,13 @@ static const app_def_t s_apps[APP_COUNT] = {
     /* Red, and not the amber the app itself still uses for a running session:
      * PIP directly above it is 0xF59E0B, and two ambers side by side in a 2x2
      * made the tiles hard to tell apart at a glance. */
+    /* Red tile, amber session — deliberate, and confirmed with the user after
+     * seeing it on hardware. Every other app's tile colour matches its in-app
+     * accent, so this is the one place that pattern breaks and it looks like an
+     * oversight. It is not: the red reads as "timer" in the drawer and the amber
+     * reads as "running" inside. Don't unify them.
+     *
+     * The in-app amber is 0xFFB454 at pomo_refresh(). */
     [APP_POMO]   = { "FOCUS",  "pomo",   ICON_TARGET,    0xFF453A, build_pomo_app,   pomo_save },
 };
 
