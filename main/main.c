@@ -49,6 +49,7 @@
 #include "esp_lcd_panel_ops.h"
 #include "esp_pm.h"
 #include "esp_sntp.h"
+#include "esp_task_wdt.h"
 #include <time.h>
 #include <sys/stat.h>
 #include <errno.h>
@@ -253,6 +254,22 @@ static void log_mem(const char *tag2) {
         (unsigned)heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL),
         (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL),
         (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
+}
+
+/* The LVGL lock, bounded.
+ *
+ * An infinite wait here turns any stall on the LVGL side into a total freeze of
+ * the main loop, and that is exactly what happened once: every task blocked,
+ * both cores idle, no panic and no watchdog. A bounded wait degrades to one
+ * dropped UI update plus a loud log line, which is recoverable and diagnosable.
+ * The underlying mutex is recursive, so calling this from a callback already
+ * running under the lock is safe. */
+#define UI_LOCK_MS 2000
+
+static bool ui_lock(void) {
+    if (bsp_display_lock(UI_LOCK_MS)) return true;
+    ESP_LOGE(TAG, "LVGL lock timed out after %d ms — UI update skipped", UI_LOCK_MS);
+    return false;
 }
 
 /* No draw-buffer reservation: holding one across bsp_display_new() starved
@@ -658,7 +675,7 @@ static void imu_init(void) {
 
 static void rotation_apply(int r) {
     r &= 3;
-    if (!bsp_display_lock(-1)) return;
+    if (!ui_lock()) return;
 
     esp_lcd_panel_handle_t panel = bsp_display_panel_handle();
     if (panel) {
@@ -1989,6 +2006,10 @@ static bool wallpaper_valid(const char *path) {
 static esp_err_t dl_evt(esp_http_client_event_t *e) {
     if (e->event_id == HTTP_EVENT_ON_DATA && s_dl_file && e->data_len > 0) {
         fwrite(e->data, 1, e->data_len, s_dl_file);
+        /* This runs on the main task, which is watchdogged. A large download is
+         * legitimately slow, so feed the dog while bytes are still arriving —
+         * a genuinely stalled transfer stops feeding it and still trips. */
+        esp_task_wdt_reset();
     }
     return ESP_OK;
 }
@@ -2007,7 +2028,10 @@ static bool asset_fetch(const char *url, const char *path) {
     esp_http_client_config_t cfg = {
         .url = url,
         .crt_bundle_attach = esp_crt_bundle_attach,
-        .timeout_ms = 25000,
+        /* Per-socket-read, not total. Two of these run back to back inside one
+         * main-loop iteration, so the pair has to stay clear of the 30 s task
+         * watchdog even when both time out. */
+        .timeout_ms = 12000,
         .event_handler = dl_evt,
         .max_redirection_count = 5,
     };
@@ -2233,8 +2257,15 @@ static void power_set_doze(bool doze) {
 
     esp_lcd_panel_handle_t panel = bsp_display_panel_handle();
 
+    /* Under the LVGL lock: this runs on the main task, and the panel IO is not
+     * safe to drive while the LVGL task is mid-flush on the same QSPI device.
+     * Auto-sleep firing on the lock screen is the worst case for that race —
+     * its 40 ms sweep timer keeps flushes almost continuous. */
     if (doze) {
-        if (panel) esp_lcd_panel_disp_on_off(panel, false);   /* 0x28 */
+        if (panel && ui_lock()) {
+            esp_lcd_panel_disp_on_off(panel, false);          /* 0x28 */
+            bsp_display_unlock();
+        }
         esp_wifi_set_ps(WIFI_PS_MAX_MODEM);
         esp_pm_config_t pm = { .max_freq_mhz = 80, .min_freq_mhz = 80,
                                .light_sleep_enable = false };
@@ -2244,7 +2275,10 @@ static void power_set_doze(bool doze) {
                                .light_sleep_enable = false };
         esp_pm_configure(&pm);
         esp_wifi_set_ps(WIFI_PS_MIN_MODEM);
-        if (panel) esp_lcd_panel_disp_on_off(panel, true);    /* 0x29 */
+        if (panel && ui_lock()) {
+            esp_lcd_panel_disp_on_off(panel, true);           /* 0x29 */
+            bsp_display_unlock();
+        }
     }
     ESP_LOGI(TAG, "power: %s", doze ? "DOZE (panel off, wifi max sleep, 80 MHz)"
                                     : "ACTIVE");
@@ -2456,7 +2490,7 @@ static void always_on_toggle(void) {
     s_always_on = !s_always_on;
     ESP_LOGI(TAG, "always-on %s", s_always_on ? "ON" : "OFF");
 
-    if (!bsp_display_lock(-1)) return;
+    if (!ui_lock()) return;
     lock_refresh();                          /* recolours the sweep ring */
 
     lv_obj_t *toast = lv_label_create(lv_screen_active());
@@ -2495,7 +2529,7 @@ static void always_on_toggle(void) {
 static bool app_back(void) {
     if (s_app == APP_WIFI && s_pw_panel &&
         !lv_obj_has_flag(s_pw_panel, LV_OBJ_FLAG_HIDDEN)) {
-        if (bsp_display_lock(-1)) {
+        if (ui_lock()) {
             show_list_mode();                       /* password -> network list */
             bsp_display_unlock();
         }
@@ -2514,7 +2548,7 @@ static void app_action(void) {
         pet_play();
         break;
     case APP_WIFI:
-        if (bsp_display_lock(-1)) {
+        if (ui_lock()) {
             if (s_ap_list)     lv_obj_clean(s_ap_list);
             if (s_setup_title) lv_label_set_text(s_setup_title, "Scanning...");
             bsp_display_unlock();
@@ -2546,7 +2580,7 @@ static void app_open(int idx) {
     if (t0 - last_switch < 250000) return;      /* debounce double taps */
     last_switch = t0;
 
-    if (!bsp_display_lock(-1)) return;
+    if (!ui_lock()) return;
 
     /* let the outgoing app flush its state before its widgets disappear */
     if (s_app >= 0 && s_app < APP_COUNT && s_apps[s_app].save) {
@@ -2628,7 +2662,7 @@ void app_main(void) {
     } else {
         bsp_display_backlight_on();
         log_mem("display-up");
-        if (bsp_display_lock(-1)) {
+        if (ui_lock()) {
             lv_display_add_event_cb(disp, refr_ready_cb, LV_EVENT_REFR_READY, NULL);
             bsp_display_unlock();
         }
@@ -2658,7 +2692,18 @@ void app_main(void) {
     uint32_t last_refr = 0;
     int64_t s_last_btn = now_ms();
 
+    /* Watch the main loop itself.
+     *
+     * The task WDT only watches the idle tasks by default, so it cannot see the
+     * failure mode that actually bit us: a deadlock in which every task blocks
+     * and both cores go idle. The idle tasks were perfectly healthy, so nothing
+     * fired and the device simply sat frozen until it was power-cycled.
+     * Subscribing the main task means a stalled loop panics after 30 s and
+     * reboots with a backtrace — self-healing, and diagnosable next time. */
+    esp_task_wdt_add(NULL);
+
     while (1) {
+        esp_task_wdt_reset();
         vTaskDelay(pdMS_TO_TICKS(s_doze ? 120 : 20));
         int64_t t = now_ms();
 
@@ -2762,7 +2807,7 @@ void app_main(void) {
             if (got) {
                 /* same path, new bytes: without this LVGL keeps serving the
                  * previously decoded bitmap out of its image cache */
-                if (bsp_display_lock(-1)) {
+                if (ui_lock()) {
                     lv_image_cache_drop(WALLPAPER_LV);
                     bsp_display_unlock();
                 }
@@ -2780,7 +2825,7 @@ void app_main(void) {
         if (s_req_scan) {
             s_req_scan = false;
             wifi_scan_now();
-            if (bsp_display_lock(-1)) {
+            if (ui_lock()) {
                 if (s_ap_list) setup_fill_list();
                 bsp_display_unlock();
             }

@@ -392,7 +392,35 @@ it independently will need the same ones:
     `static const uint8_t sx[]` piled up against the left edge. The compiler does
     warn (`-Woverflow`); don't let warnings accumulate to the point where a real
     one is invisible.
-12. **A vote counter is not hysteresis.** Autorotate flipped back and forth every
+12. **The task WDT cannot see a deadlock in which everything blocks.** The
+    device froze solid: display stuck, no panic, no watchdog, no reboot — but
+    the console kept printing from a background task, so it was clearly still
+    alive. The default task WDT only watches the **idle** tasks, and in a
+    mutual-block every task sleeps, so both idle tasks run happily and the WDT
+    is satisfied. Attaching over the S3's built-in USB-JTAG confirmed it:
+    `IDLE0` and `IDLE1` both `Running`, every other task blocked. Subscribe the
+    main loop explicitly with `esp_task_wdt_add(NULL)` + a per-iteration
+    `esp_task_wdt_reset()`; then a stall panics with a backtrace instead of
+    sitting there. Budget for legitimately slow work inside the loop (an HTTP
+    fetch) by feeding the dog from its progress callback rather than by
+    unsubscribing.
+13. **Never drive the panel IO from two tasks.** `esp_lcd_panel_disp_on_off()`
+    called from the main task races the LVGL task's `esp_lcd_panel_draw_bitmap()`
+    on the same QSPI device; a lost completion callback leaves LVGL waiting on
+    a flush that never finishes, holding the LVGL lock, which then blocks
+    everything else. Take the LVGL lock around any panel command issued outside
+    the LVGL task. Auto-sleep on an animated screen is the worst case, because
+    its timer keeps flushes nearly continuous.
+14. **`bsp_display_lock(-1)` in the main loop converts any LVGL stall into a
+    total freeze.** Use a bounded timeout and log loudly on failure — a dropped
+    UI frame is recoverable, an infinite wait is not.
+15. **Debugging a live hang:** the ESP32-S3's USB-Serial/JTAG does CDC and JTAG
+    at once, so `openocd -f board/esp32s3-builtin.cfg` plus
+    `xtensa-esp32s3-elf-gdb -ex "target extended-remote :3333"` can attach to a
+    frozen board without reflashing. Get `info threads` **and** the backtraces
+    in a *single* gdb session — thread IDs are re-enumerated on every attach,
+    and `monitor halt` leaves the CPUs stopped, so finish with `reset run`.
+16. **A vote counter is not hysteresis.** Autorotate flipped back and forth every
     few seconds on a stationary desk despite requiring eight consecutive
     agreeing samples — near 45° the input itself is genuinely ambiguous, so the
     counter just confirms whichever wrong answer arrived first. Debounce fixes
