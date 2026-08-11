@@ -1,0 +1,41 @@
+# Facet broker — install to /etc/systemd/system/facet-broker.service
+#
+#   sudo cp facet-broker /usr/local/bin/
+#   sudo mkdir -p /var/lib/facet-broker
+#   sudo install -m 600 -o facet -g facet broker.env /etc/facet-broker.env
+#   sudo systemctl enable --now facet-broker
+#   sudo tailscale funnel --bg 8080
+[Unit]
+Description=Facet broker (Spotify pairing + album art transcode)
+After=network-online.target tailscaled.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Secrets live in a 0600 file, never on the command line — /proc/PID/cmdline is
+# world-readable and would leak BROKER_TOKEN to any local user.
+EnvironmentFile=/etc/facet-broker.env
+ExecStart=/usr/local/bin/facet-broker -addr 127.0.0.1:8080 -cache-dir /var/lib/facet-broker/cache
+Restart=always
+RestartSec=3
+
+# It fetches images from the internet and writes one cache directory. Nothing
+# else should be reachable from it.
+DynamicUser=yes
+StateDirectory=facet-broker
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_INET AF_INET6
+RestrictNamespaces=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=multi-user.target

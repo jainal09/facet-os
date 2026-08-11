@@ -299,6 +299,21 @@ UI task), cache to the card, decode from the card when shown. Nothing preloaded.
   `lv_image_cache_drop(path)`**, or it keeps serving the old bitmap and the new
   wallpaper never appears. It is declared in
   `src/misc/cache/instance/lv_image_cache.h`, which `lvgl.h` does not include.
+- **TJpgD never puts anything in LVGL's image cache**, so `LV_CACHE_DEF_SIZE`
+  cannot help a JPEG at all. `lv_tjpgd.c` never calls
+  `lv_image_decoder_add_to_cache()` — LodePNG does. With 32-row draw buffers a
+  full redraw is 15 passes, and a JPEG re-runs a **complete decode on every
+  one of them, every frame, forever**. That is the dial-up wallpaper symptom
+  again, except no cache size fixes it. TJpgD also decodes baseline only, outputs
+  RGB888 (a further conversion to the panel's RGB565 at blit time), and has
+  descaling compiled out (`JD_USE_SCALE 0`).
+- **`espressif__esp_lv_decoder` is already vendored and compiled, but inert.** It
+  wraps `esp_new_jpeg` (baseline JPEG, ~10 KB fixed scratch), libpng and QOI, it
+  **does** register with the image cache, and it explicitly allocates its buffers
+  from PSRAM. It is dead because `CONFIG_ESP_LVGL_ADAPTER_ENABLE_DECODER` is
+  unset and nothing calls `esp_lv_decoder_init()` — confirmed with `nm` on the
+  ELF, not just from config. Turn both on if JPEG is ever needed on screen.
+  Neither decoder handles progressive JPEG, so the source still has to cooperate.
 - **FATFS defaults to 8.3 filenames**, so creating `telemetry.csv` (9-char stem)
   silently fails. Enable `CONFIG_FATFS_LFN_HEAP=y` or keep stems ≤ 8 chars.
 - **Validate cached assets on boot** (e.g. check the PNG signature). A fetch
@@ -384,6 +399,41 @@ Two things to know when measuring this:
   `example.com` and was mostly that server, not our TLS cost.
 
 A re-runnable bench lives behind `#define NET_BENCH` in `main.c`.
+
+### Reusing one `esp_http_client` handle across an API
+
+Verified against `esp_http_client.c` in IDF v5.5.5. All of this matters if you
+want the 6 ms figure across a whole REST API rather than one URL:
+
+- **Changing only the path keeps the connection.** `esp_http_client_set_url()`
+  closes only when the **host or port** changes (`esp_http_client.c:1174-1210`);
+  path and query never trigger a close. So one handle serves every endpoint on a
+  host. `esp_http_client_set_method()` is likewise free to change between calls.
+- **`keep_alive_enable` is TCP socket keepalive (`SO_KEEPALIVE`, `TCP_KEEPIDLE`
+  …), not HTTP persistence.** HTTP/1.1 persistence is the default and the
+  keep-open decision is made from the *server's* response
+  (`http_should_keep_alive`). The speed-up comes from that, not from the flag —
+  the flag only helps notice a dead socket. Easy to misattribute.
+- **A POST body survives into the next request.** `client->post_data` and
+  `post_len` are never cleared automatically, so a bodiless `POST` on a handle
+  that last sent JSON **resends the old JSON**. Call
+  `esp_http_client_set_post_field(c, NULL, 0)` first — it clears both and deletes
+  the `Content-Type` header (`esp_http_client.c:1872-1891`). Headers persist
+  across requests generally, which is what makes `Authorization` reuse work.
+- `Content-Length: 0` is emitted automatically for POST/PUT with no body
+  (`esp_http_client.c:1661-1672`); nothing extra is needed.
+- **A 401 carrying `WWW-Authenticate: Bearer` makes `perform()` fail *and* skips
+  draining the body.** It is treated as an auth challenge the client cannot
+  answer, returning `ESP_ERR_NOT_SUPPORTED` before the body-read loops, so
+  unread bytes are left on the socket and the connection is not closed. Reusing
+  the handle then reads garbage. Any bearer-token API hits this on **every token
+  expiry**, so it is a main path, not an edge case: on 401, call
+  `esp_http_client_flush_response()` or close, then refresh and retry. There is
+  no config flag to suppress it; the only clean alternative is the
+  `open`/`fetch_headers`/`read` API, which bypasses the check entirely.
+- **One handle is not thread-safe.** The struct carries no lock and every field
+  is mutated in place. Confine it to one task — a command queue plus a single
+  owning task is the shape that works.
 
 ## 8. Recovery when the board won't flash
 
