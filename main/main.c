@@ -156,6 +156,12 @@ static lv_obj_t *s_pw_panel;
 static lv_obj_t *s_pw_ssid_label;
 static lv_obj_t *s_pw_ta;
 static lv_obj_t *s_keyboard;
+static lv_obj_t *s_wifi_hdr;        /* "connected to X" banner above the list */
+static lv_obj_t *s_conn_panel;      /* details + disconnect for the joined AP */
+static lv_obj_t *s_conn_ssid;
+static lv_obj_t *s_conn_ip;
+static lv_obj_t *s_conn_btn;
+static lv_obj_t *s_conn_btn_label;
 
 /* ---- pet screen (widgets are declared with the scene, further down) ---- */
 static lv_obj_t *s_scr_pet;
@@ -183,6 +189,12 @@ static char s_new_ssid[33];
 static char s_new_pass[65];
 static volatile bool s_req_scan;
 static volatile bool s_req_apply;
+static volatile bool s_req_wifi_off;   /* user tapped DISCONNECT  */
+static volatile bool s_req_wifi_on;    /* user tapped RECONNECT   */
+/* Set only by an explicit disconnect. Auto-reconnect must respect it, or the
+ * station is back on the network a second after the user asked it not to be. */
+static bool s_wifi_disabled;
+static char s_ip[16];
 static volatile bool s_req_http;
 static volatile bool s_req_sntp;
 static volatile bool s_req_wake;
@@ -358,9 +370,11 @@ static void wifi_event_handler(void *arg, esp_event_base_t base, int32_t id, voi
     } else if (base == WIFI_EVENT && id == WIFI_EVENT_STA_DISCONNECTED) {
         wifi_event_sta_disconnected_t *d = (wifi_event_sta_disconnected_t *)data;
         s_wifi_up = false;
+        s_ip[0] = '\0';
         xEventGroupClearBits(s_evt, WIFI_CONNECTED_BIT);
-        /* a scan drops the association on purpose — don't fight it */
-        if (s_app != APP_WIFI) {
+        /* a scan drops the association on purpose — don't fight it; and never
+         * undo an explicit disconnect */
+        if (s_app != APP_WIFI && !s_wifi_disabled) {
             ESP_LOGW(TAG, "WiFi disconnected (reason=%d), retrying...", d->reason);
             vTaskDelay(pdMS_TO_TICKS(1000));
             esp_wifi_connect();
@@ -368,6 +382,7 @@ static void wifi_event_handler(void *arg, esp_event_base_t base, int32_t id, voi
     } else if (base == IP_EVENT && id == IP_EVENT_STA_GOT_IP) {
         ip_event_got_ip_t *e = (ip_event_got_ip_t *)data;
         ESP_LOGI(TAG, "WiFi got IP: " IPSTR, IP2STR(&e->ip_info.ip));
+        snprintf(s_ip, sizeof(s_ip), IPSTR, IP2STR(&e->ip_info.ip));
         s_wifi_up = true;
         log_event("wifi " IPSTR, IP2STR(&e->ip_info.ip));
         if (!s_time_synced) s_req_sntp = true;
@@ -1620,29 +1635,89 @@ static void build_status_app(lv_obj_t *scr) {
 
 /* ---------------- setup screen ---------------- */
 
+/* true when this SSID is the one the station is actually associated with */
+static bool wifi_is_current(const char *ssid) {
+    return s_wifi_up && s_ssid[0] && strcmp(ssid, s_ssid) == 0;
+}
+
+/* The banner above the list. Which network you are on is the first thing this
+ * screen should answer, and it used to not answer it at all. */
+static void wifi_hdr_refresh(void) {
+    if (!s_wifi_hdr) return;
+    if (s_wifi_up) {
+        lv_obj_set_style_text_color(s_wifi_hdr, lv_color_hex(0x35C759), 0);
+        lv_label_set_text_fmt(s_wifi_hdr, LV_SYMBOL_OK " %.24s", s_ssid);
+    } else if (s_wifi_disabled) {
+        lv_obj_set_style_text_color(s_wifi_hdr, lv_color_hex(0xFF453A), 0);
+        lv_label_set_text(s_wifi_hdr, "Wi-Fi off");
+    } else {
+        lv_obj_set_style_text_color(s_wifi_hdr, lv_color_hex(0x8A8AA0), 0);
+        lv_label_set_text(s_wifi_hdr, "Not connected");
+    }
+}
+
 static void show_list_mode(void) {
     lv_label_set_text(s_setup_title, "Select Wi-Fi");
+    wifi_hdr_refresh();
+    lv_obj_remove_flag(s_wifi_hdr, LV_OBJ_FLAG_HIDDEN);
     lv_obj_remove_flag(s_ap_list, LV_OBJ_FLAG_HIDDEN);
     lv_obj_remove_flag(s_rescan_btn, LV_OBJ_FLAG_HIDDEN);
     lv_obj_add_flag(s_pw_panel, LV_OBJ_FLAG_HIDDEN);
     lv_obj_add_flag(s_keyboard, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_flag(s_conn_panel, LV_OBJ_FLAG_HIDDEN);
 }
 
 static void show_password_mode(const char *ssid) {
     lv_label_set_text(s_setup_title, "Password");
     lv_label_set_text(s_pw_ssid_label, ssid);
     lv_textarea_set_text(s_pw_ta, "");
+    lv_obj_add_flag(s_wifi_hdr, LV_OBJ_FLAG_HIDDEN);
     lv_obj_add_flag(s_ap_list, LV_OBJ_FLAG_HIDDEN);
     lv_obj_add_flag(s_rescan_btn, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_flag(s_conn_panel, LV_OBJ_FLAG_HIDDEN);
     lv_obj_remove_flag(s_pw_panel, LV_OBJ_FLAG_HIDDEN);
     lv_obj_remove_flag(s_keyboard, LV_OBJ_FLAG_HIDDEN);
     lv_keyboard_set_textarea(s_keyboard, s_pw_ta);
+}
+
+/* Tapping the network you are already on has no business opening a keyboard —
+ * you are not entering a password for it. Show what it is and offer the one
+ * action that makes sense. */
+static void show_conn_mode(const char *ssid) {
+    lv_label_set_text(s_setup_title, "Connected");
+    lv_label_set_text_fmt(s_conn_ssid, "%.28s", ssid);
+    lv_label_set_text_fmt(s_conn_ip, "%s", s_ip[0] ? s_ip : "no address");
+
+    bool on = s_wifi_up;
+    lv_label_set_text(s_conn_btn_label, on ? LV_SYMBOL_CLOSE "  Disconnect"
+                                           : LV_SYMBOL_WIFI  "  Reconnect");
+    lv_obj_set_style_bg_color(s_conn_btn,
+        lv_color_hex(on ? 0x7A1F26 : 0x1F5A46), 0);
+
+    lv_obj_add_flag(s_wifi_hdr, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_flag(s_ap_list, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_flag(s_rescan_btn, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_flag(s_pw_panel, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_flag(s_keyboard, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_remove_flag(s_conn_panel, LV_OBJ_FLAG_HIDDEN);
+}
+
+static void conn_btn_cb(lv_event_t *e) {
+    /* deferred to the main task, like every other side effect here */
+    if (s_wifi_up) s_req_wifi_off = true;
+    else           s_req_wifi_on  = true;
+    show_list_mode();
 }
 
 static void ap_click_cb(lv_event_t *e) {
     lv_obj_t *btn = lv_event_get_target(e);
     int idx = (int)(intptr_t)lv_obj_get_user_data(btn);
     if (idx < 0 || idx >= s_ap_count) return;
+
+    if (wifi_is_current(s_aps[idx].ssid)) {
+        show_conn_mode(s_aps[idx].ssid);
+        return;
+    }
 
     snprintf(s_new_ssid, sizeof(s_new_ssid), "%s", s_aps[idx].ssid);
     if (!s_aps[idx].secure) {
@@ -1665,6 +1740,22 @@ static void kb_event_cb(lv_event_t *e) {
     }
 }
 
+/* The disconnect is handled by the main task, so the UI only learns it worked a
+ * moment later. Poll so the banner and the button follow reality. */
+static void wifi_timer_cb(lv_timer_t *t) {
+    if (!s_wifi_hdr || !s_conn_btn_label) return;
+    if (!lv_obj_has_flag(s_wifi_hdr, LV_OBJ_FLAG_HIDDEN)) {
+        wifi_hdr_refresh();
+    } else if (!lv_obj_has_flag(s_conn_panel, LV_OBJ_FLAG_HIDDEN)) {
+        bool on = s_wifi_up;
+        lv_label_set_text(s_conn_btn_label, on ? LV_SYMBOL_CLOSE "  Disconnect"
+                                               : LV_SYMBOL_WIFI  "  Reconnect");
+        lv_obj_set_style_bg_color(s_conn_btn,
+            lv_color_hex(on ? 0x7A1F26 : 0x1F5A46), 0);
+        lv_label_set_text(s_conn_ip, s_ip[0] ? s_ip : "no address");
+    }
+}
+
 static void rescan_cb(lv_event_t *e) {
     lv_obj_clean(s_ap_list);
     lv_label_set_text(s_setup_title, "Scanning...");
@@ -1680,6 +1771,13 @@ static void build_wifi_app(lv_obj_t *scr) {
     lv_obj_set_style_text_color(s_setup_title, lv_color_hex(0xE6E6EE), 0);
     lv_label_set_text(s_setup_title, "Scanning...");
     lv_obj_align(s_setup_title, LV_ALIGN_TOP_MID, 0, TOP_MARGIN + 4);
+
+    s_wifi_hdr = lv_label_create(s_scr_setup);
+    lv_obj_set_width(s_wifi_hdr, CONTENT_W);
+    lv_obj_set_style_text_align(s_wifi_hdr, LV_TEXT_ALIGN_CENTER, 0);
+    lv_label_set_long_mode(s_wifi_hdr, LV_LABEL_LONG_DOT);
+    lv_obj_align(s_wifi_hdr, LV_ALIGN_TOP_MID, 0, TOP_MARGIN + 34);
+    lv_label_set_text(s_wifi_hdr, "");
 
     s_ap_list = lv_list_create(s_scr_setup);
     lv_obj_set_size(s_ap_list, CONTENT_W, 264);
@@ -1721,6 +1819,46 @@ static void build_wifi_app(lv_obj_t *scr) {
     lv_obj_set_style_bg_color(s_pw_ta, lv_color_hex(0x14141F), 0);
     lv_obj_set_style_border_color(s_pw_ta, lv_color_hex(0x38B2AC), LV_PART_MAIN);
 
+    s_conn_panel = lv_obj_create(s_scr_setup);
+    lv_obj_remove_style_all(s_conn_panel);
+    lv_obj_set_size(s_conn_panel, CONTENT_W, 250);
+    lv_obj_align(s_conn_panel, LV_ALIGN_TOP_MID, 0, 104);
+    lv_obj_remove_flag(s_conn_panel, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_style_bg_color(s_conn_panel, lv_color_hex(0x14141F), 0);
+    lv_obj_set_style_bg_opa(s_conn_panel, LV_OPA_COVER, 0);
+    lv_obj_set_style_radius(s_conn_panel, 16, 0);
+    lv_obj_set_style_pad_all(s_conn_panel, 14, 0);
+
+    lv_obj_t *ct = lv_label_create(s_conn_panel);
+    lv_obj_set_style_text_color(ct, lv_color_hex(0x35C759), 0);
+    lv_label_set_text(ct, LV_SYMBOL_OK "  CONNECTED TO");
+    lv_obj_align(ct, LV_ALIGN_TOP_MID, 0, 4);
+
+    s_conn_ssid = lv_label_create(s_conn_panel);
+    lv_obj_set_width(s_conn_ssid, CONTENT_W - 36);
+    lv_obj_set_style_text_align(s_conn_ssid, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_style_text_color(s_conn_ssid, lv_color_hex(0xE6E6EE), 0);
+    lv_obj_set_style_text_font(s_conn_ssid, &lv_font_montserrat_20, 0);
+    lv_label_set_long_mode(s_conn_ssid, LV_LABEL_LONG_DOT);
+    lv_label_set_text(s_conn_ssid, "");
+    lv_obj_align(s_conn_ssid, LV_ALIGN_TOP_MID, 0, 36);
+
+    s_conn_ip = lv_label_create(s_conn_panel);
+    lv_obj_set_width(s_conn_ip, CONTENT_W - 36);
+    lv_obj_set_style_text_align(s_conn_ip, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_style_text_color(s_conn_ip, lv_color_hex(0x8A8AA0), 0);
+    lv_label_set_text(s_conn_ip, "");
+    lv_obj_align(s_conn_ip, LV_ALIGN_TOP_MID, 0, 74);
+
+    s_conn_btn = lv_button_create(s_conn_panel);
+    lv_obj_set_size(s_conn_btn, 210, 50);
+    lv_obj_align(s_conn_btn, LV_ALIGN_BOTTOM_MID, 0, -6);
+    lv_obj_set_style_radius(s_conn_btn, 14, 0);
+    lv_obj_add_event_cb(s_conn_btn, conn_btn_cb, LV_EVENT_CLICKED, NULL);
+    s_conn_btn_label = lv_label_create(s_conn_btn);
+    lv_obj_center(s_conn_btn_label);
+    lv_label_set_text(s_conn_btn_label, "");
+
     s_keyboard = lv_keyboard_create(s_scr_setup);
     lv_obj_set_size(s_keyboard, KB_W, KB_H);
     lv_obj_align(s_keyboard, LV_ALIGN_BOTTOM_MID, 0, -BOTTOM_MARGIN);
@@ -1733,6 +1871,7 @@ static void build_wifi_app(lv_obj_t *scr) {
     lv_obj_add_event_cb(s_scr_setup, gesture_home_cb, LV_EVENT_GESTURE, NULL);
 
     show_list_mode();
+    s_app_timer = lv_timer_create(wifi_timer_cb, 500, NULL);
 }
 
 /* caller holds the LVGL lock */
@@ -1743,16 +1882,31 @@ static void setup_fill_list(void) {
         return;
     }
     lv_label_set_text(s_setup_title, "Select Wi-Fi");
-    for (int i = 0; i < s_ap_count; i++) {
-        char row[56];
-        snprintf(row, sizeof(row), "%.32s  %ddBm", s_aps[i].ssid, s_aps[i].rssi);
-        lv_obj_t *btn = lv_list_add_button(s_ap_list,
-                                           s_aps[i].secure ? LV_SYMBOL_WIFI : LV_SYMBOL_OK,
-                                           row);
-        lv_obj_set_user_data(btn, (void *)(intptr_t)i);
-        lv_obj_add_event_cb(btn, ap_click_cb, LV_EVENT_CLICKED, NULL);
-        lv_obj_set_style_bg_color(btn, lv_color_hex(0x1C1C2B), 0);
-        lv_obj_set_style_text_color(btn, lv_color_hex(0xD8D8E4), 0);
+    wifi_hdr_refresh();
+
+    /* The joined network goes first and is marked, so it is obvious at a glance
+     * which one you are on without reading signal strengths. */
+    for (int pass = 0; pass < 2; pass++) {
+        for (int i = 0; i < s_ap_count; i++) {
+            bool cur = wifi_is_current(s_aps[i].ssid);
+            if (cur != (pass == 0)) continue;
+
+            char row[64];
+            if (cur) {
+                snprintf(row, sizeof(row), "%.32s  connected", s_aps[i].ssid);
+            } else {
+                snprintf(row, sizeof(row), "%.32s  %ddBm%s", s_aps[i].ssid,
+                         s_aps[i].rssi, s_aps[i].secure ? "" : "  open");
+            }
+            lv_obj_t *btn = lv_list_add_button(s_ap_list,
+                                               cur ? LV_SYMBOL_OK : LV_SYMBOL_WIFI,
+                                               row);
+            lv_obj_set_user_data(btn, (void *)(intptr_t)i);
+            lv_obj_add_event_cb(btn, ap_click_cb, LV_EVENT_CLICKED, NULL);
+            lv_obj_set_style_bg_color(btn, lv_color_hex(cur ? 0x14332A : 0x1C1C2B), 0);
+            lv_obj_set_style_text_color(btn,
+                lv_color_hex(cur ? 0x35C759 : 0xD8D8E4), 0);
+        }
     }
 }
 
@@ -2700,15 +2854,15 @@ static void always_on_toggle(void) {
 
 /* true if the app consumed the Back itself (it had a sub-scene to pop) */
 static bool app_back(void) {
-    if (s_app == APP_WIFI && s_pw_panel &&
-        !lv_obj_has_flag(s_pw_panel, LV_OBJ_FLAG_HIDDEN)) {
-        if (ui_lock()) {
-            show_list_mode();                       /* password -> network list */
-            bsp_display_unlock();
-        }
-        return true;
+    if (s_app != APP_WIFI) return false;
+    bool on_pw   = s_pw_panel   && !lv_obj_has_flag(s_pw_panel, LV_OBJ_FLAG_HIDDEN);
+    bool on_conn = s_conn_panel && !lv_obj_has_flag(s_conn_panel, LV_OBJ_FLAG_HIDDEN);
+    if (!on_pw && !on_conn) return false;
+    if (ui_lock()) {
+        show_list_mode();          /* password or details -> network list */
+        bsp_display_unlock();
     }
-    return false;
+    return true;
 }
 
 static void app_action(void) {
@@ -2765,6 +2919,8 @@ static void app_open(int idx) {
     s_bolt_label = NULL; s_fps_label = NULL; s_events_label = NULL;
     s_ap_list = NULL; s_keyboard = NULL; s_pw_ta = NULL;
     s_pw_panel = NULL; s_setup_title = NULL;
+    s_wifi_hdr = NULL; s_conn_panel = NULL; s_conn_ssid = NULL;
+    s_conn_ip = NULL; s_conn_btn = NULL; s_conn_btn_label = NULL;
     s_ch_wrap = NULL; s_sys_label = NULL;
     s_lock_time = NULL; s_lock_date = NULL; s_lock_batt = NULL;
     s_lock_sweep = NULL; s_lock_batt_arc = NULL;
@@ -2861,7 +3017,7 @@ void app_main(void) {
 
     int64_t last_stats = now_ms();
     int64_t last_batt = 0, last_imu = 0, last_pet = now_ms(), last_pet_save = now_ms();
-    int64_t last_tele = now_ms();
+    int64_t last_tele = now_ms(), last_rejoin = now_ms();
     uint32_t last_refr = 0;
     int64_t s_last_btn = now_ms();
 
@@ -2982,6 +3138,7 @@ void app_main(void) {
 
         if (s_req_apply) {
             s_req_apply = false;
+            s_wifi_disabled = false;       /* joining is an explicit "on" */
             snprintf(s_ssid, sizeof(s_ssid), "%s", s_new_ssid);
             snprintf(s_pass, sizeof(s_pass), "%s", s_new_pass);
             creds_save(s_ssid, s_pass);
@@ -2989,6 +3146,31 @@ void app_main(void) {
             log_event("join %s", s_ssid);
             esp_wifi_disconnect();
             wifi_apply_config(s_ssid, s_pass);
+            esp_wifi_connect();
+        }
+
+        if (s_req_wifi_off) {
+            s_req_wifi_off = false;
+            s_wifi_disabled = true;
+            ESP_LOGI(TAG, "wifi disconnect requested");
+            log_event("wifi off");
+            esp_wifi_disconnect();
+        }
+        if (s_req_wifi_on) {
+            s_req_wifi_on = false;
+            s_wifi_disabled = false;
+            ESP_LOGI(TAG, "wifi reconnect requested");
+            log_event("wifi on");
+            esp_wifi_connect();
+        }
+
+        /* Keep-alive for the association. The event handler deliberately skips
+         * its retry while the WI-FI app is open (a scan drops the link on
+         * purpose), which left no one to reconnect after leaving the app. A
+         * periodic nudge is more robust than relying on the event alone. */
+        if (!s_wifi_up && !s_wifi_disabled && s_app != APP_WIFI &&
+            t - last_rejoin >= 10000) {
+            last_rejoin = t;
             esp_wifi_connect();
         }
 

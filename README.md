@@ -35,7 +35,7 @@ and not PSRAM, is what decides whether a feature fits. Facet is built around it:
 |---|---|---|
 | **STATUS** | Endpoint health, Wi-Fi, heap, frame rate, rolling event log | Fetch a new wallpaper |
 | **PIP** | A virtual pet on a tiny planet — wanders, stargazes, dances, naps | Play with it |
-| **WI-FI** | Network scan and an on-screen keyboard; credentials saved to NVS | Rescan |
+| **WI-FI** | Shows the joined network, scan list, on-screen keyboard; tap the connected network to disconnect | Rescan |
 | **SYSTEM** | Diagnostics | Step the rotation calibration |
 
 Plus a lock screen: a HUD clock with a battery ring and a sweeping arc, backed
