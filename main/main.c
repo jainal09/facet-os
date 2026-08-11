@@ -5328,6 +5328,7 @@ static void lock_tap_cb(lv_event_t *e) {
         s_req_wake = true;
         return;
     }
+    ESP_LOGI(TAG, "lock: screen tapped -> home");
     app_request(APP_DRAWER);      /* always home, not "wherever you locked from" */
 }
 
@@ -5345,6 +5346,7 @@ static void lock_np_tap_cb(lv_event_t *e) {
         s_req_wake = true;
         return;
     }
+    ESP_LOGI(TAG, "lock: cover tapped -> MUSIC");
     app_request(APP_MUSIC);
 }
 
