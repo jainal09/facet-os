@@ -219,6 +219,10 @@ static bool s_sd_ok;
 static uint32_t s_tele_rows;
 static bool s_doze;
 static char s_wall_credit[48];      /* Unsplash photographer, shown in STATUS */
+
+/* One tick of the wallpaper pool. Defined with the asset code further down but
+ * driven from the network task, which is declared long before it. */
+static void wall_service(void);
 static void power_set_doze(bool doze);
 static int  battery_drain_mv_h(void);
 
@@ -483,6 +487,13 @@ static void https_task(void *arg) {
                      (unsigned)heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL));
             esp_http_client_cleanup(client);
         }
+        /* Wallpapers ride along on this task rather than the main loop. It
+         * already owns an 8 KB stack and a TLS path, so the pool costs no
+         * additional internal SRAM — and a slow download can no longer stall
+         * button handling or the app switcher, which it did when the fetch ran
+         * inline. */
+        wall_service();
+
         int period = s_doze ? (10 * 60 * 1000) : HTTPS_PERIOD_MS;
         for (int w = 0; w < period / 100 && !s_req_http; w++) {
             vTaskDelay(pdMS_TO_TICKS(100));
@@ -1982,13 +1993,35 @@ static void rtc_store(void) {
  * cannot show.
  */
 
-#define WALLPAPER_PATH  BSP_SD_MOUNT_POINT "/assets/lock.png"
-#define WALLPAPER_LV    "S:" BSP_SD_MOUNT_POINT "/assets/lock.png"
-#define UNSPLASH_JSON   BSP_SD_MOUNT_POINT "/assets/rnd.json"
-#define CREDIT_PATH     BSP_SD_MOUNT_POINT "/assets/credit.txt"
+/* A pool, not a single file.
+ *
+ * One wallpaper meant every unlock showed the same picture until the next
+ * download — four images a day, and the device looked static. The card has
+ * 32 GB, so keep WALL_SLOTS of them (~400 KB each) and pick a random one every
+ * time the lock screen is built. Downloads then only control how fast the pool
+ * turns over, not how much variety you see.
+ */
+#define WALL_SLOTS      12
+#define WALL_DIR        BSP_SD_MOUNT_POINT "/assets"
+#define UNSPLASH_JSON   WALL_DIR "/rnd.json"
+
+/* Legacy single-wallpaper path, deleted on boot if it is still lying around. */
+#define WALLPAPER_OLD   WALL_DIR "/lock.png"
 
 static FILE *s_dl_file;
 static volatile bool s_req_wallpaper;
+static int s_wall_slot = -1;         /* slot currently on screen, -1 = none */
+static int64_t s_wall_last;          /* last download attempt, success or not */
+
+static void wall_png(int slot, char *out, size_t n) {
+    snprintf(out, n, WALL_DIR "/w%d.png", slot);
+}
+static void wall_lv(int slot, char *out, size_t n) {
+    snprintf(out, n, "S:" WALL_DIR "/w%d.png", slot);
+}
+static void wall_txt(int slot, char *out, size_t n) {
+    snprintf(out, n, WALL_DIR "/w%d.txt", slot);
+}
 
 /* A cached wallpaper is only usable if it really is a PNG. Earlier builds
  * saved a progressive JPEG under a .png name, and a stale bad file would
@@ -2003,13 +2036,53 @@ static bool wallpaper_valid(const char *path) {
     return n == sizeof(hdr) && memcmp(hdr, sig, sizeof(sig)) == 0;
 }
 
+/* Which slots hold a usable image. Cached as a bitmask rather than re-stat'ing
+ * twelve files every time the lock screen is built. */
+static uint16_t s_wall_have;
+
+static void wall_scan(void) {
+    s_wall_have = 0;
+    if (!s_sd_ok) return;
+    for (int i = 0; i < WALL_SLOTS; i++) {
+        char p[64];
+        wall_png(i, p, sizeof(p));
+        if (wallpaper_valid(p)) s_wall_have |= (uint16_t)(1u << i);
+        else remove(p);                  /* truncated or wrong format */
+    }
+    ESP_LOGI(TAG, "wallpaper pool: %d/%d slots", __builtin_popcount(s_wall_have),
+             WALL_SLOTS);
+}
+
+static int wall_first_empty(void) {
+    for (int i = 0; i < WALL_SLOTS; i++) {
+        if (!(s_wall_have & (1u << i))) return i;
+    }
+    return -1;
+}
+
+/* A slot to download into: fill the gaps first so a fresh card reaches full
+ * variety quickly, then recycle at random once the pool is complete. */
+static int wall_target_slot(void) {
+    int empty = wall_first_empty();
+    return empty >= 0 ? empty : (int)(esp_random() % WALL_SLOTS);
+}
+
+/* A slot to display, avoiding an immediate repeat of the one already up. */
+static int wall_display_slot(void) {
+    int have = __builtin_popcount(s_wall_have);
+    if (have == 0) return -1;
+    for (int tries = 0; tries < 8; tries++) {
+        int pick = (int)(esp_random() % WALL_SLOTS);
+        if (!(s_wall_have & (1u << pick))) continue;
+        if (pick == s_wall_slot && have > 1) continue;
+        return pick;
+    }
+    return wall_first_empty() == 0 ? -1 : __builtin_ctz(s_wall_have);
+}
+
 static esp_err_t dl_evt(esp_http_client_event_t *e) {
     if (e->event_id == HTTP_EVENT_ON_DATA && s_dl_file && e->data_len > 0) {
         fwrite(e->data, 1, e->data_len, s_dl_file);
-        /* This runs on the main task, which is watchdogged. A large download is
-         * legitimately slow, so feed the dog while bytes are still arriving —
-         * a genuinely stalled transfer stops feeding it and still trips. */
-        esp_task_wdt_reset();
     }
     return ESP_OK;
 }
@@ -2028,10 +2101,7 @@ static bool asset_fetch(const char *url, const char *path) {
     esp_http_client_config_t cfg = {
         .url = url,
         .crt_bundle_attach = esp_crt_bundle_attach,
-        /* Per-socket-read, not total. Two of these run back to back inside one
-         * main-loop iteration, so the pair has to stay clear of the 30 s task
-         * watchdog even when both time out. */
-        .timeout_ms = 12000,
+        .timeout_ms = 12000,     /* per socket read, not total */
         .event_handler = dl_evt,
         .max_redirection_count = 5,
     };
@@ -2057,19 +2127,64 @@ static bool asset_fetch(const char *url, const char *path) {
     return ok;
 }
 
-/* One API call for a random photo, then the image itself at panel resolution.
- * The JSON is parked on the card and parsed from PSRAM so the ~10 KB response
- * never competes for internal heap. The photographer's name is recorded on the
- * card and shown in STATUS — Unsplash's API terms require attribution, but the
- * lock screen stays clean. */
-static bool unsplash_wallpaper(void) {
+/* Pick one theme at random out of the ';'-separated UNSPLASH_QUERY list.
+ * A single query would fill the whole pool with one subject, which is the
+ * opposite of the point. */
+static void wall_pick_theme(char *out, size_t n) {
+    const char *all = UNSPLASH_QUERY;
+    int count = 1;
+    for (const char *p = all; *p; p++) if (*p == ';') count++;
+
+    const char *s = all;
+    for (uint32_t i = esp_random() % (uint32_t)count; i > 0; i--) {
+        s = strchr(s, ';');
+        if (!s) { s = all; break; }
+        s++;
+    }
+    const char *e = strchr(s, ';');
+    size_t len = e ? (size_t)(e - s) : strlen(s);
+
+    while (len && *s == ' ') { s++; len--; }              /* trim */
+    while (len && s[len - 1] == ' ') len--;
+    if (len >= n) len = n - 1;
+    memcpy(out, s, len);
+    out[len] = '\0';
+}
+
+/* Themes are human-written and contain spaces, so they cannot go into a URL
+ * raw. Anything not unreserved gets percent-encoded. */
+static void url_escape(const char *in, char *out, size_t n) {
+    static const char hex[] = "0123456789ABCDEF";
+    size_t o = 0;
+    for (const unsigned char *p = (const unsigned char *)in; *p && o + 4 < n; p++) {
+        if (isalnum(*p) || *p == '-' || *p == '_' || *p == '.' || *p == '~') {
+            out[o++] = (char)*p;
+        } else {
+            out[o++] = '%';
+            out[o++] = hex[*p >> 4];
+            out[o++] = hex[*p & 0x0F];
+        }
+    }
+    out[o] = '\0';
+}
+
+/* One API call for a random photo, then the image itself at panel resolution,
+ * into the given pool slot. The JSON is parked on the card and parsed from
+ * PSRAM so the ~10 KB response never competes for internal heap. The
+ * photographer's name is saved beside the image — Unsplash's API terms require
+ * attribution, and STATUS shows it for whichever wallpaper is on screen. */
+static bool unsplash_wallpaper(int slot) {
     if (UNSPLASH_KEY[0] == '\0') return false;
 
-    char api[320];
+    char theme[80], q[240], api[420];
+    wall_pick_theme(theme, sizeof(theme));
+    url_escape(theme, q, sizeof(q));
+    ESP_LOGI(TAG, "wallpaper slot %d, theme \"%s\"", slot, theme);
+
     snprintf(api, sizeof(api),
              "https://api.unsplash.com/photos/random"
              "?orientation=squarish&content_filter=high&query=%s&client_id=%s",
-             UNSPLASH_QUERY, UNSPLASH_KEY);
+             q, UNSPLASH_KEY);
     if (!asset_fetch(api, UNSPLASH_JSON)) return false;
 
     FILE *f = fopen(UNSPLASH_JSON, "rb");
@@ -2103,19 +2218,64 @@ static bool unsplash_wallpaper(void) {
             if (q) *q = '\0';
             size_t used = strlen(img);
             snprintf(img + used, sizeof(img) - used, "?w=480&h=480&fit=crop&fm=png");
-            ok = asset_fetch(img, WALLPAPER_PATH);
+            char dest[64];
+            wall_png(slot, dest, sizeof(dest));
+            ok = asset_fetch(img, dest);
         }
-        if (ok && cJSON_IsString(name)) {
-            snprintf(s_wall_credit, sizeof(s_wall_credit), "%s", name->valuestring);
-            FILE *cf = fopen(CREDIT_PATH, "w");
-            if (cf) { fputs(s_wall_credit, cf); fclose(cf); }
-            ESP_LOGI(TAG, "wallpaper by %s", s_wall_credit);
+        if (ok) {
+            s_wall_have |= (uint16_t)(1u << slot);
+            char cpath[64];
+            wall_txt(slot, cpath, sizeof(cpath));
+            FILE *cf = fopen(cpath, "w");
+            if (cf) {
+                fputs(cJSON_IsString(name) ? name->valuestring : "", cf);
+                fclose(cf);
+            }
+            if (cJSON_IsString(name)) {
+                ESP_LOGI(TAG, "slot %d by %s", slot, name->valuestring);
+            }
         }
         cJSON_Delete(root);
     }
     free(buf);
     remove(UNSPLASH_JSON);
     return ok;
+}
+
+/* Called once per network-task cycle (~45 s awake, 10 min dozing).
+ *
+ * While the pool has gaps it downloads every cycle, so a fresh card reaches
+ * full variety in about ten minutes; once complete it drops to one replacement
+ * every WALLPAPER_PERIOD_MS. The timestamp is stamped whether or not the fetch
+ * worked, so a failing network backs off to the cycle rate instead of spinning. */
+static void wall_service(void) {
+    /* Deliberately runs while dozing too. The device spends nearly all of its
+     * life asleep, so skipping downloads there meant the pool only grew while
+     * someone was actively using it — it would never fill. Throttling comes
+     * free from this task's own cadence, which is already 10 min when dozing
+     * against 45 s awake, so an idle device quietly finishes the pool in about
+     * two hours and then drops to one replacement every WALLPAPER_PERIOD_MS. */
+    if (!s_sd_ok || !s_wifi_up) return;
+
+    bool filling = (wall_first_empty() >= 0);
+    int64_t due = filling ? 0 : WALLPAPER_PERIOD_MS;
+    if (!s_req_wallpaper && (now_ms() - s_wall_last) < due) return;
+
+    s_req_wallpaper = false;
+    s_wall_last = now_ms();
+
+    int slot = wall_target_slot();
+    if (!unsplash_wallpaper(slot)) return;
+
+    /* Same path, new bytes: without this LVGL keeps serving the previously
+     * decoded bitmap for that slot out of its image cache. */
+    char lvpath[72];
+    wall_lv(slot, lvpath, sizeof(lvpath));
+    if (ui_lock()) {
+        lv_image_cache_drop(lvpath);
+        bsp_display_unlock();
+    }
+    log_event("wallpaper %d/%d", __builtin_popcount(s_wall_have), WALL_SLOTS);
 }
 
 /* ---------------- app state store ----------------
@@ -2194,13 +2354,8 @@ static void sd_init(void) {
         s_sd_ok = true;
         ESP_LOGI(TAG, "microSD mounted at %s", BSP_SD_MOUNT_POINT);
         store_init_dirs();
-        FILE *cf = fopen(CREDIT_PATH, "r");
-        if (cf) {
-            if (fgets(s_wall_credit, sizeof(s_wall_credit), cf)) {
-                s_wall_credit[strcspn(s_wall_credit, "\r\n")] = '\0';
-            }
-            fclose(cf);
-        }
+        remove(WALLPAPER_OLD);          /* pre-pool single wallpaper */
+        wall_scan();
     } else {
         ESP_LOGW(TAG, "no microSD (%s) — telemetry disabled", esp_err_to_name(err));
     }
@@ -2388,12 +2543,30 @@ static void build_lock_screen(lv_obj_t *scr) {
     lv_obj_set_style_bg_color(scr, lv_color_hex(0x000000), 0);
     lv_obj_set_style_bg_grad_dir(scr, LV_GRAD_DIR_NONE, 0);
 
-    if (s_sd_ok && wallpaper_valid(WALLPAPER_PATH)) {
+    /* A different one from the pool on every build, so locking the device
+     * twice in a row does not show the same picture twice. */
+    int slot = s_sd_ok ? wall_display_slot() : -1;
+    if (slot >= 0) {
+        char lvpath[72];
+        wall_lv(slot, lvpath, sizeof(lvpath));
         lv_obj_t *wall = lv_image_create(scr);
-        lv_image_set_src(wall, WALLPAPER_LV);
+        lv_image_set_src(wall, lvpath);
         lv_obj_center(wall);
         lv_obj_set_style_image_opa(wall, 110, 0);
         lv_obj_remove_flag(wall, LV_OBJ_FLAG_CLICKABLE);
+        s_wall_slot = slot;
+
+        /* attribution for whatever is actually on screen, shown in STATUS */
+        char cpath[64];
+        wall_txt(slot, cpath, sizeof(cpath));
+        s_wall_credit[0] = '\0';
+        FILE *cf = fopen(cpath, "r");
+        if (cf) {
+            if (fgets(s_wall_credit, sizeof(s_wall_credit), cf)) {
+                s_wall_credit[strcspn(s_wall_credit, "\r\n")] = '\0';
+            }
+            fclose(cf);
+        }
     }
 
     /* HUD rings. A 430 px circle on a 480 px square clears the corner radius. */
@@ -2688,7 +2861,7 @@ void app_main(void) {
 
     int64_t last_stats = now_ms();
     int64_t last_batt = 0, last_imu = 0, last_pet = now_ms(), last_pet_save = now_ms();
-    int64_t last_tele = now_ms(), last_wall = now_ms();
+    int64_t last_tele = now_ms();
     uint32_t last_refr = 0;
     int64_t s_last_btn = now_ms();
 
@@ -2788,33 +2961,9 @@ void app_main(void) {
         if (s_req_sntp) {
             s_req_sntp = false;
             time_sync_start();
-            if (s_sd_ok && !wallpaper_valid(WALLPAPER_PATH)) {
-                remove(WALLPAPER_PATH);            /* missing or not a PNG */
-                s_req_wallpaper = true;
-            }
         }
 
-        /* only while awake — a download is the last thing a dozing device
-         * should spend its radio on */
-        if (!s_doze && t - last_wall >= WALLPAPER_PERIOD_MS) {
-            last_wall = t;
-            s_req_wallpaper = true;
-        }
-
-        if (s_req_wallpaper && s_wifi_up && !s_doze) {
-            s_req_wallpaper = false;
-            bool got = unsplash_wallpaper();     /* PNG: the only decodable form */
-            if (got) {
-                /* same path, new bytes: without this LVGL keeps serving the
-                 * previously decoded bitmap out of its image cache */
-                if (ui_lock()) {
-                    lv_image_cache_drop(WALLPAPER_LV);
-                    bsp_display_unlock();
-                }
-                log_event("wallpaper updated");
-                ESP_LOGI(TAG, "wallpaper saved to %s", WALLPAPER_PATH);
-            }
-        }
+        /* wallpapers are fetched on the network task — see https_task() */
 
         if (s_req_app != APP_NONE) {
             int want = s_req_app;

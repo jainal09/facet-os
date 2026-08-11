@@ -160,8 +160,38 @@ The wallpaper pipeline, which is the template for any future asset:
 5. Call `lv_image_cache_drop()` after replacing a file at a path LVGL has
    already decoded, or it keeps serving the old bitmap.
 
-Refresh is every 6 hours, plus on demand from STATUS's action key. Four API
-calls a day sits comfortably inside Unsplash's 50/hour demo limit.
+### The wallpaper pool
+
+A single wallpaper file meant every unlock showed the same picture until the
+next download — four images a day, and the device looked static. Instead the
+card holds `WALL_SLOTS` (12) of them at `/sdcard/assets/wN.png`, and the lock
+screen picks a random one **every time it is built**, avoiding an immediate
+repeat. Downloads then only control how fast the pool turns over, not how much
+variety you see. Twelve images is about 5 MB against a 32 GB card.
+
+`UNSPLASH_QUERY` is a `;`-separated list of themes and one is chosen at random
+per download, so the pool ends up mixed rather than all one subject. Themes are
+human-written and contain spaces, so they are percent-encoded into the URL.
+
+Which slots hold a usable image is cached in a bitmask (`s_wall_have`), rebuilt
+once at mount, rather than stat-ing twelve files on every lock-screen build.
+Attribution is stored per slot in `wN.txt` and STATUS shows the credit for
+whatever is currently on screen.
+
+Fetching runs on the **network task, not the main loop**. That task already owns
+an 8 KB stack and a TLS path, so the pool costs no additional internal SRAM, and
+a slow download can no longer stall button handling or the app switcher — which
+it did when the fetch ran inline. It also runs while dozing: the device spends
+nearly all its life asleep, so skipping downloads there meant the pool never
+filled. Throttling comes free from the task's own cadence (45 s awake, 10 min
+dozing), so a fresh card fills in about ten minutes of use or two hours idle,
+then settles to one replacement every `WALLPAPER_PERIOD_MS` (6 h).
+
+Measured cost: **zero steady-state**, and a transient dip of internal free from
+~23.7 KB to ~8.9 KB while an image is in flight, fully recovered afterwards.
+That download is now the single largest transient consumer of internal SRAM in
+the system — worth remembering before adding anything else that allocates
+internally at the same time.
 
 PNG, not JPEG: imgix and Unsplash serve **progressive** JPEG by default and
 TJpgD cannot decode it — it fails silently and yields a 0×0 image.
