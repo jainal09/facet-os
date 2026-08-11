@@ -2589,7 +2589,7 @@ static void pomo_refresh(void) {
     case POMO_RUN:   col = 0xFFB454; word = "FOCUS";  break;
     case POMO_PAUSE: col = 0x60A5FA; word = "PAUSED"; break;
     case POMO_DONE:  col = 0x35C759; word = "DONE";   break;
-    default:         col = 0x64748B; word = "TURN TO START"; break;
+    default:         col = 0x64748B; word = "TAP TO START";  break;
     }
     lv_label_set_text(s_pomo_word, word);
     lv_obj_set_style_text_color(s_pomo_word, lv_color_hex(col), 0);
@@ -2633,6 +2633,13 @@ static void pomo_refresh(void) {
         lv_arc_set_bg_angles(s_pomo_arc, elapsed, 360);
         lv_obj_set_style_arc_color(s_pomo_arc, lv_color_hex(col), LV_PART_MAIN);
     }
+}
+
+/* The only thing a tap does. Not pause, not cancel, not skip — those are the
+ * cube's job (lay it flat, or hold the right key). */
+static void pomo_tap_cb(lv_event_t *e) {
+    if (s_pomo_state != POMO_IDLE) return;
+    pomo_begin(pomo_top_edge(), true);
 }
 
 static void pomo_timer_cb(lv_timer_t *t) {
@@ -2697,12 +2704,15 @@ static void build_pomo_app(lv_obj_t *scr) {
     lv_obj_align(s_pomo_word, LV_ALIGN_CENTER, 0, 52);
 
     lv_obj_add_event_cb(scr, gesture_home_cb, LV_EVENT_GESTURE, NULL);
+    lv_obj_add_flag(scr, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(scr, pomo_tap_cb, LV_EVENT_CLICKED, NULL);
 
     s_pomo_drawn_rot = -1;
     s_pomo_active_ms = now_ms();
     if (s_pomo_state == POMO_IDLE) {
-        s_pomo_left_s = s_pomo_min[s_pomo_sel] * 60;
-        s_pomo_total_s = s_pomo_left_s;
+        s_pomo_sel = pomo_top_edge();
+        s_pomo_total_s = s_pomo_min[s_pomo_sel] * 60;
+        s_pomo_left_s = s_pomo_total_s;
     }
     pomo_refresh();
     s_app_timer = lv_timer_create(pomo_timer_cb, 250, NULL);
@@ -2754,9 +2764,17 @@ static void pomo_poll(int64_t t) {
     if (wr != s_pomo_last_rot && !flat) {
         s_pomo_last_rot = wr;
         sfx_play(SFX_TICK);                       /* the detent */
-        bool first = (s_pomo_state != POMO_RUN);
-        pomo_begin(wr, first);                    /* announce only on the first */
         s_pomo_active_ms = t;
+        if (s_pomo_state == POMO_RUN || s_pomo_state == POMO_PAUSE) {
+            pomo_begin(wr, false);                /* mid-session: switch and restart */
+        } else {
+            /* Idle turning only previews. Requiring a turn to start meant that
+             * if the cube already sat on the duration you wanted, you had to go
+             * all the way around to get back to it. */
+            s_pomo_sel = wr;
+            s_pomo_total_s = s_pomo_min[wr] * 60;
+            s_pomo_left_s = s_pomo_total_s;
+        }
     }
 
     /* --- the countdown itself --- */
