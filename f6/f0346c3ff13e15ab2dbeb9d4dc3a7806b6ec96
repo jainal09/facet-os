@@ -1,0 +1,20 @@
+main/main.c
+  s_57e4cf4a7836a6::t_dc51fcb6970283 3355-3365,3368-3372,3374-3375,3377,3380-3381
+  s_57e4cf4a7836a6::t_4b2a04265c3900 3351,3448-3453,3488-3505,3509,3512,3522,3534,3543-3554,3560,3572-3573,4622
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.22",
+  "base_commit_sha": "f6f0346c3ff13e15ab2dbeb9d4dc3a7806b6ec96",
+  "prompts": {},
+  "sessions": {
+    "s_57e4cf4a7836a6": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "79540328-5c96-430d-b4c5-de35687f549e",
+        "model": "claude-opus-5"
+      },
+      "human_author": "Jainal Gosaliya <jainal09gosalia@gmail.com>"
+    }
+  }
+}
