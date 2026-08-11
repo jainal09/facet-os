@@ -1,0 +1,51 @@
+docs/ARCHITECTURE.md
+  s_57e4cf4a7836a6::t_949c8c7e82748d 361-412
+  s_57e4cf4a7836a6::t_43f2ac1166bf53 282-331,357-360
+  s_57e4cf4a7836a6::t_ceb4f888391a1f 267-281
+  s_57e4cf4a7836a6::t_76a3033e9ecb32 332-356
+  s_57e4cf4a7836a6::t_75fee8703291c4 125-128,130-139
+  s_57e4cf4a7836a6::t_98a4fe3f3bb477 466-467
+  s_57e4cf4a7836a6::t_2bbc087d6fbf51 464
+  s_57e4cf4a7836a6::t_e671feedb3ca30 129,140-150
+  s_57e4cf4a7836a6::t_990da45119c23f 413
+docs/HARDWARE.md
+  s_69fa2eb4e2987f::t_0e4c0679a182a0 782-800
+  s_69fa2eb4e2987f::t_5a3835b1f5bdc9 619-624
+  s_69fa2eb4e2987f::t_25f163444c4b8f 222-225
+  s_69fa2eb4e2987f::t_9f94e91fc3b484 163-202
+  s_69fa2eb4e2987f::t_aa3cb726cb7333 596-600,604,608-611
+  s_69fa2eb4e2987f::t_0a64bbdc169bb6 203-210,221,226-231
+  s_69fa2eb4e2987f::t_f2c0d560ea08f0 830-838
+  s_69fa2eb4e2987f::t_66b5b74019fcdf 563-576
+  s_57e4cf4a7836a6::t_de8e86a1face1b 810-824
+  s_69fa2eb4e2987f::t_84e8c68ea1a2bf 745-751
+  s_69fa2eb4e2987f::t_55ef1b64da8f92 211-220,553-562
+  s_69fa2eb4e2987f::t_cadbaa55cbde56 578-595,625-660
+  s_69fa2eb4e2987f::t_0b637a345c774b 601-603,605-607,612-618
+  s_69fa2eb4e2987f::t_457661e90ef11d 148-162,232-238
+  s_69fa2eb4e2987f::t_4c89b77b96dec1 577
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.22",
+  "base_commit_sha": "a31191c8f18a32a7820ca0e71e4fe36104c74f4f",
+  "prompts": {},
+  "sessions": {
+    "s_57e4cf4a7836a6": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "79540328-5c96-430d-b4c5-de35687f549e",
+        "model": "claude-opus-5"
+      },
+      "human_author": "Jainal Gosaliya <jainal09gosalia@gmail.com>"
+    },
+    "s_69fa2eb4e2987f": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "ab961f6a-cc54-4961-a6f3-991f7a281329",
+        "model": "claude-opus-5"
+      },
+      "human_author": "Jainal Gosaliya <jainal09gosalia@gmail.com>"
+    }
+  }
+}
