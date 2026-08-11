@@ -140,6 +140,16 @@ i2c_master_bus_handle_t bsp_i2c_get_handle(void);
 esp_err_t bsp_audio_init(const i2s_std_config_t *i2s_config);
 
 /**
+ * @brief Choose whether audio init also creates the capture (RX) channel
+ *
+ * Local addition. The I2S DMA rings live in internal SRAM only, and creating the
+ * capture direction costs ~2.9 KB that a playback-only application never uses.
+ * Defaults to false (playback only). Call before the first bsp_audio_*_init();
+ * bsp_audio_codec_microphone_init() sets it back to true on its own.
+ */
+void bsp_audio_enable_rx(bool enable);
+
+/**
  * @brief Initialize speaker codec device
  *
  * @return Pointer to codec device handle or NULL when error occurred

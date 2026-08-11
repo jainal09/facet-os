@@ -16,3 +16,4 @@ LV_FONT_DECLARE(app_icons_64);
 #define ICON_PETS       "\xEE\xA4\x9D"   /* U+E91D */
 #define ICON_WIFI       "\xEE\x98\xBE"   /* U+E63E */
 #define ICON_MEMORY     "\xEE\x8C\xA2"   /* U+E322 */
+#define ICON_TARGET     "\xEE\x8E\x9E"   /* U+E39E "adjust" — a bullseye, for FOCUS */

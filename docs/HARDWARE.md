@@ -40,7 +40,7 @@ Facet's own design lives in [ARCHITECTURE.md](ARCHITECTURE.md).
 | PMU | **AXP2101** (I²C 0x34) |
 | IMU | **QMI8658** 6-axis (I²C 0x6B; 0x6A is the alternate SA0 address) |
 | RTC | **PCF85063**, battery-backed (I²C 0x51) |
-| Audio | ES7210 ADC + ES8311 codec, two onboard mics |
+| Audio | ES8311 DAC + speaker, ES7210 ADC + two onboard mics, PA on GPIO46 — see §7e |
 
 ### Pin map (from the BSP header)
 
@@ -149,6 +149,16 @@ what kills you, not the current free.
   scene. If a scene drops to ~20 fps, look for a large `shadow_width` being
   re-blurred every frame, and only touch widget properties when the value
   actually changed.
+- **`lv_obj_set_style_transform_rotation()` does rotate label TEXT** in LVGL
+  9.3, contrary to the common claim that transforms are image-only: the widget
+  is snapshotted to an off-screen layer and that bitmap is rotated
+  (`lv_refr.c`), so glyphs come out correctly. Units are 0.1 degrees, clockwise.
+  Set `transform_pivot_x/y` to the object's centre or it spins about its corner.
+  Two costs: a rotated widget allocates an un-chunked transient layer sized to
+  its bounding box on every redraw, so keep rotated objects small; and rotation
+  spins a widget **about its own centre only** — its offset from its parent does
+  not rotate, so a stack of rotated labels needs its offsets rotated by hand or
+  they collide.
 - **RGB565 cannot render a smooth dark gradient.** A dark blue vertical ramp
   shows as hard bands. Use flat black — which on an AMOLED also means those
   pixels are simply off.
@@ -238,6 +248,11 @@ measured on hardware:
   brightness 0 (cmd `0x51`), which stops emission but leaves the CO5300 driver
   IC scanning. Use `esp_lcd_panel_disp_on_off(panel, false)` (cmd `0x28`) — the
   CO5300 driver implements it.
+- **`bsp_display_brightness_set(percent)` is a real 0-100 control**, not just
+  on/off — it writes panel command `0x51` with `percent * 255 / 100`. Use it for
+  graduated dimming; use `esp_lcd_panel_disp_on_off()` when you actually want the
+  panel to stop scanning. `backlight_on`/`backlight_off` are just
+  `brightness_set(100)` and `(0)`.
 - **Stop LVGL redrawing what nobody can see.** A once-per-second clock label was
   causing a full render + QSPI flush every second with the screen dark. Guard
   periodic UI timers on the screen-power flag.
@@ -301,6 +316,44 @@ write back once SNTP lands — otherwise every boot shows a placeholder for the
 several seconds SNTP takes. Store UTC and let TZ handle DST. newlib here has no
 `timegm()`, and `mktime()` would apply the local zone, so convert explicitly.
 
+## 7e. Audio
+
+The board has an **ES8311 DAC** (playback) and an **ES7210 ADC** (the two
+onboard mics), both on the shared I²C bus, with a power amp enabled by
+**GPIO46**. There is a real speaker and it works.
+
+- `bsp_audio_codec_speaker_init()` does everything: `bsp_i2c_init()`,
+  `bsp_audio_init(NULL)`, then returns an `esp_codec_dev` handle. Default format
+  is **22050 Hz, 16-bit, mono** — match it and `esp_codec_dev_open()` never has
+  to reconfigure the codec.
+- **GPIO46 is not driven by the BSP.** The ES8311 driver's own `enable` callback
+  raises it inside `esp_codec_dev_open()` and drops it on close
+  (`es8311.c`, `es8311_pa_power`). So opening the codec clicks the amp on.
+- **Measured speaker response (this board):** nothing below ~500 Hz, faint at
+  500, usably present from there to **8 kHz**, no resonant buzz anywhere. Put
+  fundamentals at **1.2–2.5 kHz** and let partials reach ~6 kHz. **High-pass
+  everything at 500 Hz** — energy the driver cannot move does not vanish, it
+  comes back as distortion.
+- **`esp_codec_dev`'s default volume curve tops out at 0 dB** while the ES8311
+  itself reaches **+32 dB**. `esp_codec_dev_set_out_vol(dev, 100)` therefore asks
+  for unity gain and sounds far quieter than the hardware can manage — a factor
+  of 40 in amplitude left unused. Install a curve with
+  `esp_codec_dev_set_vol_curve()` reaching +32 dB. This is the single most
+  misleading thing about the audio stack.
+- **`esp_codec_dev_write()` returns when the data is queued, not when it has
+  played.** Closing immediately afterwards disables the I2S channel mid-drain
+  and truncates the tail, which sounds like a crack at the end of every clip.
+  Keep the device open between sounds and only close after an idle period, with
+  a ~120 ms delay first.
+- **Cost: ~3.7 KB of internal SRAM**, measured, and the I2S DMA rings are
+  `MALLOC_CAP_INTERNAL` only — they cannot go to PSRAM. That is with the
+  capture channel skipped (§9 patch 6); leaving it in costs ~2.9 KB more for
+  nothing if you only play audio. There is no deinit path through the BSP, so
+  initialise lazily and expect to keep it.
+- `esp_codec_dev_write()` blocks. Play from a dedicated task, and put its stack
+  in PSRAM (`xTaskCreateWithCaps`, `CONFIG_FREERTOS_TASK_CREATE_ALLOW_EXT_MEM`)
+  so it costs no internal SRAM.
+
 ## 8. Recovery when the board won't flash
 
 - **A connected battery defeats "unplug USB to power-cycle".** The board keeps
@@ -338,6 +391,10 @@ it independently will need the same ones:
    power-down).
 5. Parameterise draw-buffer height and placement — the stock BSP hardcodes 50
    rows in PSRAM. See `include/ml_draw_buf_cfg.h`.
+6. `bsp_audio_init()` always creates both I2S directions, so a playback-only app
+   pays ~2.9 KB of internal SRAM for a capture channel it never reads. Added
+   `bsp_audio_enable_rx(bool)`; `bsp_audio_codec_microphone_init()` forces it
+   back on so the mics still work.
 
 ## 10. Pitfalls index
 

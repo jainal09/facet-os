@@ -64,6 +64,15 @@ configure_file("${CMAKE_CURRENT_LIST_DIR}/credentials.h.in"
 idf_component_register(
     SRCS "main.c" "hud_clock_76.c" "hud_text_18.c" "app_icons_64.c"
     INCLUDE_DIRS "." "${FACET_GEN_DIR}"
+    # UI sounds live in flash, not on the card: ~99 KB of a 2.4 MB free app
+    # slot, and no dependency on the SD card or the network to make a noise.
+    # Authored by assets/sounds/render.py — see that file for why.
+    EMBED_FILES "../assets/sounds/tick.wav"
+                "../assets/sounds/start.wav"
+                "../assets/sounds/pause.wav"
+                "../assets/sounds/resume.wav"
+                "../assets/sounds/done.wav"
     REQUIRES nvs_flash esp_wifi esp_event esp_netif esp_http_client mbedtls
-             esp_timer esp_driver_gpio esp_driver_i2c esp_lcd_touch fatfs json esp32_s3_touch_amoled_2_16
+             esp_timer esp_driver_gpio esp_driver_i2c esp_lcd_touch fatfs json esp_codec_dev esp_driver_i2s
+             esp32_s3_touch_amoled_2_16
 )

@@ -200,10 +200,29 @@ esp_err_t bsp_sdcard_unmount(void)
     return esp_vfs_fat_sdcard_unmount(BSP_SD_MOUNT_POINT, bsp_sdcard);
 }
 
+/* Patch: playback-only mode.
+ *
+ * I2S DMA rings are MALLOC_CAP_INTERNAL only, and the stock init always creates
+ * BOTH directions — about 2.9 KB of internal SRAM for a capture channel that a
+ * playback-only app never reads. On this board internal SRAM is the one scarce
+ * resource, so allow the microphone half to be skipped. Set this to false before
+ * the first bsp_audio_*_init() call; bsp_audio_codec_microphone_init() forces it
+ * back on, so asking for the mic still works.
+ *
+ * Precedent for the NULL-handle form is esp_codec_dev's own test harness
+ * (test_apps/codec_dev_test/main/test_board.c).
+ */
+static bool audio_want_rx = false;
+
+void bsp_audio_enable_rx(bool enable)
+{
+    audio_want_rx = enable;
+}
+
 esp_err_t bsp_audio_init(const i2s_std_config_t *i2s_config)
 {
     esp_err_t ret = ESP_FAIL;
-    if (i2s_tx_chan && i2s_rx_chan)
+    if (i2s_tx_chan && (i2s_rx_chan || !audio_want_rx))
     {
         /* Audio was initialized before */
         return ESP_OK;
@@ -212,7 +231,8 @@ esp_err_t bsp_audio_init(const i2s_std_config_t *i2s_config)
     /* Setup I2S peripheral */
     i2s_chan_config_t chan_cfg = I2S_CHANNEL_DEFAULT_CONFIG(CONFIG_BSP_I2S_NUM, I2S_ROLE_MASTER);
     chan_cfg.auto_clear = true; // Auto clear the legacy data in the DMA buffer
-    BSP_ERROR_CHECK_RETURN_ERR(i2s_new_channel(&chan_cfg, &i2s_tx_chan, &i2s_rx_chan));
+    BSP_ERROR_CHECK_RETURN_ERR(i2s_new_channel(&chan_cfg, &i2s_tx_chan,
+                                               audio_want_rx ? &i2s_rx_chan : NULL));
 
     /* Setup I2S channels */
     const i2s_std_config_t std_cfg_default = BSP_I2S_DUPLEX_MONO_CFG(22050);
@@ -308,6 +328,9 @@ esp_codec_dev_handle_t bsp_audio_codec_speaker_init(void)
 
 esp_codec_dev_handle_t bsp_audio_codec_microphone_init(void)
 {
+    /* asking for capture implies the RX channel, whatever was set before */
+    audio_want_rx = true;
+
     if (i2s_data_if == NULL)
     {
         /* Initilize I2C */

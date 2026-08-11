@@ -79,6 +79,11 @@ the pitfalls index compiled perfectly.
   give a key an app-specific meaning outside `app_action()` / `app_back()`.
 - The lock screen is deliberately sparse: clock, date, battery ring. No status
   text, no photo credit. Attribution goes in the CONTROL app.
+- **On-screen strings must be pure ASCII.** `lv_font_montserrat_14` carries ASCII
+  plus LVGL's own `LV_SYMBOL_*` glyphs and nothing else, so a typographic
+  character renders as an empty box — `·` and `—` are the easy mistakes, and
+  `hud_text_18` (0x20-0x7F) and `hud_clock_76` (digits and colon only) are
+  narrower still. Non-ASCII in `ESP_LOG` strings is fine; that goes to serial.
 
 ## Keep the docs hot
 

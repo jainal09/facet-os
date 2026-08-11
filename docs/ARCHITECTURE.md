@@ -198,6 +198,63 @@ TJpgD cannot decode it — it fails silently and yields a 0×0 image.
 `urls.raw` also carries an `auto=format` that overrides an appended `&fm=png`,
 so the URL has to be cut at `?` before adding your own transform.
 
+## FOCUS: orientation as input
+
+The Pomodoro app is the only place the device treats its own attitude as a
+control rather than as something to compensate for, and the pattern is worth
+copying.
+
+Four durations sit at fixed screen positions, each pre-rotated by `-90*i` tenths
+of a degree so that turning the cube by `+90*i` cancels the pre-rotation and
+whichever label reaches the top reads upright. The bottom one is genuinely
+stored upside down.
+
+Three things make it work:
+
+1. **Autorotate is gated at the commit, not the poll.** `imu_poll()` still
+   computes `s_base_rot` every 100 ms, but `rotation_apply()` is skipped while
+   `s_app == APP_POMO`. If the panel counter-rotated, the labels would stay put
+   relative to your eye and turning the cube would change nothing.
+2. **The dial is fixed to the device; the readout is fixed to you.** The centre
+   clock counter-rotates by `-90*top_edge`. Crucially, rotating a label spins it
+   about its own centre only — its *offset* from the screen centre does not
+   rotate, so the offsets are rotated by hand from a four-entry table. Skipping
+   that put the status word on top of the digits the moment the cube turned.
+3. **The session outlives the screen.** State is file-scope and ticked from the
+   main loop at 1 Hz, so navigating away does not cancel a timer; the app is
+   only ever a view onto it.
+
+Flat-means-pause tests `abs(s_acc_z)` rather than a signed value, which keeps it
+independent of how the IMU is mounted relative to the panel — undocumented, and
+the reason autorotate needed an empirical 8-state calibration.
+
+Staying awake uses `lv_display_trigger_activity(NULL)` from the main loop while a
+session runs. `idle` is `min(LVGL inactivity, time since a key)` and a countdown
+touches neither, so without it the 60 s auto-lock would tear the app down
+mid-timer. Dimming is `bsp_display_brightness_set()`, with wake on touch **or**
+on an accelerometer delta, since the IMU is already polling.
+
+Wallpaper downloads are suppressed during a session — partly so a 400 KB fetch
+does not compete for internal SRAM with the audio codec, partly because a radio
+burst mid-focus is rude.
+
+## Sound
+
+Clips are authored offline and embedded in flash via `EMBED_FILES` (~99 KB),
+not fetched at runtime. See [assets/sounds/CREDITS.md](../assets/sounds/CREDITS.md)
+for why they are generated rather than sampled.
+
+Playback runs on a dedicated task whose stack is in PSRAM, so it costs no
+internal SRAM. It has to be off the caller's thread: `esp_codec_dev_write()`
+blocks until the DMA drains, so a 2 s bell played inline would freeze button
+handling for two seconds. The codec is brought up lazily on the first sound
+(~3.7 KB internal, unavoidable — I2S DMA cannot live in PSRAM) and stays open
+between sounds, closing only after four seconds of quiet; closing eagerly
+truncated every tail and clicked the amp on each play.
+
+The gain trap is documented in [HARDWARE.md §7e](HARDWARE.md): the stock volume
+curve stops at 0 dB while the chip reaches +32 dB.
+
 ## Power
 
 Two states.

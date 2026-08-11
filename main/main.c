@@ -122,7 +122,7 @@ static EventGroupHandle_t s_evt;
 /* Apps are built when opened and destroyed when closed, so only the running
  * app costs RAM. That removes the widget ceiling entirely — the cost of a
  * switch is one rebuild, not a reboot. */
-enum { APP_CONTROL = 0, APP_PET, APP_WIFI, APP_COUNT };
+enum { APP_CONTROL = 0, APP_POMO, APP_PET, APP_WIFI, APP_COUNT };
 #define APP_DRAWER (-1)
 #define APP_LOCK   (-2)
 #define AUTO_LOCK_MS  60000     /* unlocked and idle -> lock */
@@ -810,7 +810,10 @@ static void imu_poll(void) {
     if (want != s_rot_cand) { s_rot_cand = want; s_rot_votes = 0; }
     else if (s_rot_votes < QMI_VOTES_NEEDED) s_rot_votes++;
 
-    if (s_rot_votes >= QMI_VOTES_NEEDED && s_rot_cand != s_rot) {
+    /* The FOCUS app reads orientation as input and draws fixed-position labels;
+     * counter-rotating the panel under it would cancel the whole gesture. Gate
+     * the commit, not the poll, so s_base_rot stays live for it to read. */
+    if (s_rot_votes >= QMI_VOTES_NEEDED && s_rot_cand != s_rot && s_app != APP_POMO) {
         rotation_apply(s_rot_cand);
     }
 }
@@ -1531,6 +1534,286 @@ static void build_pet_app(lv_obj_t *scr) {
     s_app_timer = lv_timer_create(pet_timer_cb, PET_FPS_MS, NULL);
 }
 
+/* ---------------- sound ----------------
+ *
+ * ES8311 DAC into a small onboard power amp, enabled on GPIO46 by the codec's
+ * own enable callback rather than by us. Two things shape this layer:
+ *
+ * 1. The I2S DMA rings are MALLOC_CAP_INTERNAL only and cannot be freed through
+ *    the BSP, so the codec is brought up lazily on the first sound. A build that
+ *    never plays anything pays nothing. bsp_audio_enable_rx(false) keeps the
+ *    unused capture channel from costing another ~2.9 KB.
+ * 2. esp_codec_dev_write() blocks until the DMA drains, so a one-second sound
+ *    played inline would stall its caller for a second. Playback therefore runs
+ *    on its own task, whose stack lives in PSRAM so it costs no internal SRAM.
+ */
+
+#define SFX_RATE     22050          /* matches the BSP default — no reconfigure */
+#define SFX_CHUNK    512            /* samples per write */
+/* The ES8311's volume curve reaches +32 dB, so 70 was leaving most of the
+ * available gain unused — the first pass was barely audible on this driver.
+ * Runtime-adjustable and saved, because the right level is an ear judgement and
+ * reflashing to try a number is a waste of everyone's time. */
+/* +12 dB on the curve below. The per-sound balance the user tuned by ear now
+ * lives in the WAV levels, so this is a single master and 62 is where that
+ * balance is correct. */
+#define SFX_VOLUME_DEFAULT 62
+
+static int s_vol = SFX_VOLUME_DEFAULT;
+static volatile bool s_req_vol_save;
+
+static void vol_load(void) {
+    nvs_handle_t h;
+    if (nvs_open("cfg", NVS_READONLY, &h) != ESP_OK) return;
+    int32_t v = SFX_VOLUME_DEFAULT;
+    if (nvs_get_i32(h, "vol2", &v) == ESP_OK) s_vol = clampi((int)v, 0, 100);
+    nvs_close(h);
+}
+
+static void vol_save(void) {
+    nvs_handle_t h;
+    if (nvs_open("cfg", NVS_READWRITE, &h) != ESP_OK) return;
+    nvs_set_i32(h, "vol2", s_vol);
+    nvs_commit(h);
+    nvs_close(h);
+}
+
+typedef enum {
+    SFX_TONE = 1,                   /* diagnostic: one tone from s_tone_hz[] */
+    SFX_TICK,                       /* rotation detent          */
+    SFX_START,                      /* session begins           */
+    SFX_PAUSE,                      /* laid flat                */
+    SFX_RESUME,                     /* stood back up            */
+    SFX_DONE,                       /* countdown reached zero   */
+} sfx_id_t;
+
+/* Embedded by EMBED_FILES; authored by assets/sounds/render.py against this
+ * board's measured speaker response (nothing below ~500 Hz, usable to 8 kHz). */
+#define SFX_BLOB(sym)                                          \
+    extern const uint8_t sym##_start[] asm("_binary_" #sym "_start"); \
+    extern const uint8_t sym##_end[]   asm("_binary_" #sym "_end")
+
+SFX_BLOB(tick_wav);
+SFX_BLOB(start_wav);
+SFX_BLOB(pause_wav);
+SFX_BLOB(resume_wav);
+SFX_BLOB(done_wav);
+
+typedef struct {
+    const char    *name;
+    const uint8_t *begin, *end;
+} sfx_clip_t;
+
+static const sfx_clip_t s_clips[] = {
+    { "tick",   tick_wav_start,   tick_wav_end   },
+    { "start",  start_wav_start,  start_wav_end  },
+    { "pause",  pause_wav_start,  pause_wav_end  },
+    { "resume", resume_wav_start, resume_wav_end },
+    { "done",   done_wav_start,   done_wav_end   },
+};
+#define CLIP_COUNT ((int)(sizeof(s_clips) / sizeof(s_clips[0])))
+#define CLIP_OF(id) (&s_clips[(id) - SFX_TICK])
+
+/* Roughly third-octave steps across everything a small driver might manage.
+ * Stepped and manually advanced rather than a continuous sweep: a sweep gives
+ * you nothing to name when it sounds wrong, so the number has to be on screen
+ * and the pace has to be yours. */
+static const uint16_t s_tone_hz[] = {
+    200, 300, 400, 500, 650, 800, 1000, 1250,
+    1600, 2000, 2500, 3150, 4000, 5000, 6300, 8000,
+};
+#define TONE_COUNT ((int)(sizeof(s_tone_hz) / sizeof(s_tone_hz[0])))
+static volatile int s_tone_idx = -1;    /* -1 = nothing played yet */
+
+static esp_codec_dev_handle_t s_spk;
+static QueueHandle_t s_sfx_q;
+static volatile bool s_sfx_busy;
+
+/* esp_codec_dev's default volume curve maps slider 100 to 0 dB — unity gain —
+ * while the ES8311 itself reaches +32 dB. So the stock scale tops out at a
+ * fortieth of the amplitude the hardware can actually produce, which is the real
+ * reason everything sounded faint no matter how the files were mixed. Replace
+ * the curve so 100 means the chip's genuine maximum.
+ *
+ * Three points rather than two: a straight line in dB spends most of the slider
+ * in territory too quiet to be useful, so the bottom half covers the quiet range
+ * coarsely and the top half gives fine control where it matters. */
+static const esp_codec_dev_vol_map_t s_vol_curve[] = {
+    {   0, -60.0f },
+    {  50,   6.0f },
+    { 100,  32.0f },        /* ES8311 hardware maximum */
+};
+
+/* Mirror of the curve above, so the UI can report the gain the slider actually
+ * asks for. "It sounds right at 65" then means something specific. */
+static float vol_db(int v) {
+    const int n = (int)(sizeof(s_vol_curve) / sizeof(s_vol_curve[0]));
+    if (v <= 0) return -96.0f;
+    if (v >= s_vol_curve[n - 1].vol) return s_vol_curve[n - 1].db_value;
+    for (int i = 0; i < n - 1; i++) {
+        if (v < s_vol_curve[i + 1].vol) {
+            float span = (float)(s_vol_curve[i + 1].vol - s_vol_curve[i].vol);
+            float rise = s_vol_curve[i + 1].db_value - s_vol_curve[i].db_value;
+            return s_vol_curve[i].db_value + (v - s_vol_curve[i].vol) * rise / span;
+        }
+    }
+    return 0.0f;
+}
+
+static bool sfx_codec_ready(void) {
+    if (s_spk) return true;
+    bsp_audio_enable_rx(false);              /* playback only */
+    uint32_t before = esp_get_free_internal_heap_size();
+    s_spk = bsp_audio_codec_speaker_init();
+    if (!s_spk) {
+        ESP_LOGE(TAG, "speaker init failed — sound disabled");
+        return false;
+    }
+    esp_codec_dev_vol_curve_t curve = {
+        .vol_map = (esp_codec_dev_vol_map_t *)s_vol_curve,
+        .count   = (int)(sizeof(s_vol_curve) / sizeof(s_vol_curve[0])),
+    };
+    if (esp_codec_dev_set_vol_curve(s_spk, &curve) != 0) {
+        ESP_LOGW(TAG, "custom volume curve rejected — stuck at unity gain");
+    }
+    ESP_LOGI(TAG, "speaker up, internal heap %u -> %u (cost %d B)",
+             (unsigned)before, (unsigned)esp_get_free_internal_heap_size(),
+             (int)(before - esp_get_free_internal_heap_size()));
+    return true;
+}
+
+/* One steady tone, generated a chunk at a time so no big buffer is needed.
+ * Faded in and out to avoid a click, and kept well below full scale — this
+ * driver distorts when pushed, and a clipped tone would tell us nothing about
+ * its real response. */
+static void sfx_render_tone(int hz, float secs) {
+    const int total = (int)(SFX_RATE * secs);
+    static int16_t buf[SFX_CHUNK];
+    float phase = 0.0f;
+    const float step = 2.0f * (float)M_PI * (float)hz / (float)SFX_RATE;
+    const int fade = SFX_RATE / 40;                  /* 25 ms */
+
+    for (int n = 0; n < total; n += SFX_CHUNK) {
+        int count = (total - n < SFX_CHUNK) ? (total - n) : SFX_CHUNK;
+        for (int i = 0; i < count; i++) {
+            int k = n + i;
+            float env = 1.0f;
+            if (k < fade)                 env = (float)k / (float)fade;
+            else if (k > total - fade)    env = (float)(total - k) / (float)fade;
+            buf[i] = (int16_t)(sinf(phase) * env * 7000.0f);   /* ~-13 dBFS */
+            phase += step;
+            if (phase > 2.0f * (float)M_PI) phase -= 2.0f * (float)M_PI;
+        }
+        esp_codec_dev_write(s_spk, buf, count * sizeof(int16_t));
+    }
+}
+
+/* Walk the RIFF chunks to the PCM payload rather than assuming a 44-byte
+ * header — a WAV writer is free to insert LIST/fact chunks, and a wrong offset
+ * here plays the header as audio, which is unmistakable but avoidable. */
+static const uint8_t *wav_pcm(const uint8_t *p, const uint8_t *end, size_t *len) {
+    if (end - p < 12 || memcmp(p, "RIFF", 4) || memcmp(p + 8, "WAVE", 4)) return NULL;
+    const uint8_t *q = p + 12;
+    while (q + 8 <= end) {
+        uint32_t sz = (uint32_t)q[4] | ((uint32_t)q[5] << 8) |
+                      ((uint32_t)q[6] << 16) | ((uint32_t)q[7] << 24);
+        const uint8_t *body = q + 8;
+        if (!memcmp(q, "data", 4)) {
+            if (body + sz > end) sz = (uint32_t)(end - body);   /* be forgiving */
+            *len = sz;
+            return body;
+        }
+        q = body + sz + (sz & 1);        /* chunks are word-aligned */
+    }
+    return NULL;
+}
+
+/* Written in chunks so a long clip never needs a copy — the source is memory
+ * mapped straight out of flash. */
+static void sfx_render_clip(const sfx_clip_t *c) {
+    size_t len = 0;
+    const uint8_t *pcm = wav_pcm(c->begin, c->end, &len);
+    if (!pcm || len < 2) {
+        ESP_LOGW(TAG, "sfx %s: no PCM payload", c->name);
+        return;
+    }
+    const size_t step = SFX_CHUNK * sizeof(int16_t);
+    for (size_t off = 0; off < len; off += step) {
+        size_t n = (len - off < step) ? (len - off) : step;
+        esp_codec_dev_write(s_spk, (void *)(pcm + off), n);
+    }
+}
+
+static void sfx_task(void *arg) {
+    sfx_id_t id;
+    bool open = false;
+
+    while (1) {
+        /* Stay open between sounds and only release the codec once things go
+         * quiet. Closing straight after a write was the bug behind the crack at
+         * the end of the bell: esp_codec_dev_write() returns once the data is
+         * queued, not once it has been played, so the close was disabling the
+         * I2S channel while the DMA ring was still draining. Holding it open
+         * also stops the power amp clicking on every single sound. */
+        if (xQueueReceive(s_sfx_q, &id, pdMS_TO_TICKS(4000)) != pdTRUE) {
+            if (open) {
+                vTaskDelay(pdMS_TO_TICKS(120));      /* let the ring drain */
+                esp_codec_dev_close(s_spk);
+                open = false;
+            }
+            continue;
+        }
+        if (!sfx_codec_ready()) continue;
+
+        s_sfx_busy = true;
+        esp_codec_dev_sample_info_t fs = {
+            .bits_per_sample = 16,
+            .channel = 1,
+            .channel_mask = 1,
+            .sample_rate = SFX_RATE,
+        };
+        if (open || esp_codec_dev_open(s_spk, &fs) == 0) {
+            open = true;
+            esp_codec_dev_set_out_vol(s_spk, s_vol);
+            switch (id) {
+            case SFX_TONE: {
+                int idx = s_tone_idx;
+                if (idx < 0 || idx >= TONE_COUNT) idx = 0;
+                ESP_LOGI(TAG, "tone %d/%d: %u Hz", idx + 1, TONE_COUNT,
+                         (unsigned)s_tone_hz[idx]);
+                sfx_render_tone(s_tone_hz[idx], 1.2f);
+                break;
+            }
+            case SFX_TICK: case SFX_START: case SFX_PAUSE:
+            case SFX_RESUME: case SFX_DONE:
+                sfx_render_clip(CLIP_OF(id));
+                break;
+            default:
+                break;
+            }
+        } else {
+            ESP_LOGE(TAG, "codec open failed");
+        }
+        s_sfx_busy = false;
+    }
+}
+
+static void sfx_init(void) {
+    s_sfx_q = xQueueCreate(3, sizeof(sfx_id_t));
+    if (!s_sfx_q) return;
+    /* stack in PSRAM: this task does no ISR work and touches no DMA directly */
+    if (xTaskCreateWithCaps(sfx_task, "sfx", 5120, NULL, 4, NULL,
+                            MALLOC_CAP_SPIRAM) != pdPASS) {
+        ESP_LOGW(TAG, "sfx task (PSRAM stack) failed — falling back to internal");
+        xTaskCreate(sfx_task, "sfx", 4096, NULL, 4, NULL);
+    }
+}
+
+static void sfx_play(sfx_id_t id) {
+    if (!s_sfx_q) return;
+    xQueueSend(s_sfx_q, &id, 0);                   /* drop if the queue is full */
+}
+
 /* ---------------- CONTROL: settings + diagnostics ----------------
  *
  * Replaces the old STATUS and SYSTEM screens, which between them showed a
@@ -1549,6 +1832,7 @@ static void refr_ready_cb(lv_event_t *e) {
 
 static lv_obj_t *s_cfg_wall_pool, *s_cfg_wall_state, *s_cfg_wall_bar, *s_cfg_wall_sub;
 static lv_obj_t *s_cfg_rot_val;
+static lv_obj_t *s_cfg_snd_val, *s_cfg_snd_hz, *s_cfg_vol_val;
 static lv_obj_t *s_cfg_batt_bar, *s_cfg_batt_val, *s_cfg_batt_sub;
 static lv_obj_t *s_cfg_net_val;
 static lv_obj_t *s_cfg_sys_val;
@@ -1558,6 +1842,7 @@ static lv_obj_t *s_cfg_log;
 #define CFG_ACCENT_DISP 0xA78BFA
 #define CFG_ACCENT_BATT 0x34D399
 #define CFG_ACCENT_NET  0x60A5FA
+#define CFG_ACCENT_SND  0xFB923C
 #define CFG_ACCENT_SYS  0x94A3B8
 
 /* one card in the scrolling column */
@@ -1621,12 +1906,74 @@ static void cfg_rotate_cb(lv_event_t *e) {
     rotation_bump();
 }
 
+/* Advance one step and show the frequency BEFORE it sounds, so there is never
+ * any doubt which number the tone you just heard belongs to. Updated here on
+ * the LVGL task rather than waiting for the 400 ms refresh. */
+static sfx_id_t s_sfx_last;
+
+static void cfg_tone_next_cb(lv_event_t *e) {
+    s_tone_idx = (s_tone_idx + 1) % TONE_COUNT;
+    if (s_cfg_snd_hz) {
+        lv_label_set_text_fmt(s_cfg_snd_hz, "%u", (unsigned)s_tone_hz[s_tone_idx]);
+    }
+    if (s_cfg_snd_val) {
+        lv_label_set_text_fmt(s_cfg_snd_val, "hertz   /   step %d of %d",
+                              s_tone_idx + 1, TONE_COUNT);
+    }
+    s_sfx_last = SFX_TONE;
+    sfx_play(SFX_TONE);
+}
+
+/* Audition bench for the UI sounds. These are judged by ear on this speaker,
+ * not by a passing build, so stepping through them has to be one tap. */
+static int s_clip_idx = -1;
+
+static void cfg_clip_next_cb(lv_event_t *e) {
+    s_clip_idx = (s_clip_idx + 1) % CLIP_COUNT;
+    s_sfx_last = (sfx_id_t)(SFX_TICK + s_clip_idx);
+    if (s_cfg_snd_hz) lv_label_set_text(s_cfg_snd_hz, "");
+    if (s_cfg_snd_val) {
+        lv_label_set_text_fmt(s_cfg_snd_val, "%s   /   sound %d of %d",
+                              s_clips[s_clip_idx].name, s_clip_idx + 1, CLIP_COUNT);
+    }
+    sfx_play(s_sfx_last);
+}
+
+static void cfg_again_cb(lv_event_t *e) {
+    sfx_play(s_sfx_last ? s_sfx_last : SFX_TONE);
+}
+
+/* Deliberately does almost nothing while the knob is moving.
+ *
+ * Rewriting the label on every LV_EVENT_VALUE_CHANGED was a crash: the text
+ * length changes, the label sits in a LV_SIZE_CONTENT flex card, so the card and
+ * the whole scrolling column re-laid out dozens of times a second — which moves
+ * the slider itself while LVGL is midway through delivering an input event to
+ * that very slider. The knob position is feedback enough during a drag; the
+ * numbers land when you let go.
+ *
+ * NVS is written from the main loop rather than here, because a commit erases
+ * flash and can block for tens of milliseconds with the LVGL lock held. */
+static void cfg_vol_cb(lv_event_t *e) {
+    s_vol = (int)lv_slider_get_value(lv_event_get_target(e));
+    if (lv_event_get_code(e) != LV_EVENT_RELEASED) return;
+
+    if (s_cfg_vol_val) {
+        /* integer dB, not %f: newlib's float formatting is stack-hungry and this
+         * runs on the LVGL task, whose 8 KB is already carrying the renderer */
+        lv_label_set_text_fmt(s_cfg_vol_val, "volume  %d%%   /   %+d dB",
+                              s_vol, (int)vol_db(s_vol));
+    }
+    s_req_vol_save = true;
+    sfx_play(s_sfx_last ? s_sfx_last : SFX_DONE);
+}
+
 static void cfg_timer_cb(lv_timer_t *t) {
     if (!s_cfg_sys_val) return;
 
     /* ---- wallpaper ---- */
     int have = __builtin_popcount(s_wall_have);
-    lv_label_set_text_fmt(s_cfg_wall_pool, "pool  %d / %d   ·   new one every 6 h",
+    lv_label_set_text_fmt(s_cfg_wall_pool, "pool  %d / %d   /   new one every 6 h",
                           have, WALL_SLOTS);
 
     /* clear a finished result after a few seconds so the card returns to rest */
@@ -1663,7 +2010,7 @@ static void cfg_timer_cb(lv_timer_t *t) {
         lv_obj_set_style_bg_color(s_cfg_wall_bar, lv_color_hex(0x35C759),
                                   LV_PART_INDICATOR);
         lv_obj_set_style_text_color(s_cfg_wall_state, lv_color_hex(0x35C759), 0);
-        lv_label_set_text_fmt(s_cfg_wall_state, LV_SYMBOL_OK "  saved  ·  %d KB", s_dl_kb);
+        lv_label_set_text_fmt(s_cfg_wall_state, LV_SYMBOL_OK "  saved  /  %d KB", s_dl_kb);
         break;
     case DL_FAIL:
         lv_obj_remove_flag(s_cfg_wall_bar, LV_OBJ_FLAG_HIDDEN);
@@ -1696,6 +2043,14 @@ static void cfg_timer_cb(lv_timer_t *t) {
                           (s_rot_cfg & 4) ? "reversed" : "normal",
                           s_acc_x / 100, s_acc_y / 100, s_acc_z / 100);
 
+    /* ---- audio ---- */
+    /* Only owned by the timer before the first tone; after that the button
+     * callback writes it and this must not stomp the frequency on screen. */
+    if (s_tone_idx < 0) {
+        lv_label_set_text_fmt(s_cfg_snd_val, "%s   /   tap to start",
+                              s_spk ? "codec up" : "codec idle");
+    }
+
     /* ---- battery ---- */
     int pct = s_batt_pct;
     lv_bar_set_value(s_cfg_batt_bar, pct < 0 ? 100 : pct, LV_ANIM_OFF);
@@ -1711,10 +2066,10 @@ static void cfg_timer_cb(lv_timer_t *t) {
     }
     int drain = battery_drain_mv_h();
     if (drain > 0) {
-        lv_label_set_text_fmt(s_cfg_batt_sub, "drain  %d mV/h   ·   %s", drain,
+        lv_label_set_text_fmt(s_cfg_batt_sub, "drain  %d mV/h   /   %s", drain,
                               s_doze ? "dozing" : "active");
     } else {
-        lv_label_set_text_fmt(s_cfg_batt_sub, "drain  measuring...   ·   %s",
+        lv_label_set_text_fmt(s_cfg_batt_sub, "drain  measuring...   /   %s",
                               s_doze ? "dozing" : "active");
     }
 
@@ -1732,9 +2087,9 @@ static void cfg_timer_cb(lv_timer_t *t) {
     lv_label_set_text_fmt(s_cfg_sys_val,
                           "uptime  %lu s\n"
                           "render  %u.%u fps\n"
-                          "heap  %u KB free  ·  %u KB min\n"
+                          "heap  %u KB free  /  %u KB min\n"
                           "psram  %lu KB free\n"
-                          "sdcard  %s  ·  %lu log rows\n"
+                          "sdcard  %s  /  %lu log rows\n"
                           "idf  %s",
                           (unsigned long)(now_ms() / 1000),
                           (unsigned)(s_last_fps_x10 / 10), (unsigned)(s_last_fps_x10 % 10),
@@ -1798,6 +2153,41 @@ static void build_control_app(lv_obj_t *scr) {
     s_cfg_rot_val = cfg_text(c, 0xC7D2E0);
     cfg_button(c, LV_SYMBOL_REFRESH "  Step rotation calibration",
                CFG_ACCENT_DISP, cfg_rotate_cb);
+
+    /* ---- audio ---- */
+    c = cfg_card(col, "AUDIO", CFG_ACCENT_SND);
+
+    /* hud_clock_76 is digits-only, which is exactly what a frequency needs */
+    s_cfg_snd_hz = lv_label_create(c);
+    lv_obj_set_width(s_cfg_snd_hz, lv_pct(100));
+    lv_obj_set_style_text_font(s_cfg_snd_hz, &hud_clock_76, 0);
+    lv_obj_set_style_text_color(s_cfg_snd_hz, lv_color_hex(CFG_ACCENT_SND), 0);
+    lv_obj_set_style_text_align(s_cfg_snd_hz, LV_TEXT_ALIGN_CENTER, 0);
+    lv_label_set_text(s_cfg_snd_hz, "0");
+
+    s_cfg_snd_val = cfg_text(c, 0x94A3B8);
+    lv_obj_set_style_text_align(s_cfg_snd_val, LV_TEXT_ALIGN_CENTER, 0);
+
+    s_cfg_vol_val = cfg_text(c, 0xC7D2E0);
+    /* fixed height: a growing/shrinking label here would resize the card and
+     * shift the slider under the finger */
+    lv_obj_set_height(s_cfg_vol_val, 20);
+    lv_label_set_text_fmt(s_cfg_vol_val, "volume  %d%%   /   %+.0f dB",
+                              s_vol, vol_db(s_vol));
+
+    lv_obj_t *vs = lv_slider_create(c);
+    lv_obj_set_size(vs, lv_pct(100), 16);
+    lv_slider_set_range(vs, 0, 100);
+    lv_slider_set_value(vs, s_vol, LV_ANIM_OFF);
+    lv_obj_set_style_bg_color(vs, lv_color_hex(0x1E293B), LV_PART_MAIN);
+    lv_obj_set_style_bg_color(vs, lv_color_hex(CFG_ACCENT_SND), LV_PART_INDICATOR);
+    lv_obj_set_style_bg_color(vs, lv_color_hex(0xFFD9A8), LV_PART_KNOB);
+    lv_obj_add_event_cb(vs, cfg_vol_cb, LV_EVENT_VALUE_CHANGED, NULL);
+    lv_obj_add_event_cb(vs, cfg_vol_cb, LV_EVENT_RELEASED, NULL);
+
+    cfg_button(c, LV_SYMBOL_AUDIO "  Next sound", CFG_ACCENT_SND, cfg_clip_next_cb);
+    cfg_button(c, LV_SYMBOL_REFRESH "  Hear it again", CFG_ACCENT_SND, cfg_again_cb);
+    cfg_button(c, LV_SYMBOL_RIGHT "  Tone test", CFG_ACCENT_SND, cfg_tone_next_cb);
 
     /* ---- battery ---- */
     c = cfg_card(col, "BATTERY", CFG_ACCENT_BATT);
@@ -2102,6 +2492,377 @@ static void setup_fill_list(void) {
 }
 
 
+/* ---------------- POMODORO: the cube is the interface ----------------
+ *
+ * Stand the cube upright on the desk facing you. Four durations sit at fixed
+ * positions on the glass, each pre-rotated so it reads upright when its own edge
+ * is the top one — the bottom label is genuinely printed upside down. Turning
+ * the cube brings a different number to the top, and that instantly becomes the
+ * running timer. Lay it flat to pause; stand it up to resume.
+ *
+ * Two things make this work, and both are the opposite of what the rest of the
+ * firmware does:
+ *
+ *  - Autorotate is suppressed while this app owns the screen. If the panel
+ *    counter-rotated, the labels would stay put relative to your eye and turning
+ *    the cube would change nothing. Orientation is input here, not layout.
+ *  - The dial is fixed to the DEVICE, like a bezel. The countdown in the middle
+ *    is fixed to YOU, counter-rotated so it always reads upright.
+ */
+
+#define POMO_SLOTS       4
+#define POMO_FLAT_TH     12000     /* ~0.73 g on Z: lying down either way up   */
+#define POMO_FLAT_MS     600       /* setting it down should not flicker       */
+#define POMO_DIM_MS      120000    /* untouched and still -> dim the panel     */
+#define POMO_DIM_PCT     12
+#define POMO_MOTION_TH   2600      /* ~0.16 g of movement counts as "handled"  */
+#define POMO_DONE_MS     7000      /* how long the finish screen lingers       */
+
+/* Clockwise from the top edge, matching the layout on screen. */
+static const uint8_t s_pomo_min[POMO_SLOTS] = { 60, 10, 5, 30 };
+
+typedef enum { POMO_IDLE = 0, POMO_RUN, POMO_PAUSE, POMO_DONE } pomo_state_t;
+
+/* Session state is file-scope, not owned by the screen: a countdown keeps
+ * running if you navigate away, and the app is only ever a view onto it. */
+static pomo_state_t s_pomo_state;
+static int      s_pomo_sel = 0;
+static int      s_pomo_total_s, s_pomo_left_s;
+static int64_t  s_pomo_tick_ms;
+static int64_t  s_pomo_done_at;
+static uint32_t s_pomo_sessions;
+
+static bool     s_pomo_flat;
+static int64_t  s_pomo_flat_since;
+static int      s_pomo_last_rot = -1;
+static int64_t  s_pomo_active_ms;      /* last touch or movement */
+static bool     s_pomo_dimmed;
+static int      s_acc_ref_x, s_acc_ref_y, s_acc_ref_z;
+
+/* widgets */
+static lv_obj_t *s_pomo_dial[POMO_SLOTS];
+static lv_obj_t *s_pomo_clock, *s_pomo_word, *s_pomo_ring, *s_pomo_arc;
+static int s_pomo_drawn_rot = -1;
+
+typedef struct {
+    uint16_t ver;
+    uint16_t sel;
+    uint32_t sessions;
+} pomo_blob_t;
+#define POMO_BLOB_VER 1
+
+static void pomo_load(void) {
+    pomo_blob_t b;
+    if (store_load("pomodoro", &b, sizeof(b)) && b.ver == POMO_BLOB_VER) {
+        s_pomo_sel = clampi(b.sel, 0, POMO_SLOTS - 1);
+        s_pomo_sessions = b.sessions;
+    }
+}
+
+static void pomo_save(void) {
+    pomo_blob_t b = { .ver = POMO_BLOB_VER, .sel = (uint16_t)s_pomo_sel,
+                      .sessions = s_pomo_sessions };
+    store_save("pomodoro", &b, sizeof(b));
+}
+
+#define POMO_LOG_PATH BSP_SD_MOUNT_POINT "/logs/pomo.csv"
+
+static void pomo_log(const char *how) {
+    if (!s_sd_ok) return;
+    struct stat st;
+    bool fresh = (stat(POMO_LOG_PATH, &st) != 0);
+    FILE *f = fopen(POMO_LOG_PATH, "a");
+    if (!f) return;
+    if (fresh) fprintf(f, "clock,minutes,outcome,sessions\n");
+
+    char clock[16] = "";
+    time_t now; struct tm ti;
+    time(&now); localtime_r(&now, &ti);
+    if (ti.tm_year >= (2024 - 1900)) strftime(clock, sizeof(clock), "%H:%M", &ti);
+
+    fprintf(f, "%s,%d,%s,%lu\n", clock, s_pomo_total_s / 60, how,
+            (unsigned long)s_pomo_sessions);
+    fclose(f);
+}
+
+static void pomo_begin(int slot, bool announce) {
+    s_pomo_sel = clampi(slot, 0, POMO_SLOTS - 1);
+    s_pomo_total_s = s_pomo_min[s_pomo_sel] * 60;
+    s_pomo_left_s = s_pomo_total_s;
+    s_pomo_tick_ms = now_ms();
+    s_pomo_state = POMO_RUN;
+    if (announce) sfx_play(SFX_START);
+    ESP_LOGI(TAG, "pomodoro: %d min started", s_pomo_min[s_pomo_sel]);
+}
+
+static void pomo_finish(void) {
+    s_pomo_state = POMO_DONE;
+    s_pomo_left_s = 0;
+    s_pomo_done_at = now_ms();
+    s_pomo_sessions++;
+    sfx_play(SFX_DONE);
+    pomo_log("done");
+    pomo_save();
+    ESP_LOGI(TAG, "pomodoro: complete (%lu total)", (unsigned long)s_pomo_sessions);
+}
+
+/* ---- the screen ---- */
+
+/* Which edge is physically at the top. Reads the same calibration autorotate
+ * uses, so a correctly calibrated device gives a correctly oriented dial.
+ *
+ * There is deliberately no fudge factor here. One was added after misreading two
+ * photographs — a photo has no gravity reference, so "the top label looks upright
+ * in the picture" says nothing about which way the cube was actually facing. */
+static int pomo_top_edge(void) {
+    return rot_from_base(s_base_rot) & 3;
+}
+
+/* 0.1-degree units, clockwise. Edge i must be pre-rotated by -90*i so that
+ * turning the cube by +90*i cancels it out and the label reads upright. */
+static int32_t pomo_edge_angle(int i) {
+    return (3600 - 900 * i) % 3600;
+}
+
+static void pomo_build_dial(lv_obj_t *scr) {
+    static const lv_coord_t dx[POMO_SLOTS] = {   0,  176,    0, -176 };
+    static const lv_coord_t dy[POMO_SLOTS] = { -176,   0,  176,    0 };
+
+    for (int i = 0; i < POMO_SLOTS; i++) {
+        lv_obj_t *l = lv_label_create(scr);
+        lv_obj_set_size(l, 130, 28);
+        lv_obj_set_style_text_font(l, &lv_font_montserrat_20, 0);
+        lv_obj_set_style_text_align(l, LV_TEXT_ALIGN_CENTER, 0);
+        /* rotate about the label's middle, not its corner */
+        lv_obj_set_style_transform_pivot_x(l, 65, 0);
+        lv_obj_set_style_transform_pivot_y(l, 14, 0);
+        lv_obj_set_style_transform_rotation(l, pomo_edge_angle(i), 0);
+        lv_label_set_text_fmt(l, "%d MIN", s_pomo_min[i]);
+        lv_obj_align(l, LV_ALIGN_CENTER, dx[i], dy[i]);
+        lv_obj_remove_flag(l, LV_OBJ_FLAG_CLICKABLE);
+        s_pomo_dial[i] = l;
+    }
+}
+
+static void pomo_refresh(void) {
+    if (!s_pomo_clock) return;
+
+    int wr = pomo_top_edge();
+    int32_t counter = (3600 - 900 * wr) % 3600;
+
+    /* Highlight whichever label is physically at the top. */
+    for (int i = 0; i < POMO_SLOTS; i++) {
+        bool active = (i == wr);
+        lv_obj_set_style_text_color(s_pomo_dial[i],
+            lv_color_hex(active ? 0xFFB454 : 0x33465C), 0);
+        lv_obj_set_style_text_letter_space(s_pomo_dial[i], active ? 3 : 1, 0);
+    }
+
+    if (wr != s_pomo_drawn_rot) {
+        s_pomo_drawn_rot = wr;
+
+        /* Rotating each label only spins it about its own centre — its offset
+         * from the middle of the screen stays put. So the word, pinned 52 px
+         * "below" the clock in screen space, swung round into the digits as soon
+         * as the cube was turned. The offsets have to rotate with the content,
+         * so the stack keeps reading clock-then-word whichever way is up. */
+        static const lv_coord_t cx[4] = {   0, -14,   0,  14 };
+        static const lv_coord_t cy[4] = { -14,   0,  14,   0 };
+        static const lv_coord_t wx[4] = {   0,  52,   0, -52 };
+        static const lv_coord_t wy[4] = {  52,   0, -52,   0 };
+
+        lv_obj_set_style_transform_rotation(s_pomo_clock, counter, 0);
+        lv_obj_set_style_transform_rotation(s_pomo_word, counter, 0);
+        lv_obj_align(s_pomo_clock, LV_ALIGN_CENTER, cx[wr], cy[wr]);
+        lv_obj_align(s_pomo_word,  LV_ALIGN_CENTER, wx[wr], wy[wr]);
+
+        /* keep the depleting ring starting from world-up, not screen-up */
+        lv_arc_set_rotation(s_pomo_arc, (270 - 90 * wr + 360) % 360);
+    }
+
+    int left = s_pomo_left_s < 0 ? 0 : s_pomo_left_s;
+    lv_label_set_text_fmt(s_pomo_clock, "%02d:%02d", left / 60, left % 60);
+
+    int pct = (s_pomo_total_s > 0)
+            ? (int)(((int64_t)left * 360) / s_pomo_total_s) : 360;
+
+    uint32_t col;
+    const char *word;
+    switch (s_pomo_state) {
+    case POMO_RUN:   col = 0xFFB454; word = "FOCUS";  break;
+    case POMO_PAUSE: col = 0x60A5FA; word = "PAUSED"; break;
+    case POMO_DONE:  col = 0x35C759; word = "DONE";   break;
+    default:         col = 0x64748B; word = "TURN TO START"; break;
+    }
+    lv_label_set_text(s_pomo_word, word);
+    lv_obj_set_style_text_color(s_pomo_word, lv_color_hex(col), 0);
+    lv_obj_set_style_text_color(s_pomo_clock,
+        lv_color_hex(s_pomo_state == POMO_PAUSE ? 0x7A8BA5 : 0xF2E9DC), 0);
+
+    if (s_pomo_state == POMO_DONE) {
+        /* a slow pulse rather than a static screen, so a finished session
+         * catches the eye from across a room */
+        int64_t age = now_ms() - s_pomo_done_at;
+        int k = (int)((age / 40) % 50);
+        int w = 8 + (k < 25 ? k : 50 - k) / 2;
+        lv_obj_set_style_arc_width(s_pomo_arc, w, LV_PART_MAIN);
+        lv_arc_set_bg_angles(s_pomo_arc, 0, 360);
+        lv_obj_set_style_arc_color(s_pomo_arc, lv_color_hex(0x35C759), LV_PART_MAIN);
+    } else {
+        lv_obj_set_style_arc_width(s_pomo_arc, 10, LV_PART_MAIN);
+        lv_arc_set_bg_angles(s_pomo_arc, 0, pct ? pct : 1);
+        lv_obj_set_style_arc_color(s_pomo_arc, lv_color_hex(col), LV_PART_MAIN);
+    }
+}
+
+static void pomo_timer_cb(lv_timer_t *t) {
+    if (s_screen_on) pomo_refresh();
+}
+
+static void build_pomo_app(lv_obj_t *scr) {
+    /* near-black: on an AMOLED those pixels are simply off, which is what lets
+     * this sit lit on a desk for an hour without eating the battery */
+    lv_obj_set_style_bg_color(scr, lv_color_hex(0x000000), 0);
+    lv_obj_remove_flag(scr, LV_OBJ_FLAG_SCROLLABLE);
+
+    s_pomo_ring = lv_arc_create(scr);
+    lv_obj_set_size(s_pomo_ring, 404, 404);
+    lv_obj_center(s_pomo_ring);
+    lv_obj_remove_style(s_pomo_ring, NULL, LV_PART_KNOB);
+    lv_obj_remove_flag(s_pomo_ring, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_set_style_arc_width(s_pomo_ring, 2, LV_PART_MAIN);
+    lv_obj_set_style_arc_width(s_pomo_ring, 0, LV_PART_INDICATOR);
+    lv_obj_set_style_arc_color(s_pomo_ring, lv_color_hex(0x1A2230), LV_PART_MAIN);
+    lv_arc_set_bg_angles(s_pomo_ring, 0, 360);
+
+    s_pomo_arc = lv_arc_create(scr);
+    lv_obj_set_size(s_pomo_arc, 404, 404);
+    lv_obj_center(s_pomo_arc);
+    lv_obj_remove_style(s_pomo_arc, NULL, LV_PART_KNOB);
+    lv_obj_remove_flag(s_pomo_arc, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_set_style_arc_width(s_pomo_arc, 10, LV_PART_MAIN);
+    lv_obj_set_style_arc_width(s_pomo_arc, 0, LV_PART_INDICATOR);
+    lv_obj_set_style_arc_color(s_pomo_arc, lv_color_hex(0xFFB454), LV_PART_MAIN);
+    lv_arc_set_bg_angles(s_pomo_arc, 0, 360);
+
+    pomo_build_dial(scr);
+
+    s_pomo_clock = lv_label_create(scr);
+    lv_obj_set_size(s_pomo_clock, 300, 90);
+    lv_obj_set_style_text_font(s_pomo_clock, &hud_clock_76, 0);
+    lv_obj_set_style_text_align(s_pomo_clock, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_style_transform_pivot_x(s_pomo_clock, 150, 0);
+    lv_obj_set_style_transform_pivot_y(s_pomo_clock, 45, 0);
+    lv_label_set_text(s_pomo_clock, "00:00");
+    lv_obj_align(s_pomo_clock, LV_ALIGN_CENTER, 0, -14);
+
+    s_pomo_word = lv_label_create(scr);
+    lv_obj_set_size(s_pomo_word, 300, 26);
+    lv_obj_set_style_text_font(s_pomo_word, &hud_text_18, 0);
+    lv_obj_set_style_text_align(s_pomo_word, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_style_transform_pivot_x(s_pomo_word, 150, 0);
+    lv_obj_set_style_transform_pivot_y(s_pomo_word, 13, 0);
+    lv_label_set_text(s_pomo_word, "");
+    lv_obj_align(s_pomo_word, LV_ALIGN_CENTER, 0, 52);
+
+    lv_obj_add_event_cb(scr, gesture_home_cb, LV_EVENT_GESTURE, NULL);
+
+    s_pomo_drawn_rot = -1;
+    s_pomo_active_ms = now_ms();
+    if (s_pomo_state == POMO_IDLE) {
+        s_pomo_left_s = s_pomo_min[s_pomo_sel] * 60;
+        s_pomo_total_s = s_pomo_left_s;
+    }
+    pomo_refresh();
+    s_app_timer = lv_timer_create(pomo_timer_cb, 250, NULL);
+}
+
+/* ---- the physical side, driven from the main loop ---- */
+
+/* Lying down, either face up. Testing |z| rather than a signed value keeps this
+ * independent of how the IMU is mounted relative to the panel, which is not
+ * documented anywhere and had to be calibrated empirically for autorotate. */
+static bool pomo_is_flat(void) {
+    return abs(s_acc_z) > POMO_FLAT_TH;
+}
+
+static void pomo_poll(int64_t t) {
+    if (s_app != APP_POMO) {
+        if (s_pomo_dimmed) {                 /* never leave the panel dimmed */
+            bsp_display_brightness_set(100);
+            s_pomo_dimmed = false;
+        }
+        return;
+    }
+
+    /* --- flat means pause --- */
+    bool flat = pomo_is_flat();
+    if (flat != s_pomo_flat) {
+        if (!s_pomo_flat_since) s_pomo_flat_since = t;
+        if (t - s_pomo_flat_since >= POMO_FLAT_MS) {
+            s_pomo_flat = flat;
+            s_pomo_flat_since = 0;
+            if (flat && s_pomo_state == POMO_RUN) {
+                s_pomo_state = POMO_PAUSE;
+                sfx_play(SFX_PAUSE);
+                ESP_LOGI(TAG, "pomodoro: paused (laid flat)");
+            } else if (!flat && s_pomo_state == POMO_PAUSE) {
+                s_pomo_state = POMO_RUN;
+                s_pomo_tick_ms = t;
+                sfx_play(SFX_RESUME);
+                ESP_LOGI(TAG, "pomodoro: resumed");
+            }
+        }
+    } else {
+        s_pomo_flat_since = 0;
+    }
+
+    /* --- turning the cube picks a duration and starts it --- */
+    int wr = pomo_top_edge();
+    if (s_pomo_last_rot < 0) s_pomo_last_rot = wr;
+    if (wr != s_pomo_last_rot && !flat) {
+        s_pomo_last_rot = wr;
+        sfx_play(SFX_TICK);                       /* the detent */
+        bool first = (s_pomo_state != POMO_RUN);
+        pomo_begin(wr, first);                    /* announce only on the first */
+        s_pomo_active_ms = t;
+    }
+
+    /* --- the countdown itself --- */
+    if (s_pomo_state == POMO_RUN) {
+        while (t - s_pomo_tick_ms >= 1000) {
+            s_pomo_tick_ms += 1000;
+            if (--s_pomo_left_s <= 0) { pomo_finish(); break; }
+        }
+        /* Keep the device awake. idle is min(LVGL inactivity, time since a key),
+         * and a running countdown touches neither, so without this the auto-lock
+         * would tear the app down 60 s in. */
+        lv_display_trigger_activity(NULL);
+    } else if (s_pomo_state == POMO_PAUSE) {
+        lv_display_trigger_activity(NULL);
+    } else if (s_pomo_state == POMO_DONE) {
+        lv_display_trigger_activity(NULL);
+        if (t - s_pomo_done_at > POMO_DONE_MS) {
+            s_pomo_state = POMO_IDLE;
+            app_request(APP_LOCK);                /* settle into the clock */
+        }
+    }
+
+    /* --- dim when nothing is happening, wake on touch or movement --- */
+    int dx = abs(s_acc_x - s_acc_ref_x) + abs(s_acc_y - s_acc_ref_y) +
+             abs(s_acc_z - s_acc_ref_z);
+    s_acc_ref_x = s_acc_x; s_acc_ref_y = s_acc_y; s_acc_ref_z = s_acc_z;
+    bool touched = lv_display_get_inactive_time(NULL) < 1000;
+    if (dx > POMO_MOTION_TH || touched) s_pomo_active_ms = t;
+
+    bool want_dim = (t - s_pomo_active_ms > POMO_DIM_MS);
+    if (want_dim != s_pomo_dimmed) {
+        s_pomo_dimmed = want_dim;
+        bsp_display_brightness_set(want_dim ? POMO_DIM_PCT : 100);
+        ESP_LOGI(TAG, "pomodoro: %s", want_dim ? "dimmed" : "full brightness");
+    }
+}
+
 /* ---------------- app drawer ---------------- */
 
 typedef struct {
@@ -2116,6 +2877,7 @@ typedef struct {
 static const app_def_t s_apps[APP_COUNT] = {
     [APP_CONTROL] = { "CONTROL", "control", ICON_DASHBOARD, 0x22D3EE, build_control_app, NULL     },
     [APP_PET]    = { "PIP",    "pet",    ICON_PETS,      0xF59E0B, build_pet_app,    pet_save },
+    [APP_POMO]   = { "FOCUS",  "pomo",   ICON_TARGET,    0xFFB454, build_pomo_app,   pomo_save },
     [APP_WIFI]   = { "WI-FI",  "wifi",   ICON_WIFI,      0x34D399, build_wifi_app,   NULL     },
 };
 
@@ -2546,6 +3308,7 @@ static void wall_service(void) {
      * against 45 s awake, so an idle device quietly finishes the pool in about
      * two hours and then drops to one replacement every WALLPAPER_PERIOD_MS. */
     if (!s_sd_ok || !s_wifi_up) return;
+    if (s_pomo_state == POMO_RUN) return;   /* not during a session */
 
     bool filling = (wall_first_empty() >= 0);
     int64_t due = filling ? 0 : WALLPAPER_PERIOD_MS;
@@ -3027,6 +3790,15 @@ static void app_action(void) {
     case APP_CONTROL:
         s_req_wallpaper = true;      /* the card shows real progress for this */
         break;
+    case APP_POMO:
+        if (s_pomo_state == POMO_RUN || s_pomo_state == POMO_PAUSE) {
+            pomo_log("cancelled");
+            s_pomo_state = POMO_IDLE;
+            s_pomo_left_s = s_pomo_total_s;
+            sfx_play(SFX_PAUSE);
+            ESP_LOGI(TAG, "pomodoro: cancelled");
+        }
+        break;
     default:                                        /* drawer: step through apps */
         drawer_pick = (drawer_pick + 1) % APP_COUNT;
         app_request(drawer_pick);
@@ -3062,9 +3834,14 @@ static void app_open(int idx) {
     s_ch_wrap = NULL;
     s_cfg_wall_pool = NULL; s_cfg_wall_state = NULL;
     s_cfg_wall_bar = NULL; s_cfg_wall_sub = NULL;
-    s_cfg_rot_val = NULL; s_cfg_batt_bar = NULL;
+    s_cfg_rot_val = NULL; s_cfg_snd_val = NULL; s_cfg_snd_hz = NULL;
+    s_cfg_vol_val = NULL;
+    s_cfg_batt_bar = NULL;
     s_cfg_batt_val = NULL; s_cfg_batt_sub = NULL;
     s_cfg_net_val = NULL; s_cfg_sys_val = NULL; s_cfg_log = NULL;
+    s_pomo_clock = NULL; s_pomo_word = NULL;
+    s_pomo_ring = NULL; s_pomo_arc = NULL;
+    for (int i = 0; i < POMO_SLOTS; i++) s_pomo_dial[i] = NULL;
     s_lock_time = NULL; s_lock_date = NULL; s_lock_batt = NULL;
     s_lock_sweep = NULL; s_lock_batt_arc = NULL;
 
@@ -3114,6 +3891,7 @@ void app_main(void) {
 
     creds_load();
     pet_load();
+    pomo_load();
 
     /* Wi-Fi driver first: its DMA pool needs one contiguous chunk of pristine
      * internal heap. Association proceeds async while the display comes up. */
@@ -3156,6 +3934,8 @@ void app_main(void) {
 
     telemetry_row("boot");
 
+    vol_load();
+    sfx_init();
     xTaskCreate(https_task, "https", 8192, NULL, 5, NULL);
 
     int64_t last_stats = now_ms();
@@ -3292,6 +4072,11 @@ void app_main(void) {
             esp_wifi_connect();
         }
 
+        if (s_req_vol_save) {
+            s_req_vol_save = false;
+            vol_save();
+        }
+
         if (s_req_wifi_off) {
             s_req_wifi_off = false;
             s_wifi_disabled = true;
@@ -3329,6 +4114,7 @@ void app_main(void) {
         if (!s_doze && t - last_imu >= 100) {     /* rotation is meaningless dozing */
             last_imu = t;
             imu_poll();
+            pomo_poll(t);                         /* needs fresh accelerometer */
         }
 
         if (!s_rtc_written && s_time_synced) {
