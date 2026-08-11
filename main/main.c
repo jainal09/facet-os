@@ -3560,7 +3560,15 @@ static void build_lock_screen(lv_obj_t *scr) {
         lv_obj_t *wall = lv_image_create(scr);
         lv_image_set_src(wall, lvpath);
         lv_obj_center(wall);
-        lv_obj_set_style_image_opa(wall, 110, 0);
+        /* Opacity alone is not enough. A bright photo faded over black just goes
+         * grey, and a grey field across the whole panel reads as an overlay
+         * sitting on top of the UI rather than as a background behind it — it
+         * also wrecks the contrast the HUD depends on. Fade it AND crush it
+         * toward black, which keeps the texture while dropping the luminance.
+         * Darker is also cheaper on an AMOLED. */
+        lv_obj_set_style_image_opa(wall, 105, 0);
+        lv_obj_set_style_image_recolor(wall, lv_color_hex(0x000000), 0);
+        lv_obj_set_style_image_recolor_opa(wall, 130, 0);
         lv_obj_remove_flag(wall, LV_OBJ_FLAG_CLICKABLE);
         s_wall_slot = slot;
 
