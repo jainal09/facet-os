@@ -121,8 +121,8 @@ Typical healthy figures with display + Wi-Fi + an app running:
 
 | | |
 |---|---|
-| Internal SRAM free | **~25–35 KB** idle, ~22 KB with a heavy app open |
-| Min watermark during a TLS handshake | ~21 KB (was 16 **bytes** before tuning) |
+| Internal SRAM free | **~29 KB** idle, ~24 KB with the heaviest app open |
+| Floor across an app-switch sweep | **~21.8 KB** |
 | PSRAM free | ~7.3 MB of 8 MB |
 | App binary | ~1.5 MB in a 4 MB partition |
 | Unallocated flash | **~11.9 MB** — room for OTA slots or a filesystem |
@@ -131,8 +131,22 @@ Rules of thumb: an LVGL screen costs ~5 KB internal; a VPN stack costs ~42 KB of
 permanent task stacks; a TLS session costs ~40 KB but goes to PSRAM if
 `MBEDTLS_EXTERNAL_MEM_ALLOC` is on.
 
-Watch `heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL)` — the *minimum* is
-what kills you, not the current free.
+**Measure one pool, consistently.** `esp_get_free_internal_heap_size()` reports
+`8BIT|DMA|INTERNAL`, but `heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL)`
+watermarks a *superset* that also counts 32-bit-only IRAM. Logging one against
+the other produces rows where the minimum exceeds the current free — impossible
+for one pool — and quietly overstates the floor by however much IRAM-ish memory
+happens to be free. `8BIT|DMA|INTERNAL` is the pool that matters, because it is
+what Wi-Fi buffers, DMA descriptors and BLE need. Log free, minimum **and
+largest block** from identical caps: exhaustion and fragmentation are
+indistinguishable in a free-size column and need opposite fixes.
+
+**Task stacks default to internal SRAM, and they are expensive.** A single
+`xTaskCreate(..., 8192, ...)` costs 8 KB of the scarcest pool on the board.
+Anything that is not time-critical and never runs with the cache disabled should
+use `xTaskCreateWithCaps(..., MALLOC_CAP_SPIRAM)` instead — moving one network
+task's stack raised the measured floor from 13.6 KB to 21.8 KB, which is the
+largest single memory win found on this board so far.
 
 ## 5. Display and LVGL
 

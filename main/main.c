@@ -1,13 +1,10 @@
 /*
  * Funnel-profile firmware — Waveshare ESP32-S3-Touch-AMOLED-2.16
  *
- * No VPN stack. Wi-Fi STA + periodic HTTPS request (bearer token) to the STT
- * endpoint — TLS cost is transient per call instead of continuous.
+ * No VPN stack. Wi-Fi STA and ordinary outbound HTTPS, so TLS cost is transient
+ * per call instead of a permanent set of task stacks.
  *
- * Screens
- *   HOME   : battery bar, STT/wifi status, spinning arc, rolling event log
- *   SETUP  : Wi-Fi scan list -> LVGL on-screen keyboard, creds saved to NVS
- *   PET    : a small virtual pet, interactive through the side keys
+ * Apps are built on open and freed on close; see docs/ARCHITECTURE.md.
  *
  * Keys
  *   left  (IO18, GPIO18) : HOME/SETUP = screen off/on   PET = feed
@@ -50,6 +47,7 @@
 #include "esp_pm.h"
 #include "esp_sntp.h"
 #include "esp_task_wdt.h"
+#include "esp_app_desc.h"
 #include <time.h>
 #include <sys/stat.h>
 #include <errno.h>
@@ -175,7 +173,6 @@ static volatile int  s_batt_mv;
 static volatile bool s_batt_charging;
 static volatile bool s_wifi_up;
 static volatile bool s_screen_on = true;
-static char s_http_status[40] = "starting";
 
 /* pet state (persisted) */
 static int s_food = 80, s_fun = 75, s_nrg = 90;
@@ -195,7 +192,8 @@ static volatile bool s_req_wifi_on;    /* user tapped RECONNECT   */
  * station is back on the network a second after the user asked it not to be. */
 static bool s_wifi_disabled;
 static char s_ip[16];
-static volatile bool s_req_http;
+static volatile int s_wifi_reason;      /* last disconnect reason, for the log */
+static int  s_wifi_tries;               /* drives the reconnect backoff */
 static volatile bool s_req_sntp;
 static volatile bool s_req_wake;
 static bool s_time_synced;
@@ -262,6 +260,37 @@ static void wall_service(void);
 static void power_set_doze(bool doze);
 static int  battery_drain_mv_h(void);
 
+/* The pool that actually matters, and the ONE definition of it.
+ *
+ * esp_get_free_internal_heap_size() reports 8BIT|DMA|INTERNAL, but
+ * heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL) watermarks a superset
+ * that also counts 32-bit-only IRAM. Logging one against the other produced
+ * rows where min exceeded free — impossible for a single pool — and silently
+ * overstated the floor. Everything below uses identical caps so the numbers are
+ * comparable, and largest-block is included because exhaustion and
+ * fragmentation look the same in a free-size column and need opposite fixes. */
+#define MEM_CAPS (MALLOC_CAP_8BIT | MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL)
+
+static inline uint32_t hp_free(void)    { return heap_caps_get_free_size(MEM_CAPS); }
+static inline uint32_t hp_min(void)     { return heap_caps_get_minimum_free_size(MEM_CAPS); }
+static inline uint32_t hp_largest(void) { return heap_caps_get_largest_free_block(MEM_CAPS); }
+
+/* Short build id, so a CSV row can be attributed to a binary. Without it the log
+ * silently mixes every firmware that ever ran, and a row from deleted code reads
+ * as a live measurement. */
+static const char *build_id(void) {
+    static char id[9];
+    if (!id[0]) {
+        const esp_app_desc_t *d = esp_app_get_description();
+        for (int i = 0; i < 4; i++) {
+            static const char hex[] = "0123456789abcdef";
+            id[i * 2]     = hex[d->app_elf_sha256[i] >> 4];
+            id[i * 2 + 1] = hex[d->app_elf_sha256[i] & 0xF];
+        }
+    }
+    return id;
+}
+
 static int64_t now_ms(void) {
     return (int64_t)xTaskGetTickCount() * portTICK_PERIOD_MS;
 }
@@ -288,11 +317,8 @@ static void log_event(const char *fmt, ...) {
 
 static void log_mem(const char *tag2) {
     ESP_LOGI(TAG,
-        "MEM[%s] internal_free=%u internal_min=%u internal_largest_block=%u psram_free=%u",
-        tag2,
-        (unsigned)esp_get_free_internal_heap_size(),
-        (unsigned)heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL),
-        (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL),
+        "MEM[%s] free=%u min=%u largest=%u psram=%u",
+        tag2, (unsigned)hp_free(), (unsigned)hp_min(), (unsigned)hp_largest(),
         (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
 }
 
@@ -396,13 +422,16 @@ static void wifi_event_handler(void *arg, esp_event_base_t base, int32_t id, voi
         s_wifi_up = false;
         s_ip[0] = '\0';
         xEventGroupClearBits(s_evt, WIFI_CONNECTED_BIT);
-        /* a scan drops the association on purpose — don't fight it; and never
-         * undo an explicit disconnect */
-        if (s_app != APP_WIFI && !s_wifi_disabled) {
-            ESP_LOGW(TAG, "WiFi disconnected (reason=%d), retrying...", d->reason);
-            vTaskDelay(pdMS_TO_TICKS(1000));
-            esp_wifi_connect();
-        }
+        /* Record the reason and let the main loop own reconnection.
+         *
+         * This used to retry here, which was wrong twice over. It slept for a
+         * second *inside an event callback*, stalling the whole Wi-Fi event task
+         * on every disconnect; and it raced the main loop's keep-alive nudge, so
+         * two paths called esp_wifi_connect() and the logs filled with
+         * "sta is connecting, return error". With an AP that has genuinely gone
+         * away (reason 201, NO_AP_FOUND) that repeated several times a second
+         * for hours. One owner, with backoff, is the fix. */
+        s_wifi_reason = d->reason;
     } else if (base == IP_EVENT && id == IP_EVENT_STA_GOT_IP) {
         ip_event_got_ip_t *e = (ip_event_got_ip_t *)data;
         ESP_LOGI(TAG, "WiFi got IP: " IPSTR, IP2STR(&e->ip_info.ip));
@@ -590,68 +619,35 @@ static void net_bench_run(void) {
                   "warm steady-state %lld ms | heap %u ===",
              (long long)(cs / NET_BENCH_N), (long long)(ws / NET_BENCH_N),
              (long long)(ws_steady / (NET_BENCH_N - 1)),
-             (unsigned)esp_get_free_internal_heap_size());
+             (unsigned)hp_free());
 }
 #endif
 
-static void https_task(void *arg) {
-#if NET_BENCH
-    xEventGroupWaitBits(s_evt, WIFI_CONNECTED_BIT, pdFALSE, pdTRUE, portMAX_DELAY);
-    vTaskDelay(pdMS_TO_TICKS(4000));      /* let SNTP and the UI settle first */
-    net_bench_run();
-#endif
+/* The network task.
+ *
+ * Once polled a stand-in "speech to text" endpoint every 45 s to characterise
+ * TLS cost. That measurement is long done and recorded in HARDWARE.md 7f, so the
+ * poll was pure waste: a TLS handshake, a log line and a UI string, several
+ * times a minute, for information nobody read.
+ *
+ * Its stack lives in PSRAM. As plain xTaskCreate it took 8 KB of internal SRAM —
+ * the scarcest pool on the board — for a task that does nothing time-critical
+ * and never runs with the cache disabled.
+ */
+static void net_task(void *arg) {
     while (1) {
         xEventGroupWaitBits(s_evt, WIFI_CONNECTED_BIT, pdFALSE, pdTRUE, portMAX_DELAY);
 
-        int64_t t0 = esp_timer_get_time();
-        uint32_t heap_before = esp_get_free_internal_heap_size();
-
-        esp_http_client_config_t cfg = {
-            .url = STT_ENDPOINT_URL,
-            .crt_bundle_attach = esp_crt_bundle_attach,
-            .timeout_ms = 15000,
-            .method = HTTP_METHOD_GET,
-        };
-        esp_http_client_handle_t client = esp_http_client_init(&cfg);
-        if (client) {
-            if (STT_BEARER_TOKEN[0] != '\0') {
-                char auth[160];
-                snprintf(auth, sizeof(auth), "Bearer %s", STT_BEARER_TOKEN);
-                esp_http_client_set_header(client, "Authorization", auth);
-            }
-            esp_err_t err = esp_http_client_perform(client);
-            int code = esp_http_client_get_status_code(client);
-            int64_t dur_ms = (esp_timer_get_time() - t0) / 1000;
-
-            if (err == ESP_OK) {
-                snprintf(s_http_status, sizeof(s_http_status),
-                         "HTTP %d  %lldms", code, (long long)dur_ms);
-                log_event("STT %d in %lldms", code, (long long)dur_ms);
-            } else {
-                snprintf(s_http_status, sizeof(s_http_status), "err %s", esp_err_to_name(err));
-                log_event("STT err %s", esp_err_to_name(err));
-            }
-            ESP_LOGI(TAG, "STT: %s | heap before=%u after=%u min_ever=%u",
-                     s_http_status, (unsigned)heap_before,
-                     (unsigned)esp_get_free_internal_heap_size(),
-                     (unsigned)heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL));
-            esp_http_client_cleanup(client);
-        }
-        /* Wallpapers ride along on this task rather than the main loop. It
-         * already owns an 8 KB stack and a TLS path, so the pool costs no
-         * additional internal SRAM — and a slow download can no longer stall
-         * button handling or the app switcher, which it did when the fetch ran
-         * inline. */
+        /* Wallpapers are this task's only remaining job. Off the main loop, so
+         * a slow download cannot stall button handling or the app switcher. */
         wall_service();
 
-        /* A wallpaper request breaks the wait too, so pressing Fetch acts now
-         * instead of sitting there until the next cycle — up to 45 s awake, and
-         * ten minutes dozing, which read as "stuck". */
+        /* A wallpaper request breaks the wait, so pressing Fetch acts now
+         * instead of sitting until the next cycle. */
         int period = s_doze ? (10 * 60 * 1000) : HTTPS_PERIOD_MS;
-        for (int w = 0; w < period / 100 && !s_req_http && !s_req_wallpaper; w++) {
+        for (int w = 0; w < period / 100 && !s_req_wallpaper; w++) {
             vTaskDelay(pdMS_TO_TICKS(100));
         }
-        s_req_http = false;
     }
 }
 
@@ -1762,7 +1758,7 @@ static float vol_db(int v) {
 static bool sfx_codec_ready(void) {
     if (s_spk) return true;
     bsp_audio_enable_rx(false);              /* playback only */
-    uint32_t before = esp_get_free_internal_heap_size();
+    uint32_t before = hp_free();
     s_spk = bsp_audio_codec_speaker_init();
     if (!s_spk) {
         ESP_LOGE(TAG, "speaker init failed — sound disabled");
@@ -1776,8 +1772,7 @@ static bool sfx_codec_ready(void) {
         ESP_LOGW(TAG, "custom volume curve rejected — stuck at unity gain");
     }
     ESP_LOGI(TAG, "speaker up, internal heap %u -> %u (cost %d B)",
-             (unsigned)before, (unsigned)esp_get_free_internal_heap_size(),
-             (int)(before - esp_get_free_internal_heap_size()));
+             (unsigned)before, (unsigned)hp_free(), (int)(before - hp_free()));
     return true;
 }
 
@@ -2097,11 +2092,11 @@ static void cfg_timer_cb(lv_timer_t *t) {
     wifi_ap_record_t ap;
     int rssi = (esp_wifi_sta_get_ap_info(&ap) == ESP_OK) ? ap.rssi : 0;
     lv_label_set_text_fmt(s_cfg_net_val,
-                          "%s%s\nip  %s\nsignal  %d dBm\nendpoint  %s",
+                          "%s%s\nip  %s\nsignal  %d dBm",
                           s_wifi_up ? LV_SYMBOL_OK "  " : "",
                           s_wifi_up ? s_ssid : (s_wifi_disabled ? "wi-fi off" : "offline"),
                           s_ip[0] ? s_ip : "-",
-                          rssi, s_http_status);
+                          rssi);
 
     /* ---- system ---- */
     lv_label_set_text_fmt(s_cfg_sys_val,
@@ -2113,8 +2108,8 @@ static void cfg_timer_cb(lv_timer_t *t) {
                           "idf  %s",
                           (unsigned long)(now_ms() / 1000),
                           (unsigned)(s_last_fps_x10 / 10), (unsigned)(s_last_fps_x10 % 10),
-                          (unsigned)(esp_get_free_internal_heap_size() / 1024),
-                          (unsigned)(heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL) / 1024),
+                          (unsigned)(hp_free() / 1024),
+                          (unsigned)(hp_min() / 1024),
                           (unsigned long)(heap_caps_get_free_size(MALLOC_CAP_SPIRAM) / 1024),
                           s_sd_ok ? "mounted" : "none", (unsigned long)s_tele_rows,
                           IDF_VER);
@@ -3221,7 +3216,7 @@ static bool asset_fetch(const char *url, const char *path) {
         int status = esp_http_client_get_status_code(c);
         ok = (err == ESP_OK && status == 200);
         ESP_LOGI(TAG, "asset: HTTP %d, heap %u", status,
-                 (unsigned)esp_get_free_internal_heap_size());
+                 (unsigned)hp_free());
         esp_http_client_cleanup(c);
     }
     fclose(s_dl_file);
@@ -3464,7 +3459,8 @@ static bool store_load(const char *id, void *data, size_t len) {
  * the power numbers matter — so it keeps its own history on the card.
  */
 
-#define TELEMETRY_PATH   BSP_SD_MOUNT_POINT "/logs/pwrlog.csv"
+#define TELEMETRY_PATH   BSP_SD_MOUNT_POINT "/logs/pwrlog2.csv"
+#define TELEMETRY_OLD    BSP_SD_MOUNT_POINT "/logs/pwrlog.csv"
 #define TELEMETRY_PERIOD 60000
 
 static void sd_init(void) {
@@ -3480,6 +3476,32 @@ static void sd_init(void) {
     }
 }
 
+/* One-shot dump of the power log to serial. The card cannot be read without
+ * pulling it out of the device, and the whole point of this log is that it
+ * accumulates while running on battery with no console attached. */
+#define PWRLOG_DUMP 1
+
+#if PWRLOG_DUMP
+static void telemetry_dump(void) {
+    FILE *f = fopen(TELEMETRY_PATH, "r");
+    if (!f) {
+        ESP_LOGW(TAG, "no power log at %s", TELEMETRY_PATH);
+        return;
+    }
+    ESP_LOGW(TAG, "=== BEGIN pwrlog.csv ===");
+    char line[224];
+    int n = 0;
+    while (fgets(line, sizeof(line), f)) {
+        line[strcspn(line, "\r\n")] = '\0';
+        printf("CSV %s\n", line);
+        n++;
+        if ((n % 40) == 0) vTaskDelay(pdMS_TO_TICKS(20));  /* let USB-CDC drain */
+    }
+    fclose(f);
+    ESP_LOGW(TAG, "=== END pwrlog.csv (%d lines) ===", n);
+}
+#endif
+
 static void telemetry_row(const char *event) {
     if (!s_sd_ok) return;
 
@@ -3493,8 +3515,8 @@ static void telemetry_row(const char *event) {
         return;
     }
     if (fresh) {
-        fprintf(f, "clock,uptime_s,event,batt_mv,batt_pct,charging,doze,screen,"
-                   "wifi,app,heap_free,heap_min,fps\n");
+        fprintf(f, "build,clock,uptime_s,event,batt_mv,batt_pct,charging,doze,screen,"
+                   "wifi,app,heap_free,heap_min,heap_largest,fps\n");
     }
 
     char clock[16] = "";
@@ -3504,12 +3526,11 @@ static void telemetry_row(const char *event) {
     localtime_r(&tnow, &ti);
     if (ti.tm_year >= (2024 - 1900)) strftime(clock, sizeof(clock), "%H:%M:%S", &ti);
 
-    fprintf(f, "%s,%lld,%s,%d,%d,%d,%d,%d,%d,%d,%u,%u,%u.%u\n",
-            clock, (long long)(now_ms() / 1000), event,
+    fprintf(f, "%s,%s,%lld,%s,%d,%d,%d,%d,%d,%d,%d,%u,%u,%u,%u.%u\n",
+            build_id(), clock, (long long)(now_ms() / 1000), event,
             s_batt_mv, s_batt_pct, s_batt_charging ? 1 : 0,
             s_doze ? 1 : 0, s_screen_on ? 1 : 0, s_wifi_up ? 1 : 0, s_app,
-            (unsigned)esp_get_free_internal_heap_size(),
-            (unsigned)heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL),
+            (unsigned)hp_free(), (unsigned)hp_min(), (unsigned)hp_largest(),
             (unsigned)(s_last_fps_x10 / 10), (unsigned)(s_last_fps_x10 % 10));
     fclose(f);
     s_tele_rows++;
@@ -3933,10 +3954,49 @@ static void app_open(int idx) {
              (idx >= 0 && idx < APP_COUNT) ? s_apps[idx].name
                  : (idx == APP_LOCK ? "LOCK" : "DRAWER"),
              (long long)((esp_timer_get_time() - t0) / 1000),
-             (unsigned)esp_get_free_internal_heap_size());
+             (unsigned)hp_free());
 
     if (idx == APP_WIFI) s_req_scan = true;     /* scan as soon as it opens */
 }
+
+/* One-shot per-app memory bench.
+ *
+ * The power log showed heap_free reaching 1,223 bytes with an app open, awake,
+ * and no download in flight — so the cost is in the screens themselves, not in
+ * a transient. This opens each app in turn, lets it render, and reports what it
+ * actually costs, because guessing which of five cards is expensive is how you
+ * optimise the wrong thing. */
+#define APP_MEM_BENCH 1
+
+#if APP_MEM_BENCH
+static void mem_line(const char *what) {
+    ESP_LOGW(TAG, "  %-10s free=%6u  min=%6u  largest=%6u  psram=%lu",
+             what, (unsigned)hp_free(), (unsigned)hp_min(), (unsigned)hp_largest(),
+             (unsigned long)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
+}
+
+static void app_mem_bench(void) {
+    ESP_LOGW(TAG, "=== per-app internal SRAM cost ===");
+    app_open(APP_DRAWER);
+    vTaskDelay(pdMS_TO_TICKS(1200));
+    mem_line("DRAWER");
+
+    for (int i = 0; i < APP_COUNT; i++) {
+        app_open(i);
+        vTaskDelay(pdMS_TO_TICKS(1800));    /* render a few frames */
+        mem_line(s_apps[i].name);
+    }
+
+    app_open(APP_LOCK);
+    vTaskDelay(pdMS_TO_TICKS(1800));
+    mem_line("LOCK");
+
+    app_open(APP_DRAWER);
+    vTaskDelay(pdMS_TO_TICKS(1200));
+    mem_line("back-drawer");
+    ESP_LOGW(TAG, "=== end bench ===");
+}
+#endif
 
 /* ---------------- Main ---------------- */
 
@@ -4001,11 +4061,20 @@ void app_main(void) {
     btn_init(&s_key_left);
     btn_init(&s_key_right);
 
+#if PWRLOG_DUMP
+    telemetry_dump();          /* before this boot adds its own rows */
+#endif
     telemetry_row("boot");
 
     vol_load();
     sfx_init();
-    xTaskCreate(https_task, "https", 8192, NULL, 5, NULL);
+    /* PSRAM stack: 8 KB of internal SRAM is far too expensive for a task that
+     * polls and downloads. Same trick as the sfx task. */
+    if (xTaskCreateWithCaps(net_task, "net", 8192, NULL, 5, NULL,
+                            MALLOC_CAP_SPIRAM) != pdPASS) {
+        ESP_LOGW(TAG, "net task (PSRAM stack) failed — falling back to internal");
+        xTaskCreate(net_task, "net", 8192, NULL, 5, NULL);
+    }
 
     int64_t last_stats = now_ms();
     int64_t last_batt = 0, last_imu = 0, last_pet = now_ms(), last_pet_save = now_ms();
@@ -4021,6 +4090,10 @@ void app_main(void) {
      * fired and the device simply sat frozen until it was power-cycled.
      * Subscribing the main task means a stalled loop panics after 30 s and
      * reboots with a backtrace — self-healing, and diagnosable next time. */
+#if APP_MEM_BENCH
+    app_mem_bench();
+#endif
+
     esp_task_wdt_add(NULL);
 
     while (1) {
@@ -4161,14 +4234,26 @@ void app_main(void) {
             esp_wifi_connect();
         }
 
-        /* Keep-alive for the association. The event handler deliberately skips
-         * its retry while the WI-FI app is open (a scan drops the link on
-         * purpose), which left no one to reconnect after leaving the app. A
-         * periodic nudge is more robust than relying on the event alone. */
-        if (!s_wifi_up && !s_wifi_disabled && s_app != APP_WIFI &&
-            t - last_rejoin >= 10000) {
-            last_rejoin = t;
-            esp_wifi_connect();
+        /* The single owner of reconnection. The event handler only records the
+         * reason; everything else happens here, so there is exactly one caller
+         * of esp_wifi_connect() and no chance of the two racing.
+         *
+         * Backoff matters: reason 201 (NO_AP_FOUND) means the network is simply
+         * not there, and it can stay that way for hours. Hammering it every
+         * 10 s achieves nothing, keeps the radio busy and floods the log. Ramp
+         * 5 s -> 60 s and sit there. */
+        if (s_wifi_up || s_wifi_disabled) {
+            s_wifi_tries = 0;
+        } else if (s_app != APP_WIFI) {
+            int64_t wait = 5000LL << (s_wifi_tries < 4 ? s_wifi_tries : 4);
+            if (wait > 60000) wait = 60000;
+            if (t - last_rejoin >= wait) {
+                last_rejoin = t;
+                if (s_wifi_tries < 12) s_wifi_tries++;
+                ESP_LOGI(TAG, "wifi reconnect attempt %d (last reason=%d, next in %llds)",
+                         s_wifi_tries, s_wifi_reason, (long long)(wait / 1000));
+                esp_wifi_connect();
+            }
         }
 
         if (t - last_pet >= PET_TICK_MS) {
@@ -4220,7 +4305,7 @@ void app_main(void) {
                 }
             }
             ESP_LOGI(TAG, "uptime=%llds clock=%s scr=%d idle=%lu/%llds wifi=%s screen=%s batt=%d%% %dmV%s fps=%u.%u "
-                          "rot=%d sd=%lu pet[%d/%d/%d] | STT %s",
+                          "rot=%d sd=%lu pet[%d/%d/%d]",
                      (long long)(t / 1000), clock, (int)s_app,
                      (unsigned long)lv_display_get_inactive_time(NULL),
                      (long long)((t - s_last_btn) / 1000),
@@ -4229,8 +4314,7 @@ void app_main(void) {
                      (int)s_batt_pct, (int)s_batt_mv,
                      s_batt_charging ? " CHG" : "",
                      (unsigned)(s_last_fps_x10 / 10), (unsigned)(s_last_fps_x10 % 10),
-                     s_rot * 90, (unsigned long)s_tele_rows, s_food, s_fun, s_nrg,
-                     s_http_status);
+                     s_rot * 90, (unsigned long)s_tele_rows, s_food, s_fun, s_nrg);
             log_mem("periodic");
         }
     }

@@ -73,6 +73,6 @@ idf_component_register(
                 "../assets/sounds/resume.wav"
                 "../assets/sounds/done.wav"
     REQUIRES nvs_flash esp_wifi esp_event esp_netif esp_http_client mbedtls
-             esp_timer esp_driver_gpio esp_driver_i2c esp_lcd_touch fatfs json esp_codec_dev esp_driver_i2s
+             esp_timer esp_driver_gpio esp_driver_i2c esp_lcd_touch fatfs json esp_codec_dev esp_driver_i2s esp_app_format
              esp32_s3_touch_amoled_2_16
 )
