@@ -314,6 +314,10 @@ UI task), cache to the card, decode from the card when shown. Nothing preloaded.
   unset and nothing calls `esp_lv_decoder_init()` — confirmed with `nm` on the
   ELF, not just from config. Turn both on if JPEG is ever needed on screen.
   Neither decoder handles progressive JPEG, so the source still has to cooperate.
+- **Spotify's cover art is baseline JPEG** (`SOF0`, verified against a real
+  `i.scdn.co` URL — 300x300 came back 27 KB). So it is decodable here without
+  help. It still hits the no-caching problem above, so either enable
+  `esp_lv_decoder` or serve it as PNG through the existing LodePNG path.
 - **FATFS defaults to 8.3 filenames**, so creating `telemetry.csv` (9-char stem)
   silently fails. Enable `CONFIG_FATFS_LFN_HEAP=y` or keep stems ≤ 8 chars.
 - **Validate cached assets on boot** (e.g. check the PNG signature). A fetch

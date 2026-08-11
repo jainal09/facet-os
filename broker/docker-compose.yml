@@ -1,0 +1,31 @@
+services:
+  broker:
+    build: .
+    image: facet-broker:latest
+    container_name: facet-broker
+    restart: unless-stopped
+
+    # Loopback only. Tailscale Funnel is what publishes this; binding 0.0.0.0
+    # would additionally expose it to the LAN, which nothing needs.
+    ports:
+      - "127.0.0.1:8080:8080"
+
+    env_file: broker.env
+
+    volumes:
+      - art-cache:/cache
+
+    # It needs to fetch images and write one directory. Nothing else.
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  art-cache:

@@ -23,13 +23,14 @@ pairing depend on the broker, so it is not a dependency of daily use.
 offer the device-code flow that would let a screen with no keyboard pair on its
 own. Something reachable over HTTPS has to catch the callback.
 
-**Album art.** The firmware can only decode **baseline** JPEG, and its baseline
-decoder never populates LVGL's image cache — so a stock Spotify cover is either
-undecodable or re-decoded fifteen times per frame (see
-[`docs/HARDWARE.md` §7c](../docs/HARDWARE.md)). Go decodes progressive happily
-and only ever *writes* baseline, so transcoding here removes the entire risk
-class. It also centre-crops and scales to exactly the size the panel draws,
-turning a ~40 KB 640×640 into a few KB.
+**Album art.** Measured: Spotify already serves **baseline** JPEG, so the device
+*can* decode it unaided — this endpoint is an optimisation, not a rescue. It
+centre-crops and scales to exactly the size the panel draws, which turns a
+27 KB 300x300 into 10 KB, and it keeps the guarantee explicit rather than
+depending on Spotify never switching to progressive. The firmware's own decoder
+handles baseline only, and its baseline path never populates LVGL's image cache
+(see [`docs/HARDWARE.md` §7c](../docs/HARDWARE.md)), so having one predictable
+format arriving at one known size is worth keeping.
 
 ## Endpoints
 
@@ -67,34 +68,59 @@ threat model, but worth knowing.
 ## Run it
 
 ```sh
-go test ./...
-go build -o facet-broker .
-
-BROKER_TOKEN=$(openssl rand -hex 32) \
-SPOTIFY_CLIENT_ID=... \
-SPOTIFY_REDIRECT_URI=https://your-host.tsXXXX.ts.net/callback \
-  ./facet-broker -addr 127.0.0.1:8080
+cp broker.env.example broker.env      # fill in, then chmod 600
+docker compose up -d --build
+curl -s localhost:8080/healthz
 ```
 
-## Deploy to the Pi
+The image is **8.7 MB**: a multi-stage build producing a single static binary on
+`distroless/static`. No shell, no package manager, no Go toolchain in the
+runtime — `docker exec <c> id` fails, which is the point.
+
+`go vet` and the tests run **inside the build stage**, so a regression in the
+baseline-JPEG guarantee fails the image build rather than shipping a cover the
+cube renders as nothing.
+
+Compose runs it unprivileged: `nonroot`, read-only root filesystem, all
+capabilities dropped, `no-new-privileges`, and bound to `127.0.0.1:8080` only —
+Funnel is what publishes it, and binding `0.0.0.0` would additionally expose it
+to the LAN.
+
+## Expose it with Tailscale Funnel
 
 ```sh
-GOOS=linux GOARCH=arm64 go build -o facet-broker .
-scp facet-broker pi:/tmp/ && ssh pi 'sudo mv /tmp/facet-broker /usr/local/bin/'
-
-# on the Pi
-sudo install -m 600 broker.env /etc/facet-broker.env     # from broker.env.example
-sudo cp facet-broker.service /etc/systemd/system/
-sudo systemctl enable --now facet-broker
-sudo tailscale funnel --bg 8080
+sudo tailscale funnel --bg --https=443 http://127.0.0.1:8080
+sudo tailscale funnel status
 ```
 
-Then add the resulting `https://<host>.ts.net/callback` to the Spotify app's
-Redirect URIs. Spotify matches it character for character.
+Funnel must first be enabled for the tailnet — the CLI prints a
+`login.tailscale.com/f/funnel?node=...` link and blocks until an admin approves
+it. Note the CLI syntax: `tailscale funnel 8080 on` is the **old** form and now
+errors with "the CLI for serve and funnel has changed".
 
-The unit runs under `DynamicUser` with `ProtectSystem=strict` and only
-`AF_INET`/`AF_INET6` — it fetches images and writes one cache directory, and
-should not be able to do anything else.
+Then add `https://<host>.<tailnet>.ts.net/callback` to the Spotify app's Redirect
+URIs. Spotify matches it character for character.
+
+## Measured against the real API
+
+Verified end to end through Funnel from the public internet:
+
+| | |
+|---|---|
+| `GET /v1/me/player` | 3,190 B |
+| `GET /v1/me/player/devices` | 815 B |
+| Spotify cover art, 300x300 | 27,469 B, **SOF0 — baseline** |
+| Same through `/art?s=240` | 10,532 B (38%), baseline, ~185 ms |
+| Refresh token -> access token | 379 B, `expires_in=3600` |
+
+Two findings that changed the firmware plan:
+
+- **Spotify's cover art is already baseline JPEG**, so the device can decode it
+  directly. The transcode is now an *optimisation* — 62% fewer bytes at exactly
+  the size the panel draws — rather than a requirement.
+- **The refresh token does not rotate.** Spotify returns no new `refresh_token`
+  on refresh for this flow, so the firmware stores it once and never has to
+  re-persist it.
 
 ## Testing
 
@@ -103,6 +129,8 @@ on the **JPEG SOF marker** of the output rather than trusting that `image/jpeg`
 keeps writing baseline — if that ever regressed, the cube would show nothing and
 fail silently, which is the worst kind of bug to inherit.
 
-`findSOF` in `main_test.go` is also the exact check worth running against a real
-`i.scdn.co` URL to settle whether the transcode is strictly required or merely a
-nice optimisation. `0xC0` is baseline, `0xC2` is progressive.
+`findSOF` in `main_test.go` is the same check that was run against a real
+`i.scdn.co` URL to settle whether the transcode was required. Answer: Spotify
+returns `0xC0` (baseline), so it is not — it is a 62% bandwidth saving and a
+format guarantee. Re-run it if covers ever stop rendering on the device; `0xC2`
+would mean Spotify switched to progressive.
