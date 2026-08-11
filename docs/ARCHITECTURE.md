@@ -175,7 +175,7 @@ human-written and contain spaces, so they are percent-encoded into the URL.
 
 Which slots hold a usable image is cached in a bitmask (`s_wall_have`), rebuilt
 once at mount, rather than stat-ing twelve files on every lock-screen build.
-Attribution is stored per slot in `wN.txt` and STATUS shows the credit for
+Attribution is stored per slot in `wN.txt` and CONTROL shows the credit for
 whatever is currently on screen.
 
 Fetching runs on the **network task, not the main loop**. That task already owns

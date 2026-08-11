@@ -122,7 +122,7 @@ static EventGroupHandle_t s_evt;
 /* Apps are built when opened and destroyed when closed, so only the running
  * app costs RAM. That removes the widget ceiling entirely — the cost of a
  * switch is one rebuild, not a reboot. */
-enum { APP_STATUS = 0, APP_PET, APP_WIFI, APP_SYS, APP_COUNT };
+enum { APP_CONTROL = 0, APP_PET, APP_WIFI, APP_COUNT };
 #define APP_DRAWER (-1)
 #define APP_LOCK   (-2)
 #define AUTO_LOCK_MS  60000     /* unlocked and idle -> lock */
@@ -230,7 +230,31 @@ static bool store_load(const char *id, void *data, size_t len);
 static bool s_sd_ok;
 static uint32_t s_tele_rows;
 static bool s_doze;
-static char s_wall_credit[48];      /* Unsplash photographer, shown in STATUS */
+static char s_wall_credit[48];      /* Unsplash photographer, shown in CONTROL */
+
+/* Wallpaper pool state. Declared up here rather than beside the fetch code
+ * because both the network task and the CONTROL screen are defined long before
+ * it, and both need to see it. */
+#define WALL_SLOTS      12
+#define WALL_DIR        BSP_SD_MOUNT_POINT "/assets"
+
+static volatile bool s_req_wallpaper;
+static uint16_t s_wall_have;         /* bitmask of slots holding a usable PNG */
+static int      s_wall_slot = -1;    /* slot currently on screen, -1 = none */
+static int64_t  s_wall_last;         /* last download attempt, success or not */
+
+/* Download progress, so the UI can show what a fetch is actually doing.
+ * "Fetching wallpaper" as a one-shot log line read as permanently stuck: it
+ * never cleared, and it appeared up to a full network cycle before anything
+ * happened. */
+typedef enum { DL_IDLE = 0, DL_QUERY, DL_IMAGE, DL_OK, DL_FAIL } dl_state_t;
+static volatile dl_state_t s_dl_state;
+static volatile int      s_dl_pct;
+static volatile int      s_dl_kb;
+static volatile int64_t  s_dl_total;
+static volatile int64_t  s_dl_got;
+static int64_t           s_dl_ended_ms;   /* when OK/FAIL landed, to auto-clear */
+static char              s_dl_theme[80];
 
 /* One tick of the wallpaper pool. Defined with the asset code further down but
  * driven from the network task, which is declared long before it. */
@@ -509,8 +533,11 @@ static void https_task(void *arg) {
          * inline. */
         wall_service();
 
+        /* A wallpaper request breaks the wait too, so pressing Fetch acts now
+         * instead of sitting there until the next cycle — up to 45 s awake, and
+         * ten minutes dozing, which read as "stuck". */
         int period = s_doze ? (10 * 60 * 1000) : HTTPS_PERIOD_MS;
-        for (int w = 0; w < period / 100 && !s_req_http; w++) {
+        for (int w = 0; w < period / 100 && !s_req_http && !s_req_wallpaper; w++) {
             vTaskDelay(pdMS_TO_TICKS(100));
         }
         s_req_http = false;
@@ -1504,133 +1531,297 @@ static void build_pet_app(lv_obj_t *scr) {
     s_app_timer = lv_timer_create(pet_timer_cb, PET_FPS_MS, NULL);
 }
 
-/* ---------------- home screen ---------------- */
+/* ---------------- CONTROL: settings + diagnostics ----------------
+ *
+ * Replaces the old STATUS and SYSTEM screens, which between them showed a
+ * decorative spinner, a wall of read-only text, and a "right button =
+ * calibrate" hint for an action you could not see the result of.
+ *
+ * This is a scrolling column of cards, each pairing live readouts with the
+ * control that acts on them: the wallpaper card owns the fetch button and shows
+ * the actual download percentage, the display card owns rotation calibration
+ * and shows what it just changed to. Nothing here is decorative.
+ */
 
 static void refr_ready_cb(lv_event_t *e) {
     s_refr_count++;
 }
 
-static void ui_timer_cb(lv_timer_t *t) {
-    if (!s_status_label) return;
+static lv_obj_t *s_cfg_wall_pool, *s_cfg_wall_state, *s_cfg_wall_bar, *s_cfg_wall_sub;
+static lv_obj_t *s_cfg_rot_val;
+static lv_obj_t *s_cfg_batt_bar, *s_cfg_batt_val, *s_cfg_batt_sub;
+static lv_obj_t *s_cfg_net_val;
+static lv_obj_t *s_cfg_sys_val;
+static lv_obj_t *s_cfg_log;
 
-    int pct = s_batt_pct;
-    if (s_batt_bar && s_batt_label) {
-        if (pct < 0) {
-            lv_label_set_text(s_batt_label, "USB");
-            lv_bar_set_value(s_batt_bar, 100, LV_ANIM_OFF);
-            lv_obj_set_style_bg_color(s_batt_bar, lv_color_hex(0x4A9EFF), LV_PART_INDICATOR);
-        } else {
-            lv_label_set_text_fmt(s_batt_label, "%d%%", pct);
-            lv_bar_set_value(s_batt_bar, pct, LV_ANIM_OFF);
-            lv_color_t c = (pct >= 50) ? lv_color_hex(0x35C759)
-                         : (pct >= 20) ? lv_color_hex(0xFFB020)
-                                       : lv_color_hex(0xFF453A);
-            lv_obj_set_style_bg_color(s_batt_bar, c, LV_PART_INDICATOR);
-        }
+#define CFG_ACCENT_WALL 0x22D3EE
+#define CFG_ACCENT_DISP 0xA78BFA
+#define CFG_ACCENT_BATT 0x34D399
+#define CFG_ACCENT_NET  0x60A5FA
+#define CFG_ACCENT_SYS  0x94A3B8
+
+/* one card in the scrolling column */
+static lv_obj_t *cfg_card(lv_obj_t *parent, const char *title, uint32_t accent) {
+    lv_obj_t *card = lv_obj_create(parent);
+    lv_obj_remove_style_all(card);
+    lv_obj_set_width(card, lv_pct(100));
+    lv_obj_set_height(card, LV_SIZE_CONTENT);
+    lv_obj_set_style_bg_color(card, lv_color_hex(0x11161F), 0);
+    lv_obj_set_style_bg_opa(card, LV_OPA_COVER, 0);
+    lv_obj_set_style_radius(card, 16, 0);
+    lv_obj_set_style_pad_all(card, 14, 0);
+    lv_obj_set_style_pad_row(card, 7, 0);
+    lv_obj_set_style_border_width(card, 1, 0);
+    lv_obj_set_style_border_color(card, lv_color_hex(accent), 0);
+    lv_obj_set_style_border_opa(card, 80, 0);
+    lv_obj_remove_flag(card, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_flex_flow(card, LV_FLEX_FLOW_COLUMN);
+
+    lv_obj_t *t = lv_label_create(card);
+    lv_obj_set_style_text_font(t, &hud_text_18, 0);
+    lv_obj_set_style_text_color(t, lv_color_hex(accent), 0);
+    lv_obj_set_style_text_letter_space(t, 3, 0);
+    lv_label_set_text(t, title);
+    return card;
+}
+
+/* a readout line inside a card */
+static lv_obj_t *cfg_text(lv_obj_t *card, uint32_t colour) {
+    lv_obj_t *l = lv_label_create(card);
+    lv_obj_set_width(l, lv_pct(100));
+    lv_obj_set_style_text_color(l, lv_color_hex(colour), 0);
+    lv_label_set_long_mode(l, LV_LABEL_LONG_WRAP);
+    lv_label_set_text(l, "");
+    return l;
+}
+
+static lv_obj_t *cfg_button(lv_obj_t *card, const char *text, uint32_t accent,
+                            lv_event_cb_t cb) {
+    lv_obj_t *b = lv_button_create(card);
+    lv_obj_set_size(b, lv_pct(100), 44);
+    lv_obj_set_style_radius(b, 12, 0);
+    lv_obj_set_style_bg_color(b, lv_color_hex(0x1B2432), 0);
+    lv_obj_set_style_border_width(b, 1, 0);
+    lv_obj_set_style_border_color(b, lv_color_hex(accent), 0);
+    lv_obj_set_style_border_opa(b, 150, 0);
+    lv_obj_set_style_bg_color(b, lv_color_hex(accent), LV_STATE_PRESSED);
+    lv_obj_add_event_cb(b, cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_t *l = lv_label_create(b);
+    lv_obj_set_style_text_color(l, lv_color_hex(0xE2E8F0), 0);
+    lv_label_set_text(l, text);
+    lv_obj_center(l);
+    return b;
+}
+
+static void cfg_fetch_cb(lv_event_t *e) {
+    s_req_wallpaper = true;          /* the network task breaks its wait on this */
+}
+
+static void cfg_rotate_cb(lv_event_t *e) {
+    rotation_bump();
+}
+
+static void cfg_timer_cb(lv_timer_t *t) {
+    if (!s_cfg_sys_val) return;
+
+    /* ---- wallpaper ---- */
+    int have = __builtin_popcount(s_wall_have);
+    lv_label_set_text_fmt(s_cfg_wall_pool, "pool  %d / %d   ·   new one every 6 h",
+                          have, WALL_SLOTS);
+
+    /* clear a finished result after a few seconds so the card returns to rest */
+    if ((s_dl_state == DL_OK || s_dl_state == DL_FAIL) &&
+        now_ms() - s_dl_ended_ms > 6000) {
+        s_dl_state = DL_IDLE;
     }
-    lv_label_set_text(s_bolt_label, s_batt_charging ? LV_SYMBOL_CHARGE : " ");
-    /* the photo credit lives here, not on the lock screen — Unsplash's terms
-     * want attribution, the lock screen wants to stay clean */
-    lv_label_set_text_fmt(s_status_label, "STT  %s\n%s   heap %u KB\n%s%s",
-                          s_http_status,
-                          s_wifi_up ? s_ssid : "wifi down",
+
+    switch (s_dl_state) {
+    case DL_QUERY:
+        lv_obj_remove_flag(s_cfg_wall_bar, LV_OBJ_FLAG_HIDDEN);
+        lv_bar_set_value(s_cfg_wall_bar, 0, LV_ANIM_OFF);
+        lv_obj_set_style_bg_color(s_cfg_wall_bar, lv_color_hex(CFG_ACCENT_WALL),
+                                  LV_PART_INDICATOR);
+        lv_obj_set_style_text_color(s_cfg_wall_state, lv_color_hex(CFG_ACCENT_WALL), 0);
+        lv_label_set_text(s_cfg_wall_state, "asking unsplash...");
+        break;
+    case DL_IMAGE:
+        lv_obj_remove_flag(s_cfg_wall_bar, LV_OBJ_FLAG_HIDDEN);
+        lv_bar_set_value(s_cfg_wall_bar, s_dl_pct, LV_ANIM_OFF);
+        lv_obj_set_style_bg_color(s_cfg_wall_bar, lv_color_hex(CFG_ACCENT_WALL),
+                                  LV_PART_INDICATOR);
+        lv_obj_set_style_text_color(s_cfg_wall_state, lv_color_hex(CFG_ACCENT_WALL), 0);
+        if (s_dl_total > 0) {
+            lv_label_set_text_fmt(s_cfg_wall_state, "downloading  %d%%   %d KB",
+                                  s_dl_pct, s_dl_kb);
+        } else {
+            lv_label_set_text_fmt(s_cfg_wall_state, "downloading  %d KB", s_dl_kb);
+        }
+        break;
+    case DL_OK:
+        lv_obj_remove_flag(s_cfg_wall_bar, LV_OBJ_FLAG_HIDDEN);
+        lv_bar_set_value(s_cfg_wall_bar, 100, LV_ANIM_OFF);
+        lv_obj_set_style_bg_color(s_cfg_wall_bar, lv_color_hex(0x35C759),
+                                  LV_PART_INDICATOR);
+        lv_obj_set_style_text_color(s_cfg_wall_state, lv_color_hex(0x35C759), 0);
+        lv_label_set_text_fmt(s_cfg_wall_state, LV_SYMBOL_OK "  saved  ·  %d KB", s_dl_kb);
+        break;
+    case DL_FAIL:
+        lv_obj_remove_flag(s_cfg_wall_bar, LV_OBJ_FLAG_HIDDEN);
+        lv_bar_set_value(s_cfg_wall_bar, 100, LV_ANIM_OFF);
+        lv_obj_set_style_bg_color(s_cfg_wall_bar, lv_color_hex(0xFF453A),
+                                  LV_PART_INDICATOR);
+        lv_obj_set_style_text_color(s_cfg_wall_state, lv_color_hex(0xFF453A), 0);
+        lv_label_set_text(s_cfg_wall_state, LV_SYMBOL_WARNING "  fetch failed");
+        break;
+    default:
+        lv_obj_add_flag(s_cfg_wall_bar, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_set_style_text_color(s_cfg_wall_state, lv_color_hex(0x64748B), 0);
+        lv_label_set_text(s_cfg_wall_state,
+                          s_req_wallpaper ? "queued..." : "idle");
+        break;
+    }
+
+    if (s_dl_theme[0] && s_dl_state != DL_IDLE) {
+        lv_label_set_text_fmt(s_cfg_wall_sub, "theme  %s", s_dl_theme);
+    } else if (s_wall_credit[0]) {
+        lv_label_set_text_fmt(s_cfg_wall_sub, "on screen  %s / Unsplash", s_wall_credit);
+    } else {
+        lv_label_set_text(s_cfg_wall_sub, "");
+    }
+
+    /* ---- display ---- */
+    lv_label_set_text_fmt(s_cfg_rot_val,
+                          "orientation  %d deg\ncalibration  %d / %d  %s\naccel  %d  %d  %d",
+                          s_rot * 90, s_rot_cfg + 1, ROT_CFG_COUNT,
+                          (s_rot_cfg & 4) ? "reversed" : "normal",
+                          s_acc_x / 100, s_acc_y / 100, s_acc_z / 100);
+
+    /* ---- battery ---- */
+    int pct = s_batt_pct;
+    lv_bar_set_value(s_cfg_batt_bar, pct < 0 ? 100 : pct, LV_ANIM_OFF);
+    lv_obj_set_style_bg_color(s_cfg_batt_bar,
+        lv_color_hex(pct < 0 ? 0x4A9EFF
+                    : pct >= 50 ? 0x35C759
+                    : pct >= 20 ? 0xFFB020 : 0xFF453A), LV_PART_INDICATOR);
+    if (pct < 0) {
+        lv_label_set_text(s_cfg_batt_val, "external power");
+    } else {
+        lv_label_set_text_fmt(s_cfg_batt_val, "%d%%   %d mV%s", pct, s_batt_mv,
+                              s_batt_charging ? "   " LV_SYMBOL_CHARGE " charging" : "");
+    }
+    int drain = battery_drain_mv_h();
+    if (drain > 0) {
+        lv_label_set_text_fmt(s_cfg_batt_sub, "drain  %d mV/h   ·   %s", drain,
+                              s_doze ? "dozing" : "active");
+    } else {
+        lv_label_set_text_fmt(s_cfg_batt_sub, "drain  measuring...   ·   %s",
+                              s_doze ? "dozing" : "active");
+    }
+
+    /* ---- network ---- */
+    wifi_ap_record_t ap;
+    int rssi = (esp_wifi_sta_get_ap_info(&ap) == ESP_OK) ? ap.rssi : 0;
+    lv_label_set_text_fmt(s_cfg_net_val,
+                          "%s%s\nip  %s\nsignal  %d dBm\nendpoint  %s",
+                          s_wifi_up ? LV_SYMBOL_OK "  " : "",
+                          s_wifi_up ? s_ssid : (s_wifi_disabled ? "wi-fi off" : "offline"),
+                          s_ip[0] ? s_ip : "-",
+                          rssi, s_http_status);
+
+    /* ---- system ---- */
+    lv_label_set_text_fmt(s_cfg_sys_val,
+                          "uptime  %lu s\n"
+                          "render  %u.%u fps\n"
+                          "heap  %u KB free  ·  %u KB min\n"
+                          "psram  %lu KB free\n"
+                          "sdcard  %s  ·  %lu log rows\n"
+                          "idf  %s",
+                          (unsigned long)(now_ms() / 1000),
+                          (unsigned)(s_last_fps_x10 / 10), (unsigned)(s_last_fps_x10 % 10),
                           (unsigned)(esp_get_free_internal_heap_size() / 1024),
-                          s_wall_credit[0] ? "photo " : "",
-                          s_wall_credit[0] ? s_wall_credit : "");
-    lv_label_set_text_fmt(s_fps_label, "%u.%u\nfps",
-                          (unsigned)(s_last_fps_x10 / 10),
-                          (unsigned)(s_last_fps_x10 % 10));
+                          (unsigned)(heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL) / 1024),
+                          (unsigned long)(heap_caps_get_free_size(MALLOC_CAP_SPIRAM) / 1024),
+                          s_sd_ok ? "mounted" : "none", (unsigned long)s_tele_rows,
+                          IDF_VER);
 
     if (s_log_mtx && xSemaphoreTake(s_log_mtx, pdMS_TO_TICKS(20)) == pdTRUE) {
         char buf[LOG_LINES * sizeof(s_log[0]) + 8];
         snprintf(buf, sizeof(buf), "%s\n%s\n%s", s_log[0], s_log[1], s_log[2]);
         xSemaphoreGive(s_log_mtx);
-        lv_label_set_text(s_events_label, buf);
+        lv_label_set_text(s_cfg_log, buf);
     }
 }
 
-static void arc_anim_cb(void *var, int32_t v) {
-    lv_arc_set_rotation((lv_obj_t *)var, v);
-}
+static void build_control_app(lv_obj_t *scr) {
+    lv_obj_set_style_bg_color(scr, lv_color_hex(0x05070B), 0);
+    lv_obj_remove_flag(scr, LV_OBJ_FLAG_SCROLLABLE);
 
+    lv_obj_t *title = lv_label_create(scr);
+    lv_obj_set_style_text_font(title, &hud_text_18, 0);
+    lv_obj_set_style_text_color(title, lv_color_hex(0xE8FBFF), 0);
+    lv_obj_set_style_text_letter_space(title, 6, 0);
+    lv_label_set_text(title, "CONTROL");
+    lv_obj_align(title, LV_ALIGN_TOP_MID, 0, TOP_MARGIN);
 
-static void build_status_app(lv_obj_t *scr) {
-    s_scr_home = scr;
-    lv_obj_set_style_bg_color(s_scr_home, lv_color_hex(0x0B0B14), 0);
-    lv_obj_remove_flag(s_scr_home, LV_OBJ_FLAG_SCROLLABLE);
+    /* The scroll column stays inside the corner radius: 364 wide is safe all
+     * the way down to y=436, where the arc has only cut ~22 px off each side. */
+    lv_obj_t *col = lv_obj_create(scr);
+    lv_obj_remove_style_all(col);
+    lv_obj_set_size(col, CONTENT_W, 372);
+    lv_obj_align(col, LV_ALIGN_TOP_MID, 0, 64);
+    lv_obj_set_flex_flow(col, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_style_pad_row(col, 12, 0);
+    lv_obj_set_style_pad_all(col, 2, 0);
+    lv_obj_set_scroll_dir(col, LV_DIR_VER);
+    lv_obj_set_scrollbar_mode(col, LV_SCROLLBAR_MODE_ACTIVE);
 
-    lv_obj_t *batt_row = lv_obj_create(s_scr_home);
-    lv_obj_remove_style_all(batt_row);
-    lv_obj_set_size(batt_row, 210, 26);
-    lv_obj_align(batt_row, LV_ALIGN_TOP_MID, 0, TOP_MARGIN);
-    lv_obj_set_flex_flow(batt_row, LV_FLEX_FLOW_ROW);
-    lv_obj_set_flex_align(batt_row, LV_FLEX_ALIGN_CENTER,
-                          LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
-    lv_obj_set_style_pad_column(batt_row, 8, 0);
-    lv_obj_remove_flag(batt_row, LV_OBJ_FLAG_SCROLLABLE);
+    /* ---- wallpaper ---- */
+    lv_obj_t *c = cfg_card(col, "WALLPAPER", CFG_ACCENT_WALL);
+    s_cfg_wall_pool  = cfg_text(c, 0xC7D2E0);
+    s_cfg_wall_state = cfg_text(c, 0x64748B);
 
-    s_bolt_label = lv_label_create(batt_row);
-    lv_obj_set_style_text_color(s_bolt_label, lv_color_hex(0x35C759), 0);
-    lv_label_set_text(s_bolt_label, " ");
+    s_cfg_wall_bar = lv_bar_create(c);
+    lv_obj_set_size(s_cfg_wall_bar, lv_pct(100), 8);
+    lv_bar_set_range(s_cfg_wall_bar, 0, 100);
+    lv_bar_set_value(s_cfg_wall_bar, 0, LV_ANIM_OFF);
+    lv_obj_set_style_radius(s_cfg_wall_bar, 4, 0);
+    lv_obj_set_style_radius(s_cfg_wall_bar, 4, LV_PART_INDICATOR);
+    lv_obj_set_style_bg_color(s_cfg_wall_bar, lv_color_hex(0x1E293B), 0);
+    lv_obj_add_flag(s_cfg_wall_bar, LV_OBJ_FLAG_HIDDEN);
 
-    s_batt_bar = lv_bar_create(batt_row);
-    lv_obj_set_size(s_batt_bar, 110, 14);
-    lv_bar_set_range(s_batt_bar, 0, 100);
-    lv_bar_set_value(s_batt_bar, 0, LV_ANIM_OFF);
-    lv_obj_set_style_radius(s_batt_bar, 7, 0);
-    lv_obj_set_style_radius(s_batt_bar, 7, LV_PART_INDICATOR);
-    lv_obj_set_style_bg_color(s_batt_bar, lv_color_hex(0x2A2A38), 0);
-    lv_obj_set_style_bg_color(s_batt_bar, lv_color_hex(0x35C759), LV_PART_INDICATOR);
+    s_cfg_wall_sub = cfg_text(c, 0x64748B);
+    cfg_button(c, LV_SYMBOL_DOWNLOAD "  Fetch new wallpaper",
+               CFG_ACCENT_WALL, cfg_fetch_cb);
 
-    s_batt_label = lv_label_create(batt_row);
-    lv_obj_set_style_text_color(s_batt_label, lv_color_hex(0xE6E6EE), 0);
-    lv_label_set_text(s_batt_label, "--%");
+    /* ---- display ---- */
+    c = cfg_card(col, "DISPLAY", CFG_ACCENT_DISP);
+    s_cfg_rot_val = cfg_text(c, 0xC7D2E0);
+    cfg_button(c, LV_SYMBOL_REFRESH "  Step rotation calibration",
+               CFG_ACCENT_DISP, cfg_rotate_cb);
 
-    s_status_label = lv_label_create(s_scr_home);
-    lv_obj_set_width(s_status_label, CONTENT_W);
-    lv_obj_set_style_text_align(s_status_label, LV_TEXT_ALIGN_CENTER, 0);
-    lv_obj_set_style_text_color(s_status_label, lv_color_hex(0xB9B9C6), 0);
-    lv_label_set_long_mode(s_status_label, LV_LABEL_LONG_WRAP);
-    lv_label_set_text(s_status_label, "STT  starting\nwifi down");
-    lv_obj_align(s_status_label, LV_ALIGN_TOP_MID, 0, TOP_MARGIN + 36);
+    /* ---- battery ---- */
+    c = cfg_card(col, "BATTERY", CFG_ACCENT_BATT);
+    s_cfg_batt_val = cfg_text(c, 0xC7D2E0);
+    s_cfg_batt_bar = lv_bar_create(c);
+    lv_obj_set_size(s_cfg_batt_bar, lv_pct(100), 12);
+    lv_bar_set_range(s_cfg_batt_bar, 0, 100);
+    lv_obj_set_style_radius(s_cfg_batt_bar, 6, 0);
+    lv_obj_set_style_radius(s_cfg_batt_bar, 6, LV_PART_INDICATOR);
+    lv_obj_set_style_bg_color(s_cfg_batt_bar, lv_color_hex(0x1E293B), 0);
+    s_cfg_batt_sub = cfg_text(c, 0x64748B);
 
-    lv_obj_t *arc = lv_arc_create(s_scr_home);
-    lv_obj_set_size(arc, 196, 196);
-    lv_obj_align(arc, LV_ALIGN_CENTER, 0, 8);
-    lv_arc_set_bg_angles(arc, 0, 360);
-    lv_arc_set_angles(arc, 0, 110);
-    lv_obj_remove_style(arc, NULL, LV_PART_KNOB);
-    lv_obj_set_style_arc_width(arc, 12, LV_PART_MAIN);
-    lv_obj_set_style_arc_width(arc, 12, LV_PART_INDICATOR);
-    lv_obj_set_style_arc_color(arc, lv_color_hex(0x23233A), LV_PART_MAIN);
-    lv_obj_set_style_arc_color(arc, lv_color_hex(0x38B2AC), LV_PART_INDICATOR);
-    lv_obj_remove_flag(arc, LV_OBJ_FLAG_CLICKABLE);
+    /* ---- network ---- */
+    c = cfg_card(col, "NETWORK", CFG_ACCENT_NET);
+    s_cfg_net_val = cfg_text(c, 0xC7D2E0);
 
-    s_fps_label = lv_label_create(arc);
-    lv_obj_set_style_text_align(s_fps_label, LV_TEXT_ALIGN_CENTER, 0);
-    lv_obj_set_style_text_color(s_fps_label, lv_color_hex(0x8A8AA0), 0);
-    lv_label_set_text(s_fps_label, "--\nfps");
-    lv_obj_center(s_fps_label);
-
-    lv_anim_t a;
-    lv_anim_init(&a);
-    lv_anim_set_var(&a, arc);
-    lv_anim_set_exec_cb(&a, arc_anim_cb);
-    lv_anim_set_values(&a, 0, 360);
-    lv_anim_set_duration(&a, 1400);
-    lv_anim_set_repeat_count(&a, LV_ANIM_REPEAT_INFINITE);
-    lv_anim_start(&a);
-
-    s_events_label = lv_label_create(s_scr_home);
-    lv_obj_set_width(s_events_label, CONTENT_W);
-    lv_obj_set_style_text_align(s_events_label, LV_TEXT_ALIGN_CENTER, 0);
-    lv_obj_set_style_text_color(s_events_label, lv_color_hex(0x6E6E85), 0);
-    lv_label_set_long_mode(s_events_label, LV_LABEL_LONG_WRAP);
-    lv_label_set_text(s_events_label, " \n \n ");
-    lv_obj_align(s_events_label, LV_ALIGN_BOTTOM_MID, 0, -BOTTOM_MARGIN);
+    /* ---- system ---- */
+    c = cfg_card(col, "SYSTEM", CFG_ACCENT_SYS);
+    s_cfg_sys_val = cfg_text(c, 0x94A3B8);
+    s_cfg_log = cfg_text(c, 0x475569);
 
     lv_obj_add_event_cb(scr, gesture_home_cb, LV_EVENT_GESTURE, NULL);
-    s_app_timer = lv_timer_create(ui_timer_cb, 500, NULL);
+    s_app_timer = lv_timer_create(cfg_timer_cb, 400, NULL);
+    cfg_timer_cb(NULL);
 }
 
 /* ---------------- setup screen ---------------- */
@@ -1911,69 +2102,6 @@ static void setup_fill_list(void) {
 }
 
 
-/* ---------------- System app ---------------- */
-
-static lv_obj_t *s_sys_label;
-
-static void sys_timer_cb(lv_timer_t *t) {
-    if (!s_sys_label) return;
-    esp_netif_ip_info_t ip = {0};
-    esp_netif_t *nif = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
-    if (nif) esp_netif_get_ip_info(nif, &ip);
-    wifi_ap_record_t ap;
-    int rssi = (esp_wifi_sta_get_ap_info(&ap) == ESP_OK) ? ap.rssi : 0;
-
-    lv_label_set_text_fmt(s_sys_label,
-        "uptime  %lu s\n"
-        "heap    %u KB free\n"
-        "block   %u KB\n"
-        "psram   %lu KB free\n"
-        "wifi    %s  %d dBm\n"
-        "ip      " IPSTR "\n"
-        "batt    %d%%  %d mV\n"
-        "render  %u.%u fps\n"
-        "drain   %d mV/h  %s\n"
-        "sdcard  %s  %lu rows\n"
-        "rotate  %d deg   cfg %d/8 %s\n"
-        "accel   %d %d %d\n"
-        "        right button = calibrate\n"
-        "idf     %s",
-        (unsigned long)(now_ms() / 1000),
-        (unsigned)(esp_get_free_internal_heap_size() / 1024),
-        (unsigned)(heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL) / 1024),
-        (unsigned long)(heap_caps_get_free_size(MALLOC_CAP_SPIRAM) / 1024),
-        s_wifi_up ? s_ssid : "down", rssi,
-        IP2STR(&ip.ip),
-        (int)s_batt_pct, (int)s_batt_mv,
-        (unsigned)(s_last_fps_x10 / 10), (unsigned)(s_last_fps_x10 % 10),
-        battery_drain_mv_h(), s_doze ? "doze" : "active",
-        s_sd_ok ? "ok" : "none", (unsigned long)s_tele_rows,
-        s_rot * 90, s_rot_cfg, (s_rot_cfg & 4) ? "rev" : "fwd",
-        s_acc_x / 100, s_acc_y / 100, s_acc_z / 100,
-        IDF_VER);
-}
-
-static void build_sys_app(lv_obj_t *scr) {
-    lv_obj_set_style_bg_color(scr, lv_color_hex(0x0A0F22), 0);
-    lv_obj_remove_flag(scr, LV_OBJ_FLAG_SCROLLABLE);
-
-    lv_obj_t *title = lv_label_create(scr);
-    lv_obj_set_style_text_color(title, lv_color_hex(0xF4F1DE), 0);
-    lv_label_set_text(title, "SYSTEM");
-    lv_obj_align(title, LV_ALIGN_TOP_MID, 0, TOP_MARGIN);
-
-    s_sys_label = lv_label_create(scr);
-    lv_obj_set_width(s_sys_label, CONTENT_W);
-    lv_obj_set_style_text_align(s_sys_label, LV_TEXT_ALIGN_CENTER, 0);
-    lv_obj_set_style_text_color(s_sys_label, lv_color_hex(0x9AA7B8), 0);
-    lv_label_set_text(s_sys_label, "reading...");
-    lv_obj_align(s_sys_label, LV_ALIGN_CENTER, 0, 6);
-
-    lv_obj_add_event_cb(scr, gesture_home_cb, LV_EVENT_GESTURE, NULL);
-    s_app_timer = lv_timer_create(sys_timer_cb, 500, NULL);
-    sys_timer_cb(NULL);
-}
-
 /* ---------------- app drawer ---------------- */
 
 typedef struct {
@@ -1986,10 +2114,9 @@ typedef struct {
 } app_def_t;
 
 static const app_def_t s_apps[APP_COUNT] = {
-    [APP_STATUS] = { "STATUS", "status", ICON_DASHBOARD, 0x22D3EE, build_status_app, NULL     },
+    [APP_CONTROL] = { "CONTROL", "control", ICON_DASHBOARD, 0x22D3EE, build_control_app, NULL     },
     [APP_PET]    = { "PIP",    "pet",    ICON_PETS,      0xF59E0B, build_pet_app,    pet_save },
     [APP_WIFI]   = { "WI-FI",  "wifi",   ICON_WIFI,      0x34D399, build_wifi_app,   NULL     },
-    [APP_SYS]    = { "SYSTEM", "system", ICON_MEMORY,    0x818CF8, build_sys_app,    NULL     },
 };
 
 static void tile_cb(lv_event_t *e) {
@@ -2155,17 +2282,12 @@ static void rtc_store(void) {
  * time the lock screen is built. Downloads then only control how fast the pool
  * turns over, not how much variety you see.
  */
-#define WALL_SLOTS      12
-#define WALL_DIR        BSP_SD_MOUNT_POINT "/assets"
 #define UNSPLASH_JSON   WALL_DIR "/rnd.json"
 
 /* Legacy single-wallpaper path, deleted on boot if it is still lying around. */
 #define WALLPAPER_OLD   WALL_DIR "/lock.png"
 
 static FILE *s_dl_file;
-static volatile bool s_req_wallpaper;
-static int s_wall_slot = -1;         /* slot currently on screen, -1 = none */
-static int64_t s_wall_last;          /* last download attempt, success or not */
 
 static void wall_png(int slot, char *out, size_t n) {
     snprintf(out, n, WALL_DIR "/w%d.png", slot);
@@ -2189,10 +2311,6 @@ static bool wallpaper_valid(const char *path) {
     fclose(f);
     return n == sizeof(hdr) && memcmp(hdr, sig, sizeof(sig)) == 0;
 }
-
-/* Which slots hold a usable image. Cached as a bitmask rather than re-stat'ing
- * twelve files every time the lock screen is built. */
-static uint16_t s_wall_have;
 
 static void wall_scan(void) {
     s_wall_have = 0;
@@ -2235,14 +2353,29 @@ static int wall_display_slot(void) {
 }
 
 static esp_err_t dl_evt(esp_http_client_event_t *e) {
-    if (e->event_id == HTTP_EVENT_ON_DATA && s_dl_file && e->data_len > 0) {
+    if (e->event_id == HTTP_EVENT_ON_HEADER) {
+        if (e->header_key && strcasecmp(e->header_key, "Content-Length") == 0) {
+            s_dl_total = atoll(e->header_value);
+        }
+    } else if (e->event_id == HTTP_EVENT_ON_DATA && s_dl_file && e->data_len > 0) {
         fwrite(e->data, 1, e->data_len, s_dl_file);
+        s_dl_got += e->data_len;
+        s_dl_kb = (int)(s_dl_got / 1024);
+        if (s_dl_total > 0) {
+            int pct = (int)((s_dl_got * 100) / s_dl_total);
+            s_dl_pct = pct > 100 ? 100 : pct;
+        }
     }
     return ESP_OK;
 }
 
 static bool asset_fetch(const char *url, const char *path) {
     if (!s_sd_ok) return false;
+
+    s_dl_total = 0;
+    s_dl_got = 0;
+    s_dl_pct = 0;
+    s_dl_kb = 0;
 
     char tmp[80];
     snprintf(tmp, sizeof(tmp), "%s.part", path);
@@ -2333,6 +2466,8 @@ static bool unsplash_wallpaper(int slot) {
     char theme[80], q[240], api[420];
     wall_pick_theme(theme, sizeof(theme));
     url_escape(theme, q, sizeof(q));
+    snprintf(s_dl_theme, sizeof(s_dl_theme), "%s", theme);
+    s_dl_state = DL_QUERY;
     ESP_LOGI(TAG, "wallpaper slot %d, theme \"%s\"", slot, theme);
 
     snprintf(api, sizeof(api),
@@ -2374,6 +2509,7 @@ static bool unsplash_wallpaper(int slot) {
             snprintf(img + used, sizeof(img) - used, "?w=480&h=480&fit=crop&fm=png");
             char dest[64];
             wall_png(slot, dest, sizeof(dest));
+            s_dl_state = DL_IMAGE;
             ok = asset_fetch(img, dest);
         }
         if (ok) {
@@ -2419,7 +2555,13 @@ static void wall_service(void) {
     s_wall_last = now_ms();
 
     int slot = wall_target_slot();
-    if (!unsplash_wallpaper(slot)) return;
+    if (!unsplash_wallpaper(slot)) {
+        s_dl_state = DL_FAIL;
+        s_dl_ended_ms = now_ms();
+        return;
+    }
+    s_dl_state = DL_OK;
+    s_dl_ended_ms = now_ms();
 
     /* Same path, new bytes: without this LVGL keeps serving the previously
      * decoded bitmap for that slot out of its image cache. */
@@ -2882,12 +3024,8 @@ static void app_action(void) {
         }
         s_req_scan = true;
         break;
-    case APP_STATUS:
-        s_req_wallpaper = true;                     /* pull a new lock wallpaper */
-        log_event("fetching wallpaper");
-        break;
-    case APP_SYS:
-        rotation_bump();
+    case APP_CONTROL:
+        s_req_wallpaper = true;      /* the card shows real progress for this */
         break;
     default:                                        /* drawer: step through apps */
         drawer_pick = (drawer_pick + 1) % APP_COUNT;
@@ -2921,7 +3059,12 @@ static void app_open(int idx) {
     s_pw_panel = NULL; s_setup_title = NULL;
     s_wifi_hdr = NULL; s_conn_panel = NULL; s_conn_ssid = NULL;
     s_conn_ip = NULL; s_conn_btn = NULL; s_conn_btn_label = NULL;
-    s_ch_wrap = NULL; s_sys_label = NULL;
+    s_ch_wrap = NULL;
+    s_cfg_wall_pool = NULL; s_cfg_wall_state = NULL;
+    s_cfg_wall_bar = NULL; s_cfg_wall_sub = NULL;
+    s_cfg_rot_val = NULL; s_cfg_batt_bar = NULL;
+    s_cfg_batt_val = NULL; s_cfg_batt_sub = NULL;
+    s_cfg_net_val = NULL; s_cfg_sys_val = NULL; s_cfg_log = NULL;
     s_lock_time = NULL; s_lock_date = NULL; s_lock_batt = NULL;
     s_lock_sweep = NULL; s_lock_batt_arc = NULL;
 

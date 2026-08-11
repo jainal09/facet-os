@@ -33,10 +33,9 @@ and not PSRAM, is what decides whether a feature fits. Facet is built around it:
 
 | App | What it does | Hold right key |
 |---|---|---|
-| **STATUS** | Endpoint health, Wi-Fi, heap, frame rate, rolling event log | Fetch a new wallpaper |
+| **CONTROL** | Settings and diagnostics in one scrolling column of cards: wallpaper pool with a live download bar, rotation calibration, battery and drain rate, network, system counters | Fetch a new wallpaper |
 | **PIP** | A virtual pet on a tiny planet — wanders, stargazes, dances, naps | Play with it |
 | **WI-FI** | Shows the joined network, scan list, on-screen keyboard; tap the connected network to disconnect | Rescan |
-| **SYSTEM** | Diagnostics | Step the rotation calibration |
 
 Plus a lock screen: a HUD clock with a battery ring and a sweeping arc, backed
 by SNTP and a battery-backed RTC so the time is right the instant it wakes.

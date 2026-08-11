@@ -78,7 +78,7 @@ the pitfalls index compiled perfectly.
 - The three side keys have one global contract (see ARCHITECTURE.md). Do not
   give a key an app-specific meaning outside `app_action()` / `app_back()`.
 - The lock screen is deliberately sparse: clock, date, battery ring. No status
-  text, no photo credit. Attribution goes in the STATUS app.
+  text, no photo credit. Attribution goes in the CONTROL app.
 
 ## Keep the docs hot
 
