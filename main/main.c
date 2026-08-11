@@ -3348,25 +3348,37 @@ static void sp_init(void) {
 /* ---- the screen ---- */
 
 static lv_obj_t *s_sp_art, *s_sp_art_ph, *s_sp_lbl_track, *s_sp_lbl_artist;
-static lv_obj_t *s_sp_btn_play_lbl, *s_sp_btn_shuf, *s_sp_lbl_dev;
+static lv_obj_t *s_sp_btn_play_lbl, *s_sp_btn_shuf, *s_sp_btn_dev;
 static lv_obj_t *s_sp_devpanel, *s_sp_devlist;
 static char s_sp_art_shown[160];
 
-static lv_obj_t *sp_button(lv_obj_t *par, const char *glyph, lv_coord_t dx,
-                           lv_event_cb_t cb, uint32_t accent)
+/* Circular button placed by centre, in absolute screen coordinates.
+ *
+ * The first pass used 58 px targets in a row of four. On a 2.16" panel held in
+ * one hand that is genuinely hard to hit, so the transport controls are now
+ * 92-112 px and there are three of them, Apple Watch style. Positioning by
+ * centre keeps the corner-radius arithmetic checkable: the panel's corners are
+ * r=110, so a button is safe when its distance from the arc centre plus its own
+ * radius stays under 110. */
+static lv_obj_t *sp_round_btn(lv_obj_t *par, const char *glyph, const lv_font_t *font,
+                              lv_coord_t cx, lv_coord_t cy, lv_coord_t d,
+                              lv_event_cb_t cb, uint32_t accent, uint32_t bg)
 {
     lv_obj_t *b = lv_button_create(par);
-    lv_obj_set_size(b, 58, 58);
-    lv_obj_set_style_radius(b, 29, 0);
-    lv_obj_set_style_bg_color(b, lv_color_hex(0x141B26), 0);
-    lv_obj_set_style_border_width(b, 1, 0);
+    lv_obj_set_size(b, d, d);
+    lv_obj_set_pos(b, cx - d / 2, cy - d / 2);
+    lv_obj_set_style_radius(b, d / 2, 0);
+    lv_obj_set_style_bg_color(b, lv_color_hex(bg), 0);
+    lv_obj_set_style_border_width(b, 2, 0);
     lv_obj_set_style_border_color(b, lv_color_hex(accent), 0);
-    lv_obj_set_style_border_opa(b, 120, 0);
+    lv_obj_set_style_border_opa(b, 140, 0);
+    lv_obj_set_style_shadow_width(b, 0, 0);
     lv_obj_set_style_bg_color(b, lv_color_hex(accent), LV_STATE_PRESSED);
-    lv_obj_align(b, LV_ALIGN_TOP_MID, dx, 322);
+    lv_obj_set_style_border_opa(b, 255, LV_STATE_PRESSED);
     lv_obj_add_event_cb(b, cb, LV_EVENT_CLICKED, NULL);
     lv_obj_t *l = lv_label_create(b);
-    lv_obj_set_style_text_color(l, lv_color_hex(0xE2E8F0), 0);
+    if (font) lv_obj_set_style_text_font(l, font, 0);
+    lv_obj_set_style_text_color(l, lv_color_hex(0xE8FBFF), 0);
     lv_label_set_text(l, glyph);
     lv_obj_center(l);
     return l;
@@ -3433,8 +3445,12 @@ static void sp_timer_cb(lv_timer_t *t) {
     lv_label_set_text(s_sp_btn_play_lbl, s_sp_playing ? LV_SYMBOL_PAUSE : LV_SYMBOL_PLAY);
     lv_obj_set_style_text_color(s_sp_btn_shuf,
         lv_color_hex(s_sp_shuffle ? 0x1DB954 : 0x64748B), 0);
-    lv_label_set_text_fmt(s_sp_lbl_dev, LV_SYMBOL_AUDIO "  %s",
-                          s_sp_devname[0] ? s_sp_devname : "no device");
+    /* Which device is playing lives on the corner button's colour, not on a
+     * permanent caption — the name itself is in the picker. */
+    if (s_sp_btn_dev) {
+        lv_obj_set_style_text_color(s_sp_btn_dev,
+            lv_color_hex(s_sp_have_state ? 0x1DB954 : 0x475569), 0);
+    }
 
     /* Swap the art in only when the file behind it actually changed. */
     if (s_sp_art_ready && strcmp(s_sp_art_shown, s_sp_art_have) != 0) {
@@ -3469,14 +3485,31 @@ static void build_music_app(lv_obj_t *scr) {
     lv_obj_set_style_bg_color(scr, lv_color_hex(0x05070B), 0);
     lv_obj_remove_flag(scr, LV_OBJ_FLAG_SCROLLABLE);
 
-    /* Placeholder behind the art, so a track with no cover yet is not a hole. */
+    /* Layout borrowed from Apple Watch Now Playing, for the reason it exists
+     * there: on a screen this size the transport controls matter more than the
+     * artwork. The first pass had four 58 px buttons in a row and maximised the
+     * cover; that is backwards for something you poke with a thumb. Transport is
+     * now 96-116 px, and the device picker moved to a corner button so nothing
+     * has to be spent on a permanent device caption.
+     *
+     * Positions are absolute centres so the corner radius stays checkable: the
+     * panel's corners are r=110 arcs, and a circle is safe when its distance from
+     * the arc centre plus its own radius stays under 110. */
+
+    /* top corners: shuffle left, device picker right */
+    s_sp_btn_shuf = sp_round_btn(scr, LV_SYMBOL_SHUFFLE, NULL, 80, 68, 64,
+                                 sp_shuf_cb, 0x1DB954, 0x10161F);
+    s_sp_btn_dev = sp_round_btn(scr, LV_SYMBOL_AUDIO, NULL, 400, 68, 64,
+                                sp_devbtn_cb, 0x1DB954, 0x10161F);
+
+    /* cover, smaller than before on purpose */
     s_sp_art_ph = lv_obj_create(scr);
     lv_obj_remove_style_all(s_sp_art_ph);
     lv_obj_set_size(s_sp_art_ph, SP_ART_PX, SP_ART_PX);
-    lv_obj_align(s_sp_art_ph, LV_ALIGN_TOP_MID, 0, 44);
+    lv_obj_align(s_sp_art_ph, LV_ALIGN_TOP_MID, 0, 104);
     lv_obj_set_style_bg_color(s_sp_art_ph, lv_color_hex(0x11161F), 0);
     lv_obj_set_style_bg_opa(s_sp_art_ph, LV_OPA_COVER, 0);
-    lv_obj_set_style_radius(s_sp_art_ph, 16, 0);
+    lv_obj_set_style_radius(s_sp_art_ph, 14, 0);
     lv_obj_remove_flag(s_sp_art_ph, LV_OBJ_FLAG_CLICKABLE);
     lv_obj_t *ph = lv_label_create(s_sp_art_ph);
     lv_obj_set_style_text_font(ph, &app_icons_64, 0);
@@ -3486,7 +3519,7 @@ static void build_music_app(lv_obj_t *scr) {
 
     s_sp_art = lv_image_create(scr);
     lv_obj_set_size(s_sp_art, SP_ART_PX, SP_ART_PX);
-    lv_obj_align(s_sp_art, LV_ALIGN_TOP_MID, 0, 44);
+    lv_obj_align(s_sp_art, LV_ALIGN_TOP_MID, 0, 104);
     lv_image_set_inner_align(s_sp_art, LV_IMAGE_ALIGN_COVER);
     lv_obj_add_flag(s_sp_art, LV_OBJ_FLAG_HIDDEN);
     lv_obj_remove_flag(s_sp_art, LV_OBJ_FLAG_CLICKABLE);
@@ -3498,7 +3531,7 @@ static void build_music_app(lv_obj_t *scr) {
     lv_obj_set_style_text_align(s_sp_lbl_track, LV_TEXT_ALIGN_CENTER, 0);
     lv_label_set_long_mode(s_sp_lbl_track, LV_LABEL_LONG_SCROLL_CIRCULAR);
     lv_label_set_text(s_sp_lbl_track, "connecting...");
-    lv_obj_align(s_sp_lbl_track, LV_ALIGN_TOP_MID, 0, 292);
+    lv_obj_align(s_sp_lbl_track, LV_ALIGN_TOP_MID, 0, 262);
 
     s_sp_lbl_artist = lv_label_create(scr);
     lv_obj_set_width(s_sp_lbl_artist, CONTENT_W);
@@ -3507,37 +3540,24 @@ static void build_music_app(lv_obj_t *scr) {
     lv_obj_set_style_text_align(s_sp_lbl_artist, LV_TEXT_ALIGN_CENTER, 0);
     lv_label_set_long_mode(s_sp_lbl_artist, LV_LABEL_LONG_DOT);
     lv_label_set_text(s_sp_lbl_artist, "");
-    lv_obj_align(s_sp_lbl_artist, LV_ALIGN_TOP_MID, 0, 296 + 24);
+    lv_obj_align(s_sp_lbl_artist, LV_ALIGN_TOP_MID, 0, 292);
 
-    s_sp_btn_shuf     = sp_button(scr, LV_SYMBOL_SHUFFLE, -102, sp_shuf_cb, 0x1DB954);
-    (void)               sp_button(scr, LV_SYMBOL_PREV,    -34, sp_prev_cb, 0x334155);
-    s_sp_btn_play_lbl = sp_button(scr, LV_SYMBOL_PLAY,      34, sp_play_cb, 0x1DB954);
-    (void)               sp_button(scr, LV_SYMBOL_NEXT,    102, sp_next_cb, 0x334155);
+    /* transport: the things you actually press, sized accordingly */
+    (void) sp_round_btn(scr, LV_SYMBOL_PREV, NULL, 118, 376, 96,
+                        sp_prev_cb, 0x334155, 0x141B26);
+    s_sp_btn_play_lbl = sp_round_btn(scr, LV_SYMBOL_PLAY, &lv_font_montserrat_20,
+                                     240, 376, 116, sp_play_cb, 0x1DB954, 0x16241C);
+    (void) sp_round_btn(scr, LV_SYMBOL_NEXT, NULL, 362, 376, 96,
+                        sp_next_cb, 0x334155, 0x141B26);
 
-    lv_obj_t *devbtn = lv_button_create(scr);
-    lv_obj_set_size(devbtn, 240, 30);
-    lv_obj_align(devbtn, LV_ALIGN_BOTTOM_MID, 0, -BOTTOM_MARGIN + 14);
-    lv_obj_set_style_radius(devbtn, 15, 0);
-    lv_obj_set_style_bg_color(devbtn, lv_color_hex(0x0C1018), 0);
-    lv_obj_set_style_border_width(devbtn, 0, 0);
-    lv_obj_add_event_cb(devbtn, sp_devbtn_cb, LV_EVENT_CLICKED, NULL);
-    s_sp_lbl_dev = lv_label_create(devbtn);
-    lv_obj_set_style_text_font(s_sp_lbl_dev, &hud_text_18, 0);
-    lv_obj_set_style_text_color(s_sp_lbl_dev, lv_color_hex(0x64748B), 0);
-    lv_label_set_long_mode(s_sp_lbl_dev, LV_LABEL_LONG_DOT);
-    lv_obj_set_width(s_sp_lbl_dev, 220);
-    lv_obj_set_style_text_align(s_sp_lbl_dev, LV_TEXT_ALIGN_CENTER, 0);
-    lv_label_set_text(s_sp_lbl_dev, "");
-    lv_obj_center(s_sp_lbl_dev);
-
-    /* Device picker, same list-over-content shape the Wi-Fi app uses so the
-     * right key pops it exactly the same way. */
+    /* Device picker, full-screen over the top. Same shape as the Wi-Fi app's
+     * sub-scene so the right key pops it the same way. */
     s_sp_devpanel = lv_obj_create(scr);
     lv_obj_remove_style_all(s_sp_devpanel);
     lv_obj_set_size(s_sp_devpanel, 480, 480);
     lv_obj_center(s_sp_devpanel);
     lv_obj_set_style_bg_color(s_sp_devpanel, lv_color_hex(0x05070B), 0);
-    lv_obj_set_style_bg_opa(s_sp_devpanel, 245, 0);
+    lv_obj_set_style_bg_opa(s_sp_devpanel, 250, 0);
     lv_obj_remove_flag(s_sp_devpanel, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_add_flag(s_sp_devpanel, LV_OBJ_FLAG_HIDDEN);
 
@@ -3549,8 +3569,8 @@ static void build_music_app(lv_obj_t *scr) {
     lv_obj_align(dt, LV_ALIGN_TOP_MID, 0, TOP_MARGIN + 18);
 
     s_sp_devlist = lv_list_create(s_sp_devpanel);
-    lv_obj_set_size(s_sp_devlist, CONTENT_W, 300);
-    lv_obj_align(s_sp_devlist, LV_ALIGN_TOP_MID, 0, 96);
+    lv_obj_set_size(s_sp_devlist, CONTENT_W, 296);
+    lv_obj_align(s_sp_devlist, LV_ALIGN_TOP_MID, 0, 92);
     lv_obj_set_style_bg_color(s_sp_devlist, lv_color_hex(0x11161F), 0);
     lv_obj_set_style_border_width(s_sp_devlist, 0, 0);
     lv_obj_set_style_radius(s_sp_devlist, 16, 0);
@@ -4599,7 +4619,7 @@ static void app_open(int idx) {
     s_cfg_net_val = NULL; s_cfg_sys_val = NULL; s_cfg_log = NULL;
     s_sp_art = NULL; s_sp_art_ph = NULL; s_sp_lbl_track = NULL;
     s_sp_lbl_artist = NULL; s_sp_btn_play_lbl = NULL; s_sp_btn_shuf = NULL;
-    s_sp_lbl_dev = NULL; s_sp_devpanel = NULL; s_sp_devlist = NULL;
+    s_sp_btn_dev = NULL; s_sp_devpanel = NULL; s_sp_devlist = NULL;
     s_pomo_clock = NULL; s_pomo_word = NULL;
     s_pomo_ring = NULL; s_pomo_arc = NULL; s_pomo_fill = NULL;
     for (int i = 0; i < POMO_SLOTS; i++) s_pomo_dial[i] = NULL;
