@@ -1,0 +1,24 @@
+README.md
+  s_69fa2eb4e2987f::t_91335d6242bf17 46-56
+  s_69fa2eb4e2987f::t_f107f616242098 57
+docs/HARDWARE.md
+  s_69fa2eb4e2987f::t_91335d6242bf17 840-867
+docs/ARCHITECTURE.md
+  s_69fa2eb4e2987f::t_b93d6cadc500f7 414-471
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.22",
+  "base_commit_sha": "42988197ddb239e989cd006644edeb796407dd5a",
+  "prompts": {},
+  "sessions": {
+    "s_69fa2eb4e2987f": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "ab961f6a-cc54-4961-a6f3-991f7a281329",
+        "model": "claude-opus-5"
+      },
+      "human_author": "Jainal Gosaliya <jainal09gosalia@gmail.com>"
+    }
+  }
+}
