@@ -1,0 +1,35 @@
+README.md
+  s_57e4cf4a7836a6::t_cfc39b15f73742 38
+main/main.c
+  s_57e4cf4a7836a6::t_66a459a716824e 1743-1758
+  s_57e4cf4a7836a6::t_6c65f0ccec9d1a 159-164
+  s_57e4cf4a7836a6::t_d6c4ecd8604bac 1874
+  s_57e4cf4a7836a6::t_3d02cf0d2861ed 3020
+  s_57e4cf4a7836a6::t_d7ac7e58b38a29 3141,3152-3175
+  s_57e4cf4a7836a6::t_b79ad91f0c7d35 1638-1658,1661-1662,1667,1674,1677,1683-1711,1717-1720
+  s_57e4cf4a7836a6::t_557a40852119f2 192-197
+  s_57e4cf4a7836a6::t_9ffd07d4df296e 2857-2863,2865
+  s_57e4cf4a7836a6::t_4b24ce8fd6e711 2922-2923
+  s_57e4cf4a7836a6::t_60d73ee6fab11c 1885-1909
+  s_57e4cf4a7836a6::t_f0b1a80020d0ff 1822-1861
+  s_57e4cf4a7836a6::t_88566f4f41fe19 373,375-377,385
+  s_57e4cf4a7836a6::t_26669ccc58a271 1775-1781
+  s_57e4cf4a7836a6::t_fe221b3da4aadf 1721
+  s_57e4cf4a7836a6::t_5fa37fa8e6edbc 3176
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.22",
+  "base_commit_sha": "ad30601f6a8dd112480fc3644582eb1a38fd1614",
+  "prompts": {},
+  "sessions": {
+    "s_57e4cf4a7836a6": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "79540328-5c96-430d-b4c5-de35687f549e",
+        "model": "claude-opus-5"
+      },
+      "human_author": "Jainal Gosaliya <jainal09gosalia@gmail.com>"
+    }
+  }
+}
