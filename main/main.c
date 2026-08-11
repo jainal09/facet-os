@@ -5067,6 +5067,23 @@ static void lock_tap_cb(lv_event_t *e) {
     app_request(APP_DRAWER);      /* always home, not "wherever you locked from" */
 }
 
+/* The cover is a shortcut straight into MUSIC. Everywhere else on this screen
+ * goes home, so the art has to consume its own click — which it does simply by
+ * being clickable: LVGL delivers to the topmost clickable object and does not
+ * bubble without LV_OBJ_FLAG_EVENT_BUBBLE, so lock_tap_cb never sees it.
+ *
+ * The asleep check is repeated rather than shared, because it is the whole reason
+ * the panel is reachable at all: with the panel dark, the first touch must only
+ * wake. Without this, tapping a cube on the desk to see the time would drop you
+ * into an app. */
+static void lock_np_tap_cb(lv_event_t *e) {
+    if (!s_screen_on) {
+        s_req_wake = true;
+        return;
+    }
+    app_request(APP_MUSIC);
+}
+
 static void build_lock_screen(lv_obj_t *scr) {
     lv_obj_remove_flag(scr, LV_OBJ_FLAG_SCROLLABLE);
     /* Flat black, no gradient: RGB565 cannot render a smooth dark ramp, so a
@@ -5215,13 +5232,15 @@ static void build_lock_screen(lv_obj_t *scr) {
     lv_obj_set_style_bg_color(s_lock_np_ph, lv_color_hex(0x11161F), 0);
     lv_obj_set_style_bg_opa(s_lock_np_ph, LV_OPA_COVER, 0);
     lv_obj_set_style_radius(s_lock_np_ph, 10, 0);
-    lv_obj_remove_flag(s_lock_np_ph, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_flag(s_lock_np_ph, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(s_lock_np_ph, lock_np_tap_cb, LV_EVENT_CLICKED, NULL);
 
     s_lock_np_art = lv_image_create(s_lock_np);
     lv_obj_set_size(s_lock_np_art, 100, 100);
     lv_obj_set_pos(s_lock_np_art, 16, 18);
     lv_image_set_inner_align(s_lock_np_art, LV_IMAGE_ALIGN_COVER);
-    lv_obj_remove_flag(s_lock_np_art, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_flag(s_lock_np_art, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(s_lock_np_art, lock_np_tap_cb, LV_EVENT_CLICKED, NULL);
     lv_obj_add_flag(s_lock_np_art, LV_OBJ_FLAG_HIDDEN);
 
     s_lock_np_track = lv_label_create(s_lock_np);
@@ -5644,7 +5663,14 @@ void app_main(void) {
                     ESP_LOGI(TAG, "auto-sleep");
                     screen_toggle_power();
                 }
-            } else if (s_screen_on && idle > AUTO_LOCK_MS && s_req_app != APP_LOCK) {
+            } else if (s_screen_on && !s_always_on && idle > AUTO_LOCK_MS &&
+                       s_req_app != APP_LOCK) {
+                /* !s_always_on: always-on is a promise that the display stays as
+                 * you left it, and it was only honouring half of that. The sleep
+                 * branch above checked the flag, this one did not, so a cube left
+                 * showing MUSIC as a desk display reverted to the clock after
+                 * AUTO_LOCK_MS — the panel stayed lit, which is why it read as a
+                 * navigation bug rather than as a power one. */
                 ESP_LOGI(TAG, "auto-lock after %llds idle", (long long)(idle / 1000));
                 s_last_btn = t;               /* reset the clock, don't re-fire */
                 lock_engage();
