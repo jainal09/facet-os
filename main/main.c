@@ -1137,6 +1137,16 @@ static int s_base_rot;     /* what the accelerometer alone suggests */
 static int s_rot_cfg;
 #define ROT_CFG_COUNT 8
 static int s_rot_votes;
+
+/* Autorotate is switchable from CONTROL. The gate belongs at the commit and not
+ * at the poll, for the same reason the FOCUS gate does: s_base_rot has a second
+ * consumer that still needs live orientation when the panel is pinned. */
+static volatile bool s_autorot = true;   /* volatile: LVGL task writes, main reads */
+static volatile bool s_req_autorot_save;
+/* The orientation to hold when autorotate is off. Without persisting this, a
+ * reboot lands back at native 0 with the switch still reading OFF and — since
+ * the calibration button fades out in that state — no way at all to get back. */
+static int s_rot_held;
 static int s_acc_x, s_acc_y, s_acc_z;
 
 /* Rotation is quarter turns from the panel's NATIVE state.
@@ -1165,7 +1175,16 @@ static esp_err_t imu_write(uint8_t reg, uint8_t val) {
     return i2c_master_transmit(s_imu, b, 2, 100);
 }
 
+/* Flip to 1 to make the probe report failure, so CONTROL's no-sensor path can be
+ * checked without unsoldering anything. That branch never runs on a healthy
+ * board, which is exactly what makes it the one most likely to be wrong. */
+#define IMU_FORCE_ABSENT 0
+
 static void imu_init(void) {
+#if IMU_FORCE_ABSENT
+    ESP_LOGW(TAG, "QMI8658 probe forced absent (IMU_FORCE_ABSENT)");
+    return;
+#endif
     i2c_master_bus_handle_t bus = bsp_i2c_get_handle();
     if (!bus) return;
 
@@ -1231,11 +1250,28 @@ static void rot_off_save(void) {
     }
 }
 
+/* Runs on the main task, so s_rot is read at commit time rather than at the
+ * moment the switch was tapped — which is the more accurate answer anyway. */
+static void autorot_save(void) {
+    if (ble_prov_nvs_blocked()) return;
+    if (!s_autorot) s_rot_held = s_rot;
+    nvs_handle_t h;
+    if (nvs_open("cfg", NVS_READWRITE, &h) == ESP_OK) {
+        nvs_set_i32(h, "autorot", s_autorot ? 1 : 0);
+        nvs_set_i32(h, "rothold", s_rot_held);
+        nvs_commit(h);
+        nvs_close(h);
+    }
+}
+
+/* Both display-orientation settings, on one handle: this runs once at boot. */
 static void rot_off_load(void) {
     nvs_handle_t h;
     if (nvs_open("cfg", NVS_READONLY, &h) != ESP_OK) return;
     int32_t v;
     if (nvs_get_i32(h, "rotcfg", &v) == ESP_OK) s_rot_cfg = (int)(v & 7);
+    if (nvs_get_i32(h, "autorot", &v) == ESP_OK) s_autorot = (v != 0);
+    if (nvs_get_i32(h, "rothold", &v) == ESP_OK) s_rot_held = (int)(v & 3);
     nvs_close(h);
 }
 
@@ -1284,8 +1320,15 @@ static void imu_poll(void) {
 
     /* The FOCUS app reads orientation as input and draws fixed-position labels;
      * counter-rotating the panel under it would cancel the whole gesture. Gate
-     * the commit, not the poll, so s_base_rot stays live for it to read. */
-    if (s_rot_votes >= QMI_VOTES_NEEDED && s_rot_cand != s_rot && s_app != APP_POMO) {
+     * the commit, not the poll, so s_base_rot stays live for it to read — and
+     * the user's autorotate switch gates the same place for the same reason:
+     * FOCUS must keep working as a dial with the panel pinned.
+     *
+     * Nothing is re-armed when the switch goes back on. The vote counter kept
+     * running while it was off, so an already-settled orientation commits on the
+     * next poll rather than 800 ms later. */
+    if (s_autorot && s_rot_votes >= QMI_VOTES_NEEDED && s_rot_cand != s_rot &&
+        s_app != APP_POMO) {
         rotation_apply(s_rot_cand);
     }
 }
@@ -1364,6 +1407,71 @@ static btn_ev_t btn_poll(btn_t *b, int64_t t) {
     return BTN_NONE;
 }
 
+/* ---------------- display brightness ----------------
+ *
+ * The panel ran at 100% and nothing could change it: both
+ * bsp_display_brightness_init() and bsp_display_backlight_on() hardcode it. That
+ * is painful in a dark room and it is the largest power draw on the board — on an
+ * AMOLED every lit pixel costs current, so this is a battery control as much as a
+ * comfort one.
+ *
+ * BRIGHT_MIN is not cosmetic. bsp_display_brightness_set(0) blanks the panel
+ * outright, and the only control that could undo it would be a slider you can no
+ * longer see. There is no other way into this device, so the range stops at a
+ * level that is dim but still legible.
+ */
+#define BRIGHT_MIN     10
+#define BRIGHT_DEFAULT 100
+
+/* volatile: published by the LVGL task from the slider callback, consumed by the
+ * main task. Pitfall #19 — the compiler is free to sink a plain store past the
+ * volatile flag that announces it. */
+static volatile int  s_bright = BRIGHT_DEFAULT;
+static volatile bool s_req_bright_apply;   /* the main loop owns the panel write */
+static volatile bool s_req_bright_save;
+static int s_bright_applied = -1;          /* what 0x51 actually holds; -1 = unknown */
+
+static void bright_load(void) {
+    nvs_handle_t h;
+    if (nvs_open("cfg", NVS_READONLY, &h) != ESP_OK) return;
+    int32_t v;
+    if (nvs_get_i32(h, "bright", &v) == ESP_OK)
+        s_bright = clampi((int)v, BRIGHT_MIN, 100);
+    nvs_close(h);
+}
+
+static void bright_save(void) {
+    nvs_handle_t h;
+    if (nvs_open("cfg", NVS_READWRITE, &h) != ESP_OK) return;
+    nvs_set_i32(h, "bright", s_bright);
+    nvs_commit(h);
+    nvs_close(h);
+}
+
+/* Setting brightness is panel command 0x51 over the same QSPI device the LVGL
+ * task flushes on — pitfall #13 IO, not a GPIO — so it takes the lock. Safe from
+ * anywhere: the mutex is recursive, so a caller that already holds it just bumps
+ * the count. What the lock buys is exclusion between TASKS; panel_io_spi_tx_param
+ * drains any in-flight flush DMA before it writes, and that is only correct if
+ * nothing else is issuing on the bus meanwhile.
+ *
+ * THE ONLY writer of 0x51 in this file, which is what makes s_bright_applied
+ * trustworthy. Route the screen-off path through here too (bright_apply(0)) — a
+ * bare bsp_display_backlight_off() would leave the cache reading 60 while the
+ * panel sat at 0, and the next wake would then skip the write and stay black.
+ *
+ * Returns false only on a lock timeout, so callers can retry rather than strand
+ * the panel at whatever it last wrote. */
+static bool bright_apply(int pct) {
+    pct = clampi(pct, 0, 100);
+    if (pct == s_bright_applied) return true;
+    if (!ui_lock()) return false;
+    bsp_display_brightness_set(pct);
+    bsp_display_unlock();
+    s_bright_applied = pct;
+    return true;
+}
+
 /* ---------------- screen switching ---------------- */
 
 static void screen_toggle_power(void) {
@@ -1378,13 +1486,20 @@ static void screen_toggle_power(void) {
      * the main loop kept running and logging.
      *
      * power_set_doze() already took the lock for its own panel command; these
-     * two were missed. Locked separately rather than around the whole function,
-     * because bsp_display_lock() is not recursive. */
+     * two were missed. Each takes it around its own call, which is a style
+     * choice and not a constraint — the mutex IS recursive
+     * (xSemaphoreCreateRecursiveMutex, esp_lv_adapter.c:601), as ui_lock()'s
+     * comment says. An earlier version of this comment claimed the opposite and
+     * was wrong; what mattered was never recursion, it was that two TASKS must
+     * not drive the QSPI device at once. */
     if (s_screen_on) {
+        /* The user's level, not bsp's hardcoded 100. If the lock times out the
+         * panel stays dark while every flag says the screen is on, and nothing
+         * would ever retry — so hand it to the main loop instead of losing it. */
         power_set_doze(false);
-        if (ui_lock()) { bsp_display_backlight_on();  bsp_display_unlock(); }
+        if (!bright_apply(s_bright)) s_req_bright_apply = true;
     } else {
-        if (ui_lock()) { bsp_display_backlight_off(); bsp_display_unlock(); }
+        bright_apply(0);          /* not backlight_off(): see bright_apply() */
         power_set_doze(true);
     }
     ESP_LOGI(TAG, "screen %s", s_screen_on ? "ON" : "OFF");
@@ -2292,6 +2407,8 @@ static void refr_ready_cb(lv_event_t *e) {
 
 static lv_obj_t *s_cfg_wall_pool, *s_cfg_wall_state, *s_cfg_wall_bar, *s_cfg_wall_sub;
 static lv_obj_t *s_cfg_rot_val;
+static lv_obj_t *s_cfg_rot_sw, *s_cfg_rot_btn;
+static lv_obj_t *s_cfg_bright_val;
 static lv_obj_t *s_cfg_vol_val;
 static lv_obj_t *s_cfg_batt_bar, *s_cfg_batt_val, *s_cfg_batt_sub;
 static lv_obj_t *s_cfg_net_val;
@@ -2317,8 +2434,10 @@ static lv_obj_t *cfg_card(lv_obj_t *parent, const char *title, uint32_t accent) 
     lv_obj_set_style_bg_color(card, lv_color_hex(0x11161F), 0);
     lv_obj_set_style_bg_opa(card, LV_OPA_COVER, 0);
     lv_obj_set_style_radius(card, 16, 0);
-    lv_obj_set_style_pad_all(card, 14, 0);
-    lv_obj_set_style_pad_row(card, 7, 0);
+    lv_obj_set_style_pad_all(card, 16, 0);
+    /* Controls here are sized for a fingertip (CFG_TOUCH_H), and 7 px of gutter
+     * between 76 px controls reads as a pile rather than a list. */
+    lv_obj_set_style_pad_row(card, 14, 0);
     lv_obj_set_style_border_width(card, 1, 0);
     lv_obj_set_style_border_color(card, lv_color_hex(accent), 0);
     lv_obj_set_style_border_opa(card, 80, 0);
@@ -2337,17 +2456,37 @@ static lv_obj_t *cfg_card(lv_obj_t *parent, const char *title, uint32_t accent) 
 static lv_obj_t *cfg_text(lv_obj_t *card, uint32_t colour) {
     lv_obj_t *l = lv_label_create(card);
     lv_obj_set_width(l, lv_pct(100));
+    /* montserrat_20, not the 14 px default: 14 px readouts beside 76 px controls
+     * looked like a desktop dialog scaled up wrong. Same glyph coverage as the
+     * default (ASCII plus the LV_SYMBOL_* set), so nothing that renders today
+     * stops rendering, and it is already compiled in — no extra flash. */
+    lv_obj_set_style_text_font(l, &lv_font_montserrat_20, 0);
     lv_obj_set_style_text_color(l, lv_color_hex(colour), 0);
     lv_label_set_long_mode(l, LV_LABEL_LONG_WRAP);
     lv_label_set_text(l, "");
     return l;
 }
 
+/* Touch targets on this panel have to be generous. The glass is curved, the
+ * controller is noisy near the edges, and a 44 px control registered drags as
+ * taps and taps as nothing — the same lesson the first MUSIC layout learned when
+ * its 46 px transport buttons ghost-touched and were rebuilt at 76/88/76.
+ * CONTROL is an unbounded scrolling column, so height is free here; there is no
+ * reason to be frugal with it. Every control in the app is sized from these.
+ *
+ * The ext-click area matters as much as the drawn size: it widens the hit test
+ * without changing the layout, which is what rescues a slider whose knob you are
+ * chasing with a fingertip wider than the track. */
+#define CFG_TOUCH_H   76     /* buttons and switch rows                      */
+#define CFG_SLIDER_H  46     /* plus CFG_EXT_CLICK on each side              */
+#define CFG_EXT_CLICK 18
+
 static lv_obj_t *cfg_button(lv_obj_t *card, const char *text, uint32_t accent,
                             lv_event_cb_t cb) {
     lv_obj_t *b = lv_button_create(card);
-    lv_obj_set_size(b, lv_pct(100), 44);
-    lv_obj_set_style_radius(b, 12, 0);
+    lv_obj_set_size(b, lv_pct(100), CFG_TOUCH_H);
+    lv_obj_set_ext_click_area(b, 6);
+    lv_obj_set_style_radius(b, 16, 0);
     lv_obj_set_style_bg_color(b, lv_color_hex(0x1B2432), 0);
     lv_obj_set_style_border_width(b, 1, 0);
     lv_obj_set_style_border_color(b, lv_color_hex(accent), 0);
@@ -2355,10 +2494,77 @@ static lv_obj_t *cfg_button(lv_obj_t *card, const char *text, uint32_t accent,
     lv_obj_set_style_bg_color(b, lv_color_hex(accent), LV_STATE_PRESSED);
     lv_obj_add_event_cb(b, cb, LV_EVENT_CLICKED, NULL);
     lv_obj_t *l = lv_label_create(b);
+    lv_obj_set_style_text_font(l, &lv_font_montserrat_20, 0);
     lv_obj_set_style_text_color(l, lv_color_hex(0xE2E8F0), 0);
     lv_label_set_text(l, text);
     lv_obj_center(l);
     return b;
+}
+
+/* Fade a card button to inert and back — still visible, plainly not available,
+ * which is how MUSIC renders a transport control the endpoint refuses. The
+ * opacity cascades to the button's label, so the whole control dims together. */
+static void cfg_button_live(lv_obj_t *b, bool live) {
+    lv_obj_set_style_opa(b, live ? LV_OPA_COVER : LV_OPA_40, 0);
+    if (live) lv_obj_add_flag(b, LV_OBJ_FLAG_CLICKABLE);
+    else      lv_obj_remove_flag(b, LV_OBJ_FLAG_CLICKABLE);
+}
+
+/* A full-width slider sized for a finger rather than for a cursor. Both sliders
+ * in this app go through here so they cannot drift apart. */
+static lv_obj_t *cfg_slider(lv_obj_t *card, int lo, int hi, int val,
+                            uint32_t accent, uint32_t knob, lv_event_cb_t cb) {
+    lv_obj_t *s = lv_slider_create(card);
+    lv_obj_set_size(s, lv_pct(100), CFG_SLIDER_H);
+    lv_obj_set_ext_click_area(s, CFG_EXT_CLICK);
+    lv_slider_set_range(s, lo, hi);
+    lv_slider_set_value(s, val, LV_ANIM_OFF);
+    lv_obj_set_style_radius(s, CFG_SLIDER_H / 2, LV_PART_MAIN);
+    lv_obj_set_style_radius(s, CFG_SLIDER_H / 2, LV_PART_INDICATOR);
+    lv_obj_set_style_bg_color(s, lv_color_hex(0x1E293B), LV_PART_MAIN);
+    lv_obj_set_style_bg_color(s, lv_color_hex(accent), LV_PART_INDICATOR);
+    lv_obj_set_style_bg_color(s, lv_color_hex(knob), LV_PART_KNOB);
+    /* Knob flush with the track, NOT padded proud of it. Padding the knob was the
+     * obvious way to make it easier to grab and it looked broken — a 46 px track
+     * with a 66 px ball overhanging both edges reads as a rendering bug, not as a
+     * control. It also bought nothing: an lv_slider in the default mode jumps to
+     * wherever you press on the track, so the whole 46 px bar is already the
+     * target and the knob never has to be hit at all. */
+    lv_obj_set_style_pad_all(s, 0, LV_PART_KNOB);
+    lv_obj_add_event_cb(s, cb, LV_EVENT_VALUE_CHANGED, NULL);
+    lv_obj_add_event_cb(s, cb, LV_EVENT_RELEASED, NULL);
+    return s;
+}
+
+/* a labelled toggle row inside a card */
+static lv_obj_t *cfg_switch(lv_obj_t *card, const char *text, uint32_t accent,
+                            bool on, lv_event_cb_t cb) {
+    lv_obj_t *row = lv_obj_create(card);
+    lv_obj_remove_style_all(row);
+    lv_obj_set_width(row, lv_pct(100));
+    lv_obj_set_height(row, CFG_TOUCH_H);   /* fixed: a growing row would shift the card */
+    lv_obj_remove_flag(row, LV_OBJ_FLAG_SCROLLABLE);
+    /* lv_obj_create() is clickable by default and would swallow taps aimed at
+     * the switch sitting inside it (ARCHITECTURE.md, LVGL traps). */
+    lv_obj_remove_flag(row, LV_OBJ_FLAG_CLICKABLE);
+
+    lv_obj_t *l = lv_label_create(row);
+    lv_obj_set_style_text_font(l, &lv_font_montserrat_20, 0);
+    lv_obj_set_style_text_color(l, lv_color_hex(0xC7D2E0), 0);
+    lv_label_set_text(l, text);
+    lv_obj_align(l, LV_ALIGN_LEFT_MID, 0, 0);
+
+    lv_obj_t *sw = lv_switch_create(row);
+    lv_obj_set_size(sw, 116, 58);
+    lv_obj_set_ext_click_area(sw, CFG_EXT_CLICK);
+    lv_obj_set_style_bg_color(sw, lv_color_hex(0x1E293B), LV_PART_MAIN);
+    lv_obj_set_style_bg_color(sw, lv_color_hex(accent),
+                              LV_PART_INDICATOR | LV_STATE_CHECKED);
+    lv_obj_set_style_bg_color(sw, lv_color_hex(0xE2E8F0), LV_PART_KNOB);
+    lv_obj_align(sw, LV_ALIGN_RIGHT_MID, 0, 0);
+    if (on) lv_obj_add_state(sw, LV_STATE_CHECKED);
+    lv_obj_add_event_cb(sw, cb, LV_EVENT_VALUE_CHANGED, NULL);
+    return sw;
 }
 
 static void cfg_fetch_cb(lv_event_t *e) {
@@ -2374,6 +2580,30 @@ static void cfg_ble_cb(lv_event_t *e) {
 
 static void cfg_rotate_cb(lv_event_t *e) {
     rotation_bump();
+}
+
+static void cfg_autorot_cb(lv_event_t *e) {
+    s_autorot = lv_obj_has_state(lv_event_get_target(e), LV_STATE_CHECKED);
+    s_req_autorot_save = true;              /* NVS is the main loop's business */
+    ESP_LOGI(TAG, "autorotate %s", s_autorot ? "ON" : "OFF");
+}
+
+/* Same shape as cfg_vol_cb and for the same three reasons: the label is only
+ * rewritten on release, because resizing it mid-drag re-lays out the card and
+ * moves the slider under the finger; the panel write is left to the main loop,
+ * because it is QSPI IO that needs the LVGL lock this callback already holds;
+ * and NVS waits too, because committing per VALUE_CHANGED would erase flash on
+ * every pixel of the drag. */
+static void cfg_bright_cb(lv_event_t *e) {
+    s_bright = clampi((int)lv_slider_get_value(lv_event_get_target(e)),
+                      BRIGHT_MIN, 100);
+    s_req_bright_apply = true;
+    if (lv_event_get_code(e) != LV_EVENT_RELEASED) return;
+
+    if (s_cfg_bright_val) {
+        lv_label_set_text_fmt(s_cfg_bright_val, "brightness  %d%%", s_bright);
+    }
+    s_req_bright_save = true;
 }
 
 /* Deliberately does almost nothing while the knob is moving.
@@ -2471,10 +2701,25 @@ static void cfg_timer_cb(lv_timer_t *t) {
 
     /* ---- display ---- */
     lv_label_set_text_fmt(s_cfg_rot_val,
-                          "orientation  %d deg\ncalibration  %d / %d  %s\naccel  %d  %d  %d",
-                          s_rot * 90, s_rot_cfg + 1, ROT_CFG_COUNT,
+                          "orientation  %d deg   %s\ncalibration  %d / %d  %s\naccel  %d  %d  %d",
+                          s_rot * 90,
+                          !s_imu     ? "no sensor" :
+                          !s_autorot ? "held"      : "auto",
+                          s_rot_cfg + 1, ROT_CFG_COUNT,
                           (s_rot_cfg & 4) ? "reversed" : "normal",
                           s_acc_x / 100, s_acc_y / 100, s_acc_z / 100);
+
+    /* Calibrating something that is switched off makes no sense — the button
+     * applies a rotation immediately, which would visibly contradict the switch
+     * the user just turned off. Faded rather than hidden: a control that
+     * disappears makes people think something broke and go looking for it, while
+     * one that is plainly present and inert explains itself. The CLICKABLE flag
+     * doubles as the state, so the restyle only runs on an actual change —
+     * setting it every 400 ms would invalidate the card forever. */
+    if (s_cfg_rot_btn &&
+        s_autorot != lv_obj_has_flag(s_cfg_rot_btn, LV_OBJ_FLAG_CLICKABLE)) {
+        cfg_button_live(s_cfg_rot_btn, s_autorot);
+    }
 
     /* ---- battery ---- */
     int pct = s_batt_pct;
@@ -2620,27 +2865,44 @@ static void build_control_app(lv_obj_t *scr) {
     /* ---- display ---- */
     c = cfg_card(col, "DISPLAY", CFG_ACCENT_DISP);
     s_cfg_rot_val = cfg_text(c, 0xC7D2E0);
-    cfg_button(c, LV_SYMBOL_REFRESH "  Step rotation calibration",
-               CFG_ACCENT_DISP, cfg_rotate_cb);
+
+    /* fixed height, for the reason spelled out on the volume readout below */
+    s_cfg_bright_val = cfg_text(c, 0xC7D2E0);
+    lv_obj_set_height(s_cfg_bright_val, 26);   /* one montserrat_20 line, uncl'd */
+    lv_label_set_text_fmt(s_cfg_bright_val, "brightness  %d%%", s_bright);
+
+    /* never 0: see BRIGHT_MIN */
+    cfg_slider(c, BRIGHT_MIN, 100, s_bright,
+               CFG_ACCENT_DISP, 0xE9DDFF, cfg_bright_cb);
+
+    s_cfg_rot_sw = cfg_switch(c, "Auto-rotate", CFG_ACCENT_DISP,
+                              s_autorot, cfg_autorot_cb);
+    /* No IMU, no autorotate — a switch that cannot do anything is worse than one
+     * that plainly looks dead, which is how MUSIC renders an unavailable
+     * transport control too. LV_STATE_DISABLED alone is not enough: the indev
+     * does honour it, but the local styles set above beat the theme's grey, so
+     * the switch would still be drawn as if live. Hence the explicit fade. */
+    if (!s_imu) {
+        lv_obj_add_state(s_cfg_rot_sw, LV_STATE_DISABLED);
+        lv_obj_remove_flag(s_cfg_rot_sw, LV_OBJ_FLAG_CLICKABLE);
+        lv_obj_set_style_opa(s_cfg_rot_sw, LV_OPA_40, 0);
+    }
+
+    /* Calibration only means something while autorotate is committing, so the
+     * button follows the switch — see cfg_timer_cb. */
+    s_cfg_rot_btn = cfg_button(c, LV_SYMBOL_REFRESH "  Step rotation calibration",
+                               CFG_ACCENT_DISP, cfg_rotate_cb);
 
     /* ---- audio ---- */
     c = cfg_card(col, "AUDIO", CFG_ACCENT_SND);
     s_cfg_vol_val = cfg_text(c, 0xC7D2E0);
     /* fixed height: a growing label here would resize the card and shift the
      * slider under the finger mid-drag */
-    lv_obj_set_height(s_cfg_vol_val, 20);
+    lv_obj_set_height(s_cfg_vol_val, 26);      /* one montserrat_20 line, uncl'd */
     lv_label_set_text_fmt(s_cfg_vol_val, "volume  %d%%   /   %+d dB",
                           s_vol, (int)vol_db(s_vol));
 
-    lv_obj_t *vs = lv_slider_create(c);
-    lv_obj_set_size(vs, lv_pct(100), 16);
-    lv_slider_set_range(vs, 0, 100);
-    lv_slider_set_value(vs, s_vol, LV_ANIM_OFF);
-    lv_obj_set_style_bg_color(vs, lv_color_hex(0x1E293B), LV_PART_MAIN);
-    lv_obj_set_style_bg_color(vs, lv_color_hex(CFG_ACCENT_SND), LV_PART_INDICATOR);
-    lv_obj_set_style_bg_color(vs, lv_color_hex(0xFFD9A8), LV_PART_KNOB);
-    lv_obj_add_event_cb(vs, cfg_vol_cb, LV_EVENT_VALUE_CHANGED, NULL);
-    lv_obj_add_event_cb(vs, cfg_vol_cb, LV_EVENT_RELEASED, NULL);
+    cfg_slider(c, 0, 100, s_vol, CFG_ACCENT_SND, 0xFFD9A8, cfg_vol_cb);
 
     /* ---- battery ---- */
     c = cfg_card(col, "BATTERY", CFG_ACCENT_BATT);
@@ -2701,7 +2963,8 @@ static void build_control_app(lv_obj_t *scr) {
 #define POMO_FLAT_TH     12000     /* ~0.73 g on Z: lying down either way up   */
 #define POMO_FLAT_MS     600       /* setting it down should not flicker       */
 #define POMO_DIM_MS      120000    /* untouched and still -> dim the panel     */
-#define POMO_DIM_PCT     12
+#define POMO_DIM_PCT     12        /* of the user's brightness, not of full     */
+#define POMO_DIM_FLOOR   3         /* still legible across the room             */
 #define POMO_MOTION_TH   2600      /* ~0.16 g of movement counts as "handled"  */
 #define POMO_DONE_MS     7000      /* how long the finish screen lingers       */
 
@@ -3053,7 +3316,7 @@ static bool pomo_is_flat(void) {
 static void pomo_poll(int64_t t) {
     if (s_app != APP_POMO) {
         if (s_pomo_dimmed) {                 /* never leave the panel dimmed */
-            bsp_display_brightness_set(100);
+            bright_apply(s_bright);
             s_pomo_dimmed = false;
         }
         return;
@@ -3124,8 +3387,22 @@ static void pomo_poll(int64_t t) {
     bool want_dim = (t - s_pomo_active_ms > POMO_DIM_MS);
     if (want_dim != s_pomo_dimmed) {
         s_pomo_dimmed = want_dim;
-        bsp_display_brightness_set(want_dim ? POMO_DIM_PCT : 100);
-        ESP_LOGI(TAG, "pomodoro: %s", want_dim ? "dimmed" : "full brightness");
+        /* Proportional, not the flat constant, and not a min() either. Flat 12
+         * would make "dimming" brighter for anyone running the panel below it;
+         * min(user, 12) fixes that but then dims by nothing at all at
+         * BRIGHT_MIN, silently retiring the feature for exactly the people who
+         * chose a dark panel on purpose. A percentage of the user's level is
+         * identical to today at 100 (100 * 12 / 100 = 12) and still a real
+         * three-of-ten dim at the floor. */
+        int lvl = s_bright;          /* one read: it is volatile and used thrice */
+        int dim = clampi(lvl * POMO_DIM_PCT / 100, POMO_DIM_FLOOR, lvl);
+        /* bright_apply(), not a bare bsp_ call: this runs on the main task while
+         * pomo_timer_cb is repainting at 4 Hz, so the panel IO is contended
+         * every single time this fires — pitfall #13's worst case, not its
+         * rarest. It was unlocked here for a long time and got away with it. */
+        bright_apply(want_dim ? dim : lvl);
+        ESP_LOGI(TAG, "pomodoro: %s (panel %d%%)",
+                 want_dim ? "dimmed" : "undimmed", want_dim ? dim : lvl);
     }
 }
 
@@ -4467,7 +4744,10 @@ static const app_def_t s_apps[APP_COUNT] = {
     [APP_CONTROL] = { "CONTROL", "control", ICON_DASHBOARD, 0x22D3EE, build_control_app, NULL     },
     [APP_PET]    = { "PIP",    "pet",    ICON_PETS,      0xF59E0B, build_pet_app,    pet_save },
     [APP_MUSIC]  = { "MUSIC",  "music",  ICON_MUSIC,     0x1DB954, build_music_app,  NULL      },
-    [APP_POMO]   = { "FOCUS",  "pomo",   ICON_TARGET,    0xFFB454, build_pomo_app,   pomo_save },
+    /* Red, and not the amber the app itself still uses for a running session:
+     * PIP directly above it is 0xF59E0B, and two ambers side by side in a 2x2
+     * made the tiles hard to tell apart at a glance. */
+    [APP_POMO]   = { "FOCUS",  "pomo",   ICON_TARGET,    0xFF453A, build_pomo_app,   pomo_save },
 };
 
 static void tile_cb(lv_event_t *e) {
@@ -5655,6 +5935,7 @@ static void app_open(int idx) {
     s_cfg_wall_pool = NULL; s_cfg_wall_state = NULL;
     s_cfg_wall_bar = NULL; s_cfg_wall_sub = NULL;
     s_cfg_rot_val = NULL; s_cfg_vol_val = NULL;
+    s_cfg_rot_sw = NULL; s_cfg_rot_btn = NULL; s_cfg_bright_val = NULL;
     s_cfg_batt_bar = NULL;
     s_cfg_batt_val = NULL; s_cfg_batt_sub = NULL;
     s_cfg_net_val = NULL; s_cfg_sys_val = NULL; s_cfg_log = NULL;
@@ -5775,6 +6056,13 @@ void app_main(void) {
     if (s_ssid[0] && s_pass[0]) known_remember(s_ssid, s_pass);
     pet_load();
     pomo_load();
+    /* Ahead of the display, not with the other settings further down, and handed
+     * to the BSP rather than applied here: the panel is already lit and holding a
+     * 600 ms delay partway through bsp_display_start_with_config(), so anything
+     * this side of that call is far too late to stop a full-brightness flash. The
+     * BSP fork takes the level up front instead (its fork change #6). */
+    bright_load();
+    bsp_display_brightness_set_boot(s_bright);
 
     /* Wi-Fi driver first: its DMA pool needs one contiguous chunk of pristine
      * internal heap. Association proceeds async while the display comes up. */
@@ -5793,7 +6081,7 @@ void app_main(void) {
         ESP_LOGE(TAG, "DISPLAY INIT FAILED — continuing headless (board stays flashable)");
         log_mem("display-fail");
     } else {
-        bsp_display_backlight_on();
+        bright_apply(s_bright);
         log_mem("display-up");
         if (ui_lock()) {
             lv_display_add_event_cb(disp, refr_ready_cb, LV_EVENT_REFR_READY, NULL);
@@ -5811,7 +6099,10 @@ void app_main(void) {
     battery_poll();
     rot_off_load();
     imu_init();
-    rotation_apply(0);   /* native: aligns the driver's state, no visual change */
+    /* Autorotating: native, which aligns the driver's state with no visual change
+     * and is corrected by the IMU within a few polls. Held: the orientation the
+     * user pinned, which is the whole point of having switched it off. */
+    rotation_apply(s_autorot ? 0 : s_rot_held);
     btn_init(&s_key_left);
     btn_init(&s_key_right);
 
@@ -5990,6 +6281,25 @@ void app_main(void) {
         if (s_req_vol_save && !ble_prov_nvs_blocked()) {
             s_req_vol_save = false;
             vol_save();
+        }
+
+        /* The slider only records a number; the panel write happens here, one per
+         * pass at most, which is also what keeps a drag from issuing a 0x51 per
+         * touch sample. The flag is cleared only when the write actually lands —
+         * clearing it up front would drop the request on a lock timeout, or
+         * whenever it arrived while the panel was off or dimmed. */
+        if (s_req_bright_apply && s_screen_on && !s_pomo_dimmed) {
+            if (bright_apply(s_bright)) s_req_bright_apply = false;
+        }
+
+        if (s_req_bright_save && !ble_prov_nvs_blocked()) {
+            s_req_bright_save = false;
+            bright_save();
+        }
+
+        if (s_req_autorot_save && !ble_prov_nvs_blocked()) {
+            s_req_autorot_save = false;
+            autorot_save();
         }
 
         if (s_req_ble_on) {
