@@ -1,0 +1,38 @@
+main/main.c
+  s_57e4cf4a7836a6::t_99a21ec4fbfab0 198-206,480-485,4888-4889
+  s_57e4cf4a7836a6::t_886798de35a1a5 4938-4942,4946-4947,4950-4951,4959-4962
+  s_57e4cf4a7836a6::t_8ede19b091bee5 123,2967-3567,3582,3889,4510-4516,4548-4551,4600-4602,4747,4760,4897-4900
+  s_57e4cf4a7836a6::t_2c5510e23c3e7f 197,4944-4945,4948-4949,4952-4958,4963
+  s_57e4cf4a7836a6::t_3141472b0fa7c5 277-280
+  s_57e4cf4a7836a6::t_c8740736fcd636 374-377,379,381-391,4943
+  s_57e4cf4a7836a6::t_1e0d2d88208eb1 3837,3863-3867,3887-3888
+  s_57e4cf4a7836a6::t_46122dcb8dd277 4139,4640
+  s_57e4cf4a7836a6::t_50c4950c203c39 4650-4653,4669-4670,4672
+  s_57e4cf4a7836a6::t_655458c62aabd0 378,3890,4901
+main/credentials.h.in
+  s_57e4cf4a7836a6::t_c4e9e61c7317d9 21-26
+main/hud_fonts.h
+  s_57e4cf4a7836a6::t_50158879c731e7 20
+main/app_icons_64.c
+  s_57e4cf4a7836a6::t_50158879c731e7 4,363-460,956-959,967,975
+main/CMakeLists.txt
+  s_57e4cf4a7836a6::t_c4e9e61c7317d9 20-23
+.env.example
+  s_57e4cf4a7836a6::t_c4e9e61c7317d9 34-44
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.22",
+  "base_commit_sha": "ec77033860b3274bd0febfacf3c297272eea8357",
+  "prompts": {},
+  "sessions": {
+    "s_57e4cf4a7836a6": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "79540328-5c96-430d-b4c5-de35687f549e",
+        "model": "claude-opus-5"
+      },
+      "human_author": "Jainal Gosaliya <jainal09gosalia@gmail.com>"
+    }
+  }
+}
