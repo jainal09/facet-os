@@ -140,6 +140,8 @@ func main() {
 	mux.HandleFunc("/token", b.handleToken)
 	mux.HandleFunc("/art", b.handleArt)
 	mux.HandleFunc("/art.bin", b.handleArt)
+	// Queue lookahead for prefetching — see queue.go for why it is server-side.
+	mux.HandleFunc("/queue", b.handleQueue)
 	// Wi-Fi setup UI. Unauthenticated by design — see provision.go.
 	mux.HandleFunc("/provision", b.handleProvision)
 
@@ -453,7 +455,7 @@ func encodeSquare(img image.Image, size int) ([]byte, error) {
 		Add(image.Pt(bnds.Min.X+(bnds.Dx()-side)/2, bnds.Min.Y+(bnds.Dy()-side)/2))
 
 	dst := image.NewRGBA(image.Rect(0, 0, size, size))
-	// CatmullRom rather than ApproxBiLinear: this runs once per track on a Pi,
+	// CatmullRom rather than ApproxBiLinear: this runs once per track on the server,
 	// where a few extra milliseconds are free, and album art downscaled 640->240
 	// looks visibly softer with a cheaper kernel.
 	draw.CatmullRom.Scale(dst, dst.Bounds(), img, crop, draw.Over, nil)
