@@ -120,7 +120,7 @@ static EventGroupHandle_t s_evt;
 /* Apps are built when opened and destroyed when closed, so only the running
  * app costs RAM. That removes the widget ceiling entirely — the cost of a
  * switch is one rebuild, not a reboot. */
-enum { APP_CONTROL = 0, APP_POMO, APP_PET, APP_WIFI, APP_COUNT };
+enum { APP_CONTROL = 0, APP_MUSIC, APP_POMO, APP_PET, APP_WIFI, APP_COUNT };
 #define APP_DRAWER (-1)
 #define APP_LOCK   (-2)
 #define AUTO_LOCK_MS  60000     /* unlocked and idle -> lock */
@@ -194,6 +194,16 @@ static bool s_wifi_disabled;
 static char s_ip[16];
 static volatile int s_wifi_reason;      /* last disconnect reason, for the log */
 static int  s_wifi_tries;               /* drives the reconnect backoff */
+static bool s_wifi_diag_done;           /* one scan dump per boot when joining fails */
+/* Credentials are not trusted until they actually work.
+ *
+ * A half-typed password on the on-screen keyboard used to be committed to NVS
+ * immediately, and NVS wins over the compiled-in values — so one abandoned
+ * attempt permanently overrode a working config, and the only symptom was
+ * reason=201 forever against an SSID that does not exist. Hold new credentials
+ * as pending, commit on GOT_IP, and fall back to the built-in ones if they keep
+ * failing. */
+static volatile bool s_creds_pending;
 static volatile bool s_req_sntp;
 static volatile bool s_req_wake;
 static bool s_time_synced;
@@ -264,6 +274,10 @@ static char              s_dl_theme[80];
 /* One tick of the wallpaper pool. Defined with the asset code further down but
  * driven from the network task, which is declared long before it. */
 static void wall_service(void);
+
+/* Streaming download to the card, optionally with a bearer. Defined with the
+ * asset code; the Spotify app needs it for album art and sits above it. */
+static bool asset_fetch_auth(const char *url, const char *path, const char *bearer);
 static void power_set_doze(bool doze);
 static int  battery_drain_mv_h(void);
 
@@ -357,7 +371,24 @@ void ml_pre_draw_buf_alloc(void) {
 
 /* ---------------- persistent state ---------------- */
 
+/* Set to 1 for one flash to discard saved Wi-Fi credentials. A half-typed
+ * password on the on-screen keyboard had been committed to NVS, and NVS wins
+ * over the compiled-in values, so the device chased an SSID that does not exist.
+ * Combined with save-on-success below, one boot restores a correct saved pair. */
+#define CREDS_RESET 0
+
 static void creds_load(void) {
+#if CREDS_RESET
+    {
+        nvs_handle_t h;
+        if (nvs_open("wifi", NVS_READWRITE, &h) == ESP_OK) {
+            nvs_erase_all(h);
+            nvs_commit(h);
+            nvs_close(h);
+            ESP_LOGW(TAG, "CREDS_RESET: discarded saved Wi-Fi credentials");
+        }
+    }
+#endif
     snprintf(s_ssid, sizeof(s_ssid), "%s", WIFI_SSID);
     snprintf(s_pass, sizeof(s_pass), "%s", WIFI_PASSWORD);
 
@@ -446,6 +477,12 @@ static void wifi_event_handler(void *arg, esp_event_base_t base, int32_t id, voi
         s_wifi_up = true;
         log_event("wifi " IPSTR, IP2STR(&e->ip_info.ip));
         if (!s_time_synced) s_req_sntp = true;
+        /* It works — now it is safe to remember. */
+        if (s_creds_pending) {
+            s_creds_pending = false;
+            creds_save(s_ssid, s_pass);
+            ESP_LOGI(TAG, "credentials for \"%s\" confirmed and saved", s_ssid);
+        }
         xEventGroupSetBits(s_evt, WIFI_CONNECTED_BIT);
     }
 }
@@ -2927,6 +2964,607 @@ static void pomo_poll(int64_t t) {
     }
 }
 
+/* ---------------- MUSIC: a Spotify remote ----------------
+ *
+ * Controls whatever is already playing — phone, laptop, speaker — and never
+ * plays audio itself.
+ *
+ * Three measured facts shape all of this:
+ *
+ *  - One reused connection turns a 390 ms call into 6 ms, and it survives idle
+ *    gaps (HARDWARE.md 7f). So a single long-lived esp_http_client handle serves
+ *    every endpoint, and polling costs almost nothing.
+ *  - That handle is NOT thread-safe and mutates state per request, so it lives on
+ *    exactly one task and touch callbacks reach it through a queue.
+ *  - Album art arrives from the broker pre-decoded as an LVGL RGB565 .bin, so the
+ *    device does no image decoding at all and LVGL streams rows off the card.
+ */
+
+#define SP_API        "https://api.spotify.com/v1"
+#define SP_TOKEN_URL  "https://accounts.spotify.com/api/token"
+#define SP_POLL_MS    3000
+#define SP_ART_PX     240
+#define SP_ART_PATH   WALL_DIR "/art.bin"
+#define SP_ART_LV     "S:" WALL_DIR "/art.bin"
+
+typedef enum {
+    SP_CMD_POLL = 1,
+    SP_CMD_PLAY, SP_CMD_PAUSE, SP_CMD_NEXT, SP_CMD_PREV, SP_CMD_SHUFFLE,
+    SP_CMD_DEVICES,
+    SP_CMD_TRANSFER,
+} sp_cmd_t;
+
+#define SP_MAX_DEV 8
+typedef struct {
+    char id[42];
+    char name[34];
+    bool active;
+} sp_dev_t;
+
+/* Player state. Written only by the spotify task, read by the UI timer — all
+ * scalars or fixed buffers, so a torn read shows a stale field, never a crash. */
+static char s_sp_track[64];
+static char s_sp_artist[64];
+static char s_sp_devname[34];
+static char s_sp_art_url[160];
+static char s_sp_art_have[160];        /* url currently on the card */
+static volatile bool s_sp_playing;
+static volatile bool s_sp_shuffle;
+static volatile bool s_sp_have_state;  /* a device is active */
+static volatile bool s_sp_authfail;
+static volatile bool s_sp_art_ready;
+static sp_dev_t s_sp_dev[SP_MAX_DEV];
+static volatile int s_sp_devcount;
+static volatile int s_sp_transfer_idx = -1;
+
+static char s_sp_access[320];
+static int64_t s_sp_expires_ms;         /* when the access token dies */
+
+static QueueHandle_t s_sp_q;
+static esp_http_client_handle_t s_sp_http;
+static char *s_sp_body;                 /* PSRAM response buffer */
+static int s_sp_len;
+#define SP_BODY_MAX 8192
+
+/* ---- HTTP plumbing, all on the spotify task ---- */
+
+static esp_err_t sp_evt(esp_http_client_event_t *e) {
+    if (e->event_id == HTTP_EVENT_ON_DATA && s_sp_body) {
+        int n = e->data_len;
+        if (s_sp_len + n > SP_BODY_MAX - 1) n = SP_BODY_MAX - 1 - s_sp_len;
+        if (n > 0) {
+            memcpy(s_sp_body + s_sp_len, e->data, n);
+            s_sp_len += n;
+            s_sp_body[s_sp_len] = '\0';
+        }
+    }
+    return ESP_OK;
+}
+
+/* Refresh the access token. No client secret: this is a PKCE public client, and
+ * Spotify returns no new refresh token for this grant, so the stored one keeps
+ * working and never has to be re-persisted. */
+static bool sp_refresh_token(void) {
+    if (SPOTIFY_REFRESH_TOKEN[0] == '\0' || SPOTIFY_CLIENT_ID[0] == '\0') return false;
+
+    char *body = heap_caps_malloc(1024, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!body) return false;
+    snprintf(body, 1024, "grant_type=refresh_token&refresh_token=%s&client_id=%s",
+             SPOTIFY_REFRESH_TOKEN, SPOTIFY_CLIENT_ID);
+
+    s_sp_len = 0;
+    if (s_sp_body) s_sp_body[0] = '\0';
+
+    esp_http_client_config_t cfg = {
+        .url = SP_TOKEN_URL,
+        .crt_bundle_attach = esp_crt_bundle_attach,
+        .method = HTTP_METHOD_POST,
+        .timeout_ms = 12000,
+        .event_handler = sp_evt,
+    };
+    esp_http_client_handle_t c = esp_http_client_init(&cfg);
+    bool ok = false;
+    if (c) {
+        esp_http_client_set_header(c, "Content-Type", "application/x-www-form-urlencoded");
+        esp_http_client_set_post_field(c, body, strlen(body));
+        esp_http_client_perform(c);
+        int code = esp_http_client_get_status_code(c);
+        if (code == 200 && s_sp_len > 0) {
+            cJSON *j = cJSON_Parse(s_sp_body);
+            if (j) {
+                cJSON *at = cJSON_GetObjectItem(j, "access_token");
+                cJSON *ex = cJSON_GetObjectItem(j, "expires_in");
+                if (cJSON_IsString(at)) {
+                    snprintf(s_sp_access, sizeof(s_sp_access), "%s", at->valuestring);
+                    int secs = cJSON_IsNumber(ex) ? ex->valueint : 3600;
+                    s_sp_expires_ms = now_ms() + (int64_t)secs * 1000;
+                    ok = true;
+                    ESP_LOGI(TAG, "spotify: token refreshed, valid %d s", secs);
+                }
+                cJSON_Delete(j);
+            }
+        } else {
+            ESP_LOGE(TAG, "spotify: token refresh failed, HTTP %d", code);
+        }
+        esp_http_client_cleanup(c);
+    }
+    free(body);
+    s_sp_authfail = !ok;
+    return ok;
+}
+
+static bool sp_token_ok(void) {
+    /* Refresh early rather than discovering expiry via a 401: that path leaves
+     * the socket undrained (HARDWARE.md 7f) and costs a reconnect. */
+    if (s_sp_access[0] && now_ms() < s_sp_expires_ms - 120000) return true;
+    return sp_refresh_token();
+}
+
+/* One handle for every endpoint. Only the path changes, and esp_http_client only
+ * drops the connection when host or port change, so this keeps the 6 ms path. */
+static int sp_call(esp_http_client_method_t method, const char *path, const char *json)
+{
+    if (!sp_token_ok()) return -1;
+
+    char url[224];
+    snprintf(url, sizeof(url), "%s%s", SP_API, path);
+
+    if (!s_sp_http) {
+        esp_http_client_config_t cfg = {
+            .url = url,
+            .crt_bundle_attach = esp_crt_bundle_attach,
+            .timeout_ms = 12000,
+            .event_handler = sp_evt,
+            .keep_alive_enable = true,
+        };
+        s_sp_http = esp_http_client_init(&cfg);
+        if (!s_sp_http) return -1;
+    } else {
+        esp_http_client_set_url(s_sp_http, url);
+    }
+
+    char auth[352];
+    snprintf(auth, sizeof(auth), "Bearer %s", s_sp_access);
+    esp_http_client_set_header(s_sp_http, "Authorization", auth);
+    esp_http_client_set_method(s_sp_http, method);
+
+    /* A body set on a previous request persists on a reused handle, so a bodiless
+     * POST would resend the last JSON. Clearing it also drops Content-Type. */
+    if (json) {
+        esp_http_client_set_header(s_sp_http, "Content-Type", "application/json");
+        esp_http_client_set_post_field(s_sp_http, json, strlen(json));
+    } else {
+        esp_http_client_set_post_field(s_sp_http, NULL, 0);
+    }
+
+    s_sp_len = 0;
+    if (s_sp_body) s_sp_body[0] = '\0';
+    esp_http_client_perform(s_sp_http);
+    int code = esp_http_client_get_status_code(s_sp_http);
+
+    if (code == 401) {
+        /* perform() bails on the Bearer challenge before draining the body, so
+         * the socket has unread bytes. Flush before reusing, then retry once. */
+        esp_http_client_flush_response(s_sp_http, NULL);
+        s_sp_access[0] = '\0';
+        if (sp_refresh_token()) {
+            snprintf(auth, sizeof(auth), "Bearer %s", s_sp_access);
+            esp_http_client_set_header(s_sp_http, "Authorization", auth);
+            s_sp_len = 0;
+            if (s_sp_body) s_sp_body[0] = '\0';
+            esp_http_client_perform(s_sp_http);
+            code = esp_http_client_get_status_code(s_sp_http);
+        }
+    }
+    return code;
+}
+
+/* ---- state ---- */
+
+static void sp_poll_state(void) {
+    int code = sp_call(HTTP_METHOD_GET, "/me/player", NULL);
+
+    if (code == 204 || (code == 200 && s_sp_len < 4)) {
+        s_sp_have_state = false;        /* nothing playing anywhere */
+        return;
+    }
+    if (code != 200 || s_sp_len == 0) return;
+
+    cJSON *j = cJSON_Parse(s_sp_body);
+    if (!j) return;
+
+    cJSON *item = cJSON_GetObjectItem(j, "item");
+    cJSON *dev  = cJSON_GetObjectItem(j, "device");
+    cJSON *pl   = cJSON_GetObjectItem(j, "is_playing");
+    cJSON *sh   = cJSON_GetObjectItem(j, "shuffle_state");
+
+    s_sp_playing = cJSON_IsTrue(pl);
+    s_sp_shuffle = cJSON_IsTrue(sh);
+    s_sp_have_state = true;
+
+    if (dev) {
+        cJSON *n = cJSON_GetObjectItem(dev, "name");
+        if (cJSON_IsString(n)) snprintf(s_sp_devname, sizeof(s_sp_devname), "%s", n->valuestring);
+    }
+    if (item) {
+        cJSON *n = cJSON_GetObjectItem(item, "name");
+        if (cJSON_IsString(n)) snprintf(s_sp_track, sizeof(s_sp_track), "%s", n->valuestring);
+
+        cJSON *arts = cJSON_GetObjectItem(item, "artists");
+        if (cJSON_IsArray(arts) && cJSON_GetArraySize(arts) > 0) {
+            cJSON *a0 = cJSON_GetArrayItem(arts, 0);
+            cJSON *an = a0 ? cJSON_GetObjectItem(a0, "name") : NULL;
+            if (cJSON_IsString(an)) snprintf(s_sp_artist, sizeof(s_sp_artist), "%s", an->valuestring);
+        }
+
+        /* Pick the image nearest the tile size; the broker rescales anyway, but
+         * asking for a smaller source keeps its fetch cheap. */
+        cJSON *alb = cJSON_GetObjectItem(item, "album");
+        cJSON *imgs = alb ? cJSON_GetObjectItem(alb, "images") : NULL;
+        if (cJSON_IsArray(imgs)) {
+            const char *best = NULL;
+            int bestd = 1 << 30;
+            for (int i = 0; i < cJSON_GetArraySize(imgs); i++) {
+                cJSON *im = cJSON_GetArrayItem(imgs, i);
+                cJSON *u = cJSON_GetObjectItem(im, "url");
+                cJSON *w = cJSON_GetObjectItem(im, "width");
+                if (!cJSON_IsString(u) || !cJSON_IsNumber(w)) continue;
+                int d = abs(w->valueint - SP_ART_PX);
+                if (d < bestd) { bestd = d; best = u->valuestring; }
+            }
+            if (best) snprintf(s_sp_art_url, sizeof(s_sp_art_url), "%s", best);
+        }
+    }
+    cJSON_Delete(j);
+}
+
+static void sp_poll_devices(void) {
+    int code = sp_call(HTTP_METHOD_GET, "/me/player/devices", NULL);
+    if (code != 200 || s_sp_len == 0) return;
+
+    cJSON *j = cJSON_Parse(s_sp_body);
+    if (!j) return;
+    cJSON *devs = cJSON_GetObjectItem(j, "devices");
+    int n = 0;
+    if (cJSON_IsArray(devs)) {
+        for (int i = 0; i < cJSON_GetArraySize(devs) && n < SP_MAX_DEV; i++) {
+            cJSON *d = cJSON_GetArrayItem(devs, i);
+            cJSON *id = cJSON_GetObjectItem(d, "id");
+            cJSON *nm = cJSON_GetObjectItem(d, "name");
+            if (!cJSON_IsString(id) || !cJSON_IsString(nm)) continue;
+            snprintf(s_sp_dev[n].id, sizeof(s_sp_dev[0].id), "%s", id->valuestring);
+            snprintf(s_sp_dev[n].name, sizeof(s_sp_dev[0].name), "%s", nm->valuestring);
+            s_sp_dev[n].active = cJSON_IsTrue(cJSON_GetObjectItem(d, "is_active"));
+            n++;
+        }
+    }
+    s_sp_devcount = n;
+    cJSON_Delete(j);
+    ESP_LOGI(TAG, "spotify: %d device(s)", n);
+}
+
+/* Album art, pre-decoded by the broker into LVGL's RGB565 binary format. The
+ * device never decodes an image: LVGL's bin decoder reads rows straight off the
+ * card per draw chunk. Reuses the wallpaper download path wholesale. */
+static void sp_fetch_art(void) {
+    if (!s_sd_ok || !s_sp_art_url[0] || BROKER_URL[0] == '\0') return;
+    if (strcmp(s_sp_art_url, s_sp_art_have) == 0) return;   /* same track */
+
+    char url[512];
+    int n = snprintf(url, sizeof(url), "%s/art.bin?s=%d&u=", BROKER_URL, SP_ART_PX);
+    /* percent-encode the Spotify URL into the query */
+    static const char hex[] = "0123456789ABCDEF";
+    for (const unsigned char *p = (const unsigned char *)s_sp_art_url;
+         *p && n < (int)sizeof(url) - 4; p++) {
+        if (isalnum(*p) || *p == '-' || *p == '_' || *p == '.' || *p == '~') {
+            url[n++] = (char)*p;
+        } else {
+            url[n++] = '%'; url[n++] = hex[*p >> 4]; url[n++] = hex[*p & 0xF];
+        }
+    }
+    url[n] = '\0';
+
+    if (asset_fetch_auth(url, SP_ART_PATH, BROKER_TOKEN)) {
+        snprintf(s_sp_art_have, sizeof(s_sp_art_have), "%s", s_sp_art_url);
+        /* same path, new bytes — LVGL would otherwise keep serving the old one */
+        if (ui_lock()) {
+            lv_image_cache_drop(SP_ART_LV);
+            bsp_display_unlock();
+        }
+        s_sp_art_ready = true;
+        ESP_LOGI(TAG, "spotify: art updated");
+    }
+}
+
+static void sp_task(void *arg) {
+    s_sp_body = heap_caps_malloc(SP_BODY_MAX, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!s_sp_body) {
+        ESP_LOGE(TAG, "spotify: no PSRAM for the response buffer");
+        vTaskDelete(NULL);
+        return;
+    }
+
+    sp_cmd_t cmd;
+    while (1) {
+        if (xQueueReceive(s_sp_q, &cmd, portMAX_DELAY) != pdTRUE) continue;
+        if (!s_wifi_up) continue;
+
+        switch (cmd) {
+        case SP_CMD_POLL:    sp_poll_state(); sp_fetch_art(); break;
+        case SP_CMD_DEVICES: sp_poll_devices(); break;
+
+        /* Optimistic UI: the icon already flipped, so a poll follows to confirm
+         * rather than to discover. */
+        case SP_CMD_PLAY:    sp_call(HTTP_METHOD_PUT,  "/me/player/play", NULL);  goto confirm;
+        case SP_CMD_PAUSE:   sp_call(HTTP_METHOD_PUT,  "/me/player/pause", NULL); goto confirm;
+        case SP_CMD_NEXT:    sp_call(HTTP_METHOD_POST, "/me/player/next", NULL);  goto confirm;
+        case SP_CMD_PREV:    sp_call(HTTP_METHOD_POST, "/me/player/previous", NULL); goto confirm;
+        case SP_CMD_SHUFFLE: {
+            char p[64];
+            snprintf(p, sizeof(p), "/me/player/shuffle?state=%s",
+                     s_sp_shuffle ? "true" : "false");
+            sp_call(HTTP_METHOD_PUT, p, NULL);
+            goto confirm;
+        }
+        case SP_CMD_TRANSFER: {
+            int idx = s_sp_transfer_idx;
+            if (idx >= 0 && idx < s_sp_devcount) {
+                char body[96];
+                snprintf(body, sizeof(body), "{\"device_ids\":[\"%s\"],\"play\":true}",
+                         s_sp_dev[idx].id);
+                int code = sp_call(HTTP_METHOD_PUT, "/me/player", body);
+                ESP_LOGI(TAG, "spotify: transfer to %s -> HTTP %d",
+                         s_sp_dev[idx].name, code);
+            }
+            goto confirm;
+        }
+        default: break;
+        }
+        continue;
+
+    confirm:
+        vTaskDelay(pdMS_TO_TICKS(350));   /* let Spotify settle before reading back */
+        sp_poll_state();
+        sp_fetch_art();
+    }
+}
+
+static void sp_send(sp_cmd_t c) {
+    if (s_sp_q) xQueueSend(s_sp_q, &c, 0);
+}
+
+static void sp_init(void) {
+    s_sp_q = xQueueCreate(6, sizeof(sp_cmd_t));
+    if (!s_sp_q) return;
+    if (xTaskCreateWithCaps(sp_task, "spotify", 8192, NULL, 4, NULL,
+                            MALLOC_CAP_SPIRAM) != pdPASS) {
+        ESP_LOGE(TAG, "!! spotify stack fell back to INTERNAL SRAM — costs ~8 KB "
+                      "of the scarce pool; expect a lower floor");
+        s_stack_fallback = true;
+        xTaskCreate(sp_task, "spotify", 8192, NULL, 4, NULL);
+    }
+}
+
+/* ---- the screen ---- */
+
+static lv_obj_t *s_sp_art, *s_sp_art_ph, *s_sp_lbl_track, *s_sp_lbl_artist;
+static lv_obj_t *s_sp_btn_play_lbl, *s_sp_btn_shuf, *s_sp_lbl_dev;
+static lv_obj_t *s_sp_devpanel, *s_sp_devlist;
+static char s_sp_art_shown[160];
+
+static lv_obj_t *sp_button(lv_obj_t *par, const char *glyph, lv_coord_t dx,
+                           lv_event_cb_t cb, uint32_t accent)
+{
+    lv_obj_t *b = lv_button_create(par);
+    lv_obj_set_size(b, 58, 58);
+    lv_obj_set_style_radius(b, 29, 0);
+    lv_obj_set_style_bg_color(b, lv_color_hex(0x141B26), 0);
+    lv_obj_set_style_border_width(b, 1, 0);
+    lv_obj_set_style_border_color(b, lv_color_hex(accent), 0);
+    lv_obj_set_style_border_opa(b, 120, 0);
+    lv_obj_set_style_bg_color(b, lv_color_hex(accent), LV_STATE_PRESSED);
+    lv_obj_align(b, LV_ALIGN_TOP_MID, dx, 322);
+    lv_obj_add_event_cb(b, cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_t *l = lv_label_create(b);
+    lv_obj_set_style_text_color(l, lv_color_hex(0xE2E8F0), 0);
+    lv_label_set_text(l, glyph);
+    lv_obj_center(l);
+    return l;
+}
+
+/* Every control flips the UI first and enqueues second. At 6 ms the round trip is
+ * nearly instant anyway, but this makes a dropped call invisible rather than
+ * making every tap feel laggy. */
+static void sp_play_cb(lv_event_t *e) {
+    s_sp_playing = !s_sp_playing;
+    if (s_sp_btn_play_lbl) {
+        lv_label_set_text(s_sp_btn_play_lbl, s_sp_playing ? LV_SYMBOL_PAUSE : LV_SYMBOL_PLAY);
+    }
+    sp_send(s_sp_playing ? SP_CMD_PLAY : SP_CMD_PAUSE);
+}
+static void sp_next_cb(lv_event_t *e) { sp_send(SP_CMD_NEXT); }
+static void sp_prev_cb(lv_event_t *e) { sp_send(SP_CMD_PREV); }
+static void sp_shuf_cb(lv_event_t *e) {
+    s_sp_shuffle = !s_sp_shuffle;
+    if (s_sp_btn_shuf) {
+        lv_obj_set_style_text_color(s_sp_btn_shuf,
+            lv_color_hex(s_sp_shuffle ? 0x1DB954 : 0x64748B), 0);
+    }
+    sp_send(SP_CMD_SHUFFLE);
+}
+
+static void sp_show_devices(bool on) {
+    if (!s_sp_devpanel) return;
+    if (on) {
+        lv_obj_remove_flag(s_sp_devpanel, LV_OBJ_FLAG_HIDDEN);
+        sp_send(SP_CMD_DEVICES);
+    } else {
+        lv_obj_add_flag(s_sp_devpanel, LV_OBJ_FLAG_HIDDEN);
+    }
+}
+
+static void sp_devtap_cb(lv_event_t *e) {
+    int idx = (int)(intptr_t)lv_obj_get_user_data(lv_event_get_target(e));
+    if (idx < 0 || idx >= s_sp_devcount) return;
+    s_sp_transfer_idx = idx;
+    snprintf(s_sp_devname, sizeof(s_sp_devname), "%s", s_sp_dev[idx].name);
+    sp_send(SP_CMD_TRANSFER);
+    sp_show_devices(false);
+}
+
+static void sp_devbtn_cb(lv_event_t *e) { sp_show_devices(true); }
+
+static int s_sp_devdrawn = -1;
+
+static void sp_timer_cb(lv_timer_t *t) {
+    if (!s_sp_lbl_track) return;
+
+    if (s_sp_authfail) {
+        lv_label_set_text(s_sp_lbl_track, "not authorised");
+        lv_label_set_text(s_sp_lbl_artist, "check SPOTIFY_REFRESH_TOKEN");
+    } else if (!s_sp_have_state) {
+        lv_label_set_text(s_sp_lbl_track, "nothing playing");
+        lv_label_set_text(s_sp_lbl_artist, "pick a device to start");
+    } else {
+        lv_label_set_text(s_sp_lbl_track, s_sp_track);
+        lv_label_set_text(s_sp_lbl_artist, s_sp_artist);
+    }
+
+    lv_label_set_text(s_sp_btn_play_lbl, s_sp_playing ? LV_SYMBOL_PAUSE : LV_SYMBOL_PLAY);
+    lv_obj_set_style_text_color(s_sp_btn_shuf,
+        lv_color_hex(s_sp_shuffle ? 0x1DB954 : 0x64748B), 0);
+    lv_label_set_text_fmt(s_sp_lbl_dev, LV_SYMBOL_AUDIO "  %s",
+                          s_sp_devname[0] ? s_sp_devname : "no device");
+
+    /* Swap the art in only when the file behind it actually changed. */
+    if (s_sp_art_ready && strcmp(s_sp_art_shown, s_sp_art_have) != 0) {
+        snprintf(s_sp_art_shown, sizeof(s_sp_art_shown), "%s", s_sp_art_have);
+        lv_image_set_src(s_sp_art, SP_ART_LV);
+        lv_obj_remove_flag(s_sp_art, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_add_flag(s_sp_art_ph, LV_OBJ_FLAG_HIDDEN);
+    }
+
+    /* Rebuild the device list only when the set changes, not every tick — it is
+     * a list of buttons and rebuilding it under a finger would fight the touch. */
+    if (s_sp_devlist && !lv_obj_has_flag(s_sp_devpanel, LV_OBJ_FLAG_HIDDEN) &&
+        s_sp_devdrawn != s_sp_devcount) {
+        s_sp_devdrawn = s_sp_devcount;
+        lv_obj_clean(s_sp_devlist);
+        for (int i = 0; i < s_sp_devcount; i++) {
+            lv_obj_t *b = lv_list_add_button(s_sp_devlist,
+                s_sp_dev[i].active ? LV_SYMBOL_OK : LV_SYMBOL_AUDIO, s_sp_dev[i].name);
+            lv_obj_set_user_data(b, (void *)(intptr_t)i);
+            lv_obj_add_event_cb(b, sp_devtap_cb, LV_EVENT_CLICKED, NULL);
+            lv_obj_set_style_bg_color(b, lv_color_hex(s_sp_dev[i].active ? 0x123524 : 0x1C1C2B), 0);
+            lv_obj_set_style_text_color(b, lv_color_hex(s_sp_dev[i].active ? 0x1DB954 : 0xD8D8E4), 0);
+        }
+        if (s_sp_devcount == 0) {
+            lv_obj_t *b = lv_list_add_text(s_sp_devlist, "no devices - open Spotify somewhere");
+            lv_obj_set_style_text_color(b, lv_color_hex(0x64748B), 0);
+        }
+    }
+}
+
+static void build_music_app(lv_obj_t *scr) {
+    lv_obj_set_style_bg_color(scr, lv_color_hex(0x05070B), 0);
+    lv_obj_remove_flag(scr, LV_OBJ_FLAG_SCROLLABLE);
+
+    /* Placeholder behind the art, so a track with no cover yet is not a hole. */
+    s_sp_art_ph = lv_obj_create(scr);
+    lv_obj_remove_style_all(s_sp_art_ph);
+    lv_obj_set_size(s_sp_art_ph, SP_ART_PX, SP_ART_PX);
+    lv_obj_align(s_sp_art_ph, LV_ALIGN_TOP_MID, 0, 44);
+    lv_obj_set_style_bg_color(s_sp_art_ph, lv_color_hex(0x11161F), 0);
+    lv_obj_set_style_bg_opa(s_sp_art_ph, LV_OPA_COVER, 0);
+    lv_obj_set_style_radius(s_sp_art_ph, 16, 0);
+    lv_obj_remove_flag(s_sp_art_ph, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_t *ph = lv_label_create(s_sp_art_ph);
+    lv_obj_set_style_text_font(ph, &app_icons_64, 0);
+    lv_obj_set_style_text_color(ph, lv_color_hex(0x1E293B), 0);
+    lv_label_set_text(ph, ICON_MUSIC);
+    lv_obj_center(ph);
+
+    s_sp_art = lv_image_create(scr);
+    lv_obj_set_size(s_sp_art, SP_ART_PX, SP_ART_PX);
+    lv_obj_align(s_sp_art, LV_ALIGN_TOP_MID, 0, 44);
+    lv_image_set_inner_align(s_sp_art, LV_IMAGE_ALIGN_COVER);
+    lv_obj_add_flag(s_sp_art, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_remove_flag(s_sp_art, LV_OBJ_FLAG_CLICKABLE);
+
+    s_sp_lbl_track = lv_label_create(scr);
+    lv_obj_set_width(s_sp_lbl_track, CONTENT_W);
+    lv_obj_set_style_text_font(s_sp_lbl_track, &lv_font_montserrat_20, 0);
+    lv_obj_set_style_text_color(s_sp_lbl_track, lv_color_hex(0xF2E9DC), 0);
+    lv_obj_set_style_text_align(s_sp_lbl_track, LV_TEXT_ALIGN_CENTER, 0);
+    lv_label_set_long_mode(s_sp_lbl_track, LV_LABEL_LONG_SCROLL_CIRCULAR);
+    lv_label_set_text(s_sp_lbl_track, "connecting...");
+    lv_obj_align(s_sp_lbl_track, LV_ALIGN_TOP_MID, 0, 292);
+
+    s_sp_lbl_artist = lv_label_create(scr);
+    lv_obj_set_width(s_sp_lbl_artist, CONTENT_W);
+    lv_obj_set_style_text_font(s_sp_lbl_artist, &hud_text_18, 0);
+    lv_obj_set_style_text_color(s_sp_lbl_artist, lv_color_hex(0x1DB954), 0);
+    lv_obj_set_style_text_align(s_sp_lbl_artist, LV_TEXT_ALIGN_CENTER, 0);
+    lv_label_set_long_mode(s_sp_lbl_artist, LV_LABEL_LONG_DOT);
+    lv_label_set_text(s_sp_lbl_artist, "");
+    lv_obj_align(s_sp_lbl_artist, LV_ALIGN_TOP_MID, 0, 296 + 24);
+
+    s_sp_btn_shuf     = sp_button(scr, LV_SYMBOL_SHUFFLE, -102, sp_shuf_cb, 0x1DB954);
+    (void)               sp_button(scr, LV_SYMBOL_PREV,    -34, sp_prev_cb, 0x334155);
+    s_sp_btn_play_lbl = sp_button(scr, LV_SYMBOL_PLAY,      34, sp_play_cb, 0x1DB954);
+    (void)               sp_button(scr, LV_SYMBOL_NEXT,    102, sp_next_cb, 0x334155);
+
+    lv_obj_t *devbtn = lv_button_create(scr);
+    lv_obj_set_size(devbtn, 240, 30);
+    lv_obj_align(devbtn, LV_ALIGN_BOTTOM_MID, 0, -BOTTOM_MARGIN + 14);
+    lv_obj_set_style_radius(devbtn, 15, 0);
+    lv_obj_set_style_bg_color(devbtn, lv_color_hex(0x0C1018), 0);
+    lv_obj_set_style_border_width(devbtn, 0, 0);
+    lv_obj_add_event_cb(devbtn, sp_devbtn_cb, LV_EVENT_CLICKED, NULL);
+    s_sp_lbl_dev = lv_label_create(devbtn);
+    lv_obj_set_style_text_font(s_sp_lbl_dev, &hud_text_18, 0);
+    lv_obj_set_style_text_color(s_sp_lbl_dev, lv_color_hex(0x64748B), 0);
+    lv_label_set_long_mode(s_sp_lbl_dev, LV_LABEL_LONG_DOT);
+    lv_obj_set_width(s_sp_lbl_dev, 220);
+    lv_obj_set_style_text_align(s_sp_lbl_dev, LV_TEXT_ALIGN_CENTER, 0);
+    lv_label_set_text(s_sp_lbl_dev, "");
+    lv_obj_center(s_sp_lbl_dev);
+
+    /* Device picker, same list-over-content shape the Wi-Fi app uses so the
+     * right key pops it exactly the same way. */
+    s_sp_devpanel = lv_obj_create(scr);
+    lv_obj_remove_style_all(s_sp_devpanel);
+    lv_obj_set_size(s_sp_devpanel, 480, 480);
+    lv_obj_center(s_sp_devpanel);
+    lv_obj_set_style_bg_color(s_sp_devpanel, lv_color_hex(0x05070B), 0);
+    lv_obj_set_style_bg_opa(s_sp_devpanel, 245, 0);
+    lv_obj_remove_flag(s_sp_devpanel, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(s_sp_devpanel, LV_OBJ_FLAG_HIDDEN);
+
+    lv_obj_t *dt = lv_label_create(s_sp_devpanel);
+    lv_obj_set_style_text_font(dt, &hud_text_18, 0);
+    lv_obj_set_style_text_color(dt, lv_color_hex(0x1DB954), 0);
+    lv_obj_set_style_text_letter_space(dt, 4, 0);
+    lv_label_set_text(dt, "PLAY ON");
+    lv_obj_align(dt, LV_ALIGN_TOP_MID, 0, TOP_MARGIN + 18);
+
+    s_sp_devlist = lv_list_create(s_sp_devpanel);
+    lv_obj_set_size(s_sp_devlist, CONTENT_W, 300);
+    lv_obj_align(s_sp_devlist, LV_ALIGN_TOP_MID, 0, 96);
+    lv_obj_set_style_bg_color(s_sp_devlist, lv_color_hex(0x11161F), 0);
+    lv_obj_set_style_border_width(s_sp_devlist, 0, 0);
+    lv_obj_set_style_radius(s_sp_devlist, 16, 0);
+    lv_obj_set_style_pad_all(s_sp_devlist, 6, 0);
+
+    lv_obj_add_event_cb(scr, gesture_home_cb, LV_EVENT_GESTURE, NULL);
+
+    s_sp_devdrawn = -1;
+    s_sp_art_shown[0] = '\0';
+    sp_send(SP_CMD_POLL);
+    sp_send(SP_CMD_DEVICES);
+    s_app_timer = lv_timer_create(sp_timer_cb, 400, NULL);
+}
+
 /* ---------------- app drawer ---------------- */
 
 typedef struct {
@@ -2941,6 +3579,7 @@ typedef struct {
 static const app_def_t s_apps[APP_COUNT] = {
     [APP_CONTROL] = { "CONTROL", "control", ICON_DASHBOARD, 0x22D3EE, build_control_app, NULL     },
     [APP_PET]    = { "PIP",    "pet",    ICON_PETS,      0xF59E0B, build_pet_app,    pet_save },
+    [APP_MUSIC]  = { "MUSIC",  "music",  ICON_MUSIC,     0x1DB954, build_music_app,  NULL      },
     [APP_POMO]   = { "FOCUS",  "pomo",   ICON_TARGET,    0xFFB454, build_pomo_app,   pomo_save },
     [APP_WIFI]   = { "WI-FI",  "wifi",   ICON_WIFI,      0x34D399, build_wifi_app,   NULL     },
 };
@@ -3195,7 +3834,7 @@ static esp_err_t dl_evt(esp_http_client_event_t *e) {
     return ESP_OK;
 }
 
-static bool asset_fetch(const char *url, const char *path) {
+static bool asset_fetch_auth(const char *url, const char *path, const char *bearer) {
     if (!s_sd_ok) return false;
 
     s_dl_total = 0;
@@ -3221,6 +3860,11 @@ static bool asset_fetch(const char *url, const char *path) {
     esp_http_client_handle_t c = esp_http_client_init(&cfg);
     bool ok = false;
     if (c) {
+        if (bearer && bearer[0]) {
+            char auth[96];
+            snprintf(auth, sizeof(auth), "Bearer %.72s", bearer);
+            esp_http_client_set_header(c, "Authorization", auth);
+        }
         esp_err_t err = esp_http_client_perform(c);
         int status = esp_http_client_get_status_code(c);
         ok = (err == ESP_OK && status == 200);
@@ -3238,6 +3882,10 @@ static bool asset_fetch(const char *url, const char *path) {
         remove(tmp);
     }
     return ok;
+}
+
+static bool asset_fetch(const char *url, const char *path) {
+    return asset_fetch_auth(url, path, NULL);
 }
 
 /* Pick one theme at random out of the ';'-separated UNSPLASH_QUERY list.
@@ -3488,7 +4136,7 @@ static void sd_init(void) {
 /* One-shot dump of the power log to serial. The card cannot be read without
  * pulling it out of the device, and the whole point of this log is that it
  * accumulates while running on battery with no console attached. */
-#define PWRLOG_DUMP 1
+#define PWRLOG_DUMP 0
 
 #if PWRLOG_DUMP
 static void telemetry_dump(void) {
@@ -3859,6 +4507,13 @@ static void always_on_toggle(void) {
 
 /* true if the app consumed the Back itself (it had a sub-scene to pop) */
 static bool app_back(void) {
+    if (s_app == APP_MUSIC) {
+        if (s_sp_devpanel && !lv_obj_has_flag(s_sp_devpanel, LV_OBJ_FLAG_HIDDEN)) {
+            if (ui_lock()) { sp_show_devices(false); bsp_display_unlock(); }
+            return true;
+        }
+        return false;
+    }
     if (s_app != APP_WIFI) return false;
     bool on_pw   = s_pw_panel   && !lv_obj_has_flag(s_pw_panel, LV_OBJ_FLAG_HIDDEN);
     bool on_conn = s_conn_panel && !lv_obj_has_flag(s_conn_panel, LV_OBJ_FLAG_HIDDEN);
@@ -3889,6 +4544,10 @@ static void app_action(void) {
         break;
     case APP_CONTROL:
         s_req_wallpaper = true;      /* the card shows real progress for this */
+        break;
+    case APP_MUSIC:
+        s_sp_playing = !s_sp_playing;
+        sp_send(s_sp_playing ? SP_CMD_PLAY : SP_CMD_PAUSE);
         break;
     case APP_POMO:
         if (s_pomo_state == POMO_RUN || s_pomo_state == POMO_PAUSE) {
@@ -3938,6 +4597,9 @@ static void app_open(int idx) {
     s_cfg_batt_bar = NULL;
     s_cfg_batt_val = NULL; s_cfg_batt_sub = NULL;
     s_cfg_net_val = NULL; s_cfg_sys_val = NULL; s_cfg_log = NULL;
+    s_sp_art = NULL; s_sp_art_ph = NULL; s_sp_lbl_track = NULL;
+    s_sp_lbl_artist = NULL; s_sp_btn_play_lbl = NULL; s_sp_btn_shuf = NULL;
+    s_sp_lbl_dev = NULL; s_sp_devpanel = NULL; s_sp_devlist = NULL;
     s_pomo_clock = NULL; s_pomo_word = NULL;
     s_pomo_ring = NULL; s_pomo_arc = NULL; s_pomo_fill = NULL;
     for (int i = 0; i < POMO_SLOTS; i++) s_pomo_dial[i] = NULL;
@@ -3975,7 +4637,7 @@ static void app_open(int idx) {
  * a transient. This opens each app in turn, lets it render, and reports what it
  * actually costs, because guessing which of five cards is expensive is how you
  * optimise the wrong thing. */
-#define APP_MEM_BENCH 1
+#define APP_MEM_BENCH 0
 
 #if APP_MEM_BENCH
 static void mem_line(const char *what) {
@@ -3985,6 +4647,10 @@ static void mem_line(const char *what) {
 }
 
 static void app_mem_bench(void) {
+    /* Wait for the network first: measuring an app that cannot reach its API
+     * measures the wrong thing, and MUSIC is the one that cares. */
+    ESP_LOGW(TAG, "bench: waiting for wifi...");
+    xEventGroupWaitBits(s_evt, WIFI_CONNECTED_BIT, pdFALSE, pdTRUE, pdMS_TO_TICKS(30000));
     ESP_LOGW(TAG, "=== per-app internal SRAM cost ===");
     app_open(APP_DRAWER);
     vTaskDelay(pdMS_TO_TICKS(1200));
@@ -4000,9 +4666,10 @@ static void app_mem_bench(void) {
     vTaskDelay(pdMS_TO_TICKS(1800));
     mem_line("LOCK");
 
-    app_open(APP_DRAWER);
+    /* Leave it on MUSIC so the poll loop actually runs and can be observed. */
+    app_open(APP_MUSIC);
     vTaskDelay(pdMS_TO_TICKS(1200));
-    mem_line("back-drawer");
+    mem_line("rest-on-MUSIC");
     ESP_LOGW(TAG, "=== end bench ===");
 }
 #endif
@@ -4077,6 +4744,7 @@ void app_main(void) {
 
     vol_load();
     sfx_init();
+    sp_init();
     /* PSRAM stack: 8 KB of internal SRAM is far too expensive for a task that
      * polls and downloads. Same trick as the sfx task. */
     if (xTaskCreateWithCaps(net_task, "net", 8192, NULL, 5, NULL,
@@ -4089,7 +4757,7 @@ void app_main(void) {
 
     int64_t last_stats = now_ms();
     int64_t last_batt = 0, last_imu = 0, last_pet = now_ms(), last_pet_save = now_ms();
-    int64_t last_tele = now_ms(), last_rejoin = now_ms();
+    int64_t last_tele = now_ms(), last_rejoin = now_ms(), last_sp_poll = 0;
     uint32_t last_refr = 0;
     int64_t s_last_btn = now_ms();
 
@@ -4217,12 +4885,18 @@ void app_main(void) {
             s_wifi_disabled = false;       /* joining is an explicit "on" */
             snprintf(s_ssid, sizeof(s_ssid), "%s", s_new_ssid);
             snprintf(s_pass, sizeof(s_pass), "%s", s_new_pass);
-            creds_save(s_ssid, s_pass);
+            s_creds_pending = true;      /* saved only once it actually joins */
+            s_wifi_tries = 0;
             ESP_LOGI(TAG, "applying new credentials for \"%s\"", s_ssid);
             log_event("join %s", s_ssid);
             esp_wifi_disconnect();
             wifi_apply_config(s_ssid, s_pass);
             esp_wifi_connect();
+        }
+
+        if (s_app == APP_MUSIC && s_wifi_up && t - last_sp_poll >= SP_POLL_MS) {
+            last_sp_poll = t;
+            sp_send(SP_CMD_POLL);
         }
 
         if (s_req_vol_save) {
@@ -4261,9 +4935,32 @@ void app_main(void) {
             if (t - last_rejoin >= wait) {
                 last_rejoin = t;
                 if (s_wifi_tries < 12) s_wifi_tries++;
-                ESP_LOGI(TAG, "wifi reconnect attempt %d (last reason=%d, next in %llds)",
-                         s_wifi_tries, s_wifi_reason, (long long)(wait / 1000));
-                esp_wifi_connect();
+                /* Diagnose before reconnecting, not after. A scan cannot start
+                 * while a connect is in flight, so doing this straight after
+                 * esp_wifi_connect() just fails and reports "nothing visible",
+                 * which reads as a dead radio. Spend one round on the scan
+                 * instead of a connect attempt. */
+                if (s_wifi_tries >= 3 && !s_wifi_diag_done) {
+                    s_wifi_diag_done = true;
+                    ESP_LOGW(TAG, "cannot join \"%s\" — scanning to see what is here", s_ssid);
+                    esp_wifi_disconnect();
+                    vTaskDelay(pdMS_TO_TICKS(200));
+                    wifi_scan_now();
+                    if (s_ap_count == 0) {
+                        ESP_LOGW(TAG, "  scan returned nothing — either genuinely no "
+                                      "2.4 GHz networks in range, or the scan was refused");
+                    }
+                    for (int k = 0; k < s_ap_count; k++) {
+                        ESP_LOGW(TAG, "  visible: \"%s\" %d dBm%s%s",
+                                 s_aps[k].ssid, s_aps[k].rssi,
+                                 s_aps[k].secure ? "" : " (open)",
+                                 strcmp(s_aps[k].ssid, s_ssid) == 0 ? "  <-- CONFIGURED" : "");
+                    }
+                } else {
+                    ESP_LOGI(TAG, "wifi reconnect attempt %d (last reason=%d, next in %llds)",
+                             s_wifi_tries, s_wifi_reason, (long long)(wait / 1000));
+                    esp_wifi_connect();
+                }
             }
         }
 

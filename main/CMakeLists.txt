@@ -17,6 +17,10 @@ set(TIMEZONE         "UTC0")
 set(NTP_SERVER       "pool.ntp.org")
 set(UNSPLASH_KEY     "")
 set(UNSPLASH_QUERY   "space,nebula,astronomy")
+set(BROKER_TOKEN         "")
+set(BROKER_URL           "")
+set(SPOTIFY_REFRESH_TOKEN  "")
+set(SPOTIFY_CLIENT_ID    "")
 
 # Seed a .env on first configure so the file always exists from here on.
 # CMAKE_CONFIGURE_DEPENDS cannot watch a path that does not exist yet, so
