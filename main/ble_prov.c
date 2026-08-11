@@ -72,6 +72,7 @@ static const char *TAG = "ble_prov";
 #define CMD_JOIN        0x03
 #define CMD_WIFI_OFF    0x04
 #define CMD_BYE         0x05
+#define CMD_RESCAN      0x06
 
 /* cube -> phone, in DATA */
 #define RSP_APLIST      0x81
@@ -80,14 +81,26 @@ static const char *TAG = "ble_prov";
 #define ERR_NONE        0
 #define ERR_BAD_CODE    1
 #define ERR_LOCKED_OUT  2
-#define ERR_JOIN_FAILED 3
+/* 3 was ERR_JOIN_FAILED, retired: the radio is down before the join happens, so
+ * the outcome shows on the panel rather than on the phone. Left as a gap so the
+ * codes stay stable across versions. */
 #define ERR_INTERNAL    4
+#define ERR_NO_RESCAN   5   /* not enough headroom to restart Wi-Fi */
 
 /* DATA is read as one attribute; ATT caps an attribute at 512 bytes, and the
  * seal costs NONCE_LEN + TAG_LEN on top of the plaintext. */
 #define DATA_CAP        512
 #define DATA_PT_CAP     (DATA_CAP - NONCE_LEN - TAG_LEN)
 #define CMD_CAP         256
+
+/* Worst case (14 x 32-char SSIDs) only 12 entries fit one 512-byte attribute;
+ * real SSIDs are far shorter, so the snapshot holds more than will ever be
+ * sent and build_aplist() stops cleanly when it runs out of room. */
+#define AP_SNAPSHOT_MAX 16
+
+/* Long enough for the STATE notification to reach the phone before the radio
+ * goes down, short enough not to feel like a hang. */
+#define HANDOFF_LINGER_MS 1200
 
 /* ---- UUIDs -------------------------------------------------------------
  * f9a3000N-0b45-4f7e-9c2a-6d1e8b3c7a51. BLE_UUID128_INIT takes bytes
@@ -119,6 +132,24 @@ typedef struct {
     uint8_t  cmd[CMD_CAP];          /* sealed, straight off the host task    */
     uint16_t cmd_len;
 
+    /* Separate from cmd[] on purpose. The page writes SESSION and CMD back to
+     * back, both land on the host task within milliseconds, and the main loop
+     * only polls every 20 ms — so sharing one buffer meant the sealed HELLO
+     * overwrote the public key before it was ever read. The key was then never
+     * derived, the HELLO could not open, and the user was told "wrong code"
+     * while typing the right one. */
+    uint8_t  peer_pub[PUBKEY_LEN];
+
+    /* The scan list as it was when pairing began. Wi-Fi is deinitialised for
+     * the duration of a session, so there is nothing to rescan against. */
+    ble_prov_ap_t aps[AP_SNAPSHOT_MAX];
+    int      ap_count;
+    char     cur_ssid[33];
+
+    char     want_ssid[33];         /* handed back to main.c at teardown     */
+    char     want_pass[64];
+    bool     have_handoff;
+
     uint64_t tx_ctr;
     uint64_t rx_ctr;                /* highest accepted; replays are dropped */
 
@@ -133,6 +164,7 @@ static session_t *s_sess;
 
 static volatile bool  s_running;    /* stack is up, or coming up/going down  */
 static volatile bool  s_cmd_pending;
+static volatile bool  s_key_pending;
 static ble_prov_state_t s_state = BLE_PROV_OFF;
 static uint8_t  s_err;
 static uint8_t  s_data_seq;         /* bumped so the phone knows to re-read  */
@@ -142,7 +174,6 @@ static uint16_t s_state_handle;
 static uint8_t  s_own_addr_type;
 
 static int64_t  s_t_state;          /* when the current state was entered    */
-static bool     s_scan_wanted;      /* a SCAN arrived; waiting on main.c     */
 
 static void adv_start(void);
 
@@ -297,16 +328,16 @@ static bool derive_key(const uint8_t *peer_pub)
  * that sees 11 of 14 networks is still useful. */
 static void build_aplist(void)
 {
-    ble_prov_ap_t aps[16];
-    int n = ble_prov_get_aps(aps, (int)(sizeof(aps) / sizeof(aps[0])));
+    const ble_prov_ap_t *aps = s_sess->aps;
+    int n = s_sess->ap_count;
 
     uint8_t pt[DATA_PT_CAP];
     size_t  o = 0;
 
     pt[o++] = RSP_APLIST;
 
-    const char *cur = ble_prov_current_ssid();
-    size_t cur_len = cur ? strnlen(cur, 32) : 0;
+    const char *cur = s_sess->cur_ssid;
+    size_t cur_len = strnlen(cur, 32);
     pt[o++] = (uint8_t)cur_len;
     memcpy(pt + o, cur, cur_len);
     o += cur_len;
@@ -379,9 +410,8 @@ static int gatt_access(uint16_t conn, uint16_t attr,
             len != PUBKEY_LEN) {
             return BLE_ATT_ERR_INVALID_ATTR_VALUE_LEN;
         }
-        memcpy(s_sess->cmd, peer, PUBKEY_LEN);
-        s_sess->cmd_len = PUBKEY_LEN;
-        s_cmd_pending = true;            /* poll() tells them apart by state */
+        memcpy(s_sess->peer_pub, peer, PUBKEY_LEN);
+        s_key_pending = true;
         return 0;
     }
 
@@ -440,8 +470,13 @@ static int gap_event(struct ble_gap_event *ev, void *arg)
         ESP_LOGI(TAG, "phone disconnected (reason 0x%x)", ev->disconnect.reason);
         s_conn = BLE_HS_CONN_HANDLE_NONE;
         /* A session outlives one connection: a phone that drops mid-flow can
-         * come back and re-do the exchange without the user re-arming it. */
-        if (s_running && s_state != BLE_PROV_DONE) adv_start();
+         * come back and re-do the exchange without the user re-arming it.
+         * Except after a lockout — re-advertising there would hand an attacker
+         * a fresh connection to keep grinding from, which is the whole thing
+         * the attempt limit exists to stop. */
+        if (s_running && s_state != BLE_PROV_DONE && s_state != BLE_PROV_ERR) {
+            adv_start();
+        }
         break;
 
     case BLE_GAP_EVENT_ADV_COMPLETE:
@@ -516,7 +551,7 @@ static void host_task(void *param)
 
 /* ---- lifecycle --------------------------------------------------------- */
 
-bool ble_prov_start(void)
+bool ble_prov_start(const ble_prov_ap_t *aps, int n, const char *current)
 {
     if (s_running) return true;
 
@@ -530,6 +565,14 @@ bool ble_prov_start(void)
 
     uint32_t r = esp_random() % 1000000u;
     snprintf(s_sess->code, sizeof(s_sess->code), "%06u", (unsigned)r);
+
+    /* Take the scan list now; Wi-Fi is about to be, or already is, gone. */
+    if (n > AP_SNAPSHOT_MAX) n = AP_SNAPSHOT_MAX;
+    if (aps && n > 0) {
+        memcpy(s_sess->aps, aps, (size_t)n * sizeof(ble_prov_ap_t));
+        s_sess->ap_count = n;
+    }
+    if (current) snprintf(s_sess->cur_ssid, sizeof(s_sess->cur_ssid), "%s", current);
 
     mbedtls_ecp_group_init(&s_sess->grp);
     mbedtls_mpi_init(&s_sess->d);
@@ -561,7 +604,7 @@ bool ble_prov_start(void)
                                         touch flash, not after it succeeds */
     s_conn        = BLE_HS_CONN_HANDLE_NONE;
     s_cmd_pending = false;
-    s_scan_wanted = false;
+    s_key_pending = false;
     s_err         = ERR_NONE;
     s_data_seq    = 0;
 
@@ -634,7 +677,7 @@ void ble_prov_stop(void)
     }
 
     s_cmd_pending = false;
-    s_scan_wanted = false;
+    s_key_pending = false;
     s_state = BLE_PROV_OFF;
     s_running = false;               /* last: unblocks NVS only once the
                                         controller is genuinely gone */
@@ -656,21 +699,11 @@ static void handle_command(int64_t now)
     uint8_t pt[CMD_CAP];
     size_t  n = 0;
 
-    /* Before a key exists the only thing CMD/SESSION can carry is the phone's
-     * public point. */
+    /* Not the user's fault, so it must not count as a wrong-code attempt:
+     * this is a frame that arrived before key agreement completed. */
     if (!s_sess->have_key) {
-        if (s_sess->cmd_len != PUBKEY_LEN) {
-            ESP_LOGW(TAG, "unexpected %u bytes before key agreement",
-                     s_sess->cmd_len);
-            return;
-        }
-        if (derive_key(s_sess->cmd)) {
-            set_state(BLE_PROV_LINKED, now);
-        } else {
-            s_err = ERR_INTERNAL;
-            set_state(BLE_PROV_ERR, now);
-        }
-        state_notify();
+        ESP_LOGW(TAG, "command before key agreement — dropping %u bytes",
+                 s_sess->cmd_len);
         return;
     }
 
@@ -683,7 +716,16 @@ static void handle_command(int64_t now)
                         ? ERR_LOCKED_OUT : ERR_BAD_CODE;
             ESP_LOGW(TAG, "bad code (attempt %d)", s_sess->auth_attempts);
             if (s_sess->auth_attempts >= MAX_AUTH_ATTEMPTS) {
+                /* Six digits is only 10^6 — trivial to grind over a radio link
+                 * if guessing is free. The limit is what makes the code worth
+                 * anything, so it ends the SESSION rather than just refusing
+                 * the frame: stop advertising here, and gap_event() will not
+                 * re-arm it on the disconnect that follows. Getting back in
+                 * needs a physical press of PAIR and a fresh code. */
                 set_state(BLE_PROV_ERR, now);
+                ble_gap_adv_stop();
+                ESP_LOGW(TAG, "locked out after %d attempts — session closing",
+                         MAX_AUTH_ATTEMPTS);
             }
         } else {
             ESP_LOGW(TAG, "dropping an unopenable frame");
@@ -714,9 +756,12 @@ static void handle_command(int64_t now)
 
     switch (op) {
     case CMD_SCAN:
-        ESP_LOGI(TAG, "scan requested");
-        s_scan_wanted = true;
-        ble_prov_request_scan();
+        /* Serves the snapshot taken at start(). There is no live rescan: Wi-Fi
+         * is deinitialised for the whole session so there is nothing to scan
+         * with. Harmless to call repeatedly — the phone uses it to re-read the
+         * list after a reconnect. */
+        ESP_LOGI(TAG, "list requested (%d networks in snapshot)", s_sess->ap_count);
+        build_aplist();
         break;
 
     case CMD_JOIN: {
@@ -733,21 +778,46 @@ static void handle_command(int64_t now)
         memcpy(pass, pt + 3 + sl, pl);   pass[pl] = '\0';
 
         ESP_LOGI(TAG, "join requested for a %u-char ssid", (unsigned)sl);
-        set_state(BLE_PROV_JOINING, now);
-        state_notify();
-        ble_prov_submit(ssid, pass);
+        /* Stash and close. The join itself cannot happen while the radio is up,
+         * so poll() notifies the phone, lingers long enough for that to land,
+         * then hands off and tears BLE down. */
+        snprintf(s_sess->want_ssid, sizeof(s_sess->want_ssid), "%s", ssid);
+        snprintf(s_sess->want_pass, sizeof(s_sess->want_pass), "%s", pass);
+        s_sess->have_handoff = true;
+        set_state(BLE_PROV_HANDOFF, now);
         memset(pass, 0, sizeof(pass));
         break;
     }
 
     case CMD_WIFI_OFF:
+        /* An empty SSID is the agreed "stay off" hand-off. */
         ESP_LOGI(TAG, "disconnect requested");
-        ble_prov_request_wifi_off();
+        s_sess->want_ssid[0] = '\0';
+        s_sess->want_pass[0] = '\0';
+        s_sess->have_handoff = true;
+        set_state(BLE_PROV_HANDOFF, now);
         break;
 
     case CMD_BYE:
         set_state(BLE_PROV_DONE, now);
         break;
+
+    case CMD_RESCAN: {
+        /* Blocks the main loop for a few seconds: Wi-Fi has to be brought up,
+         * scanned with, and taken down again. Well inside the 30 s task WDT,
+         * and the link survives because NimBLE runs on its own task. */
+        ESP_LOGI(TAG, "rescan requested");
+        int n = ble_prov_rescan(s_sess->aps, AP_SNAPSHOT_MAX);
+        if (n < 0) {
+            s_err = ERR_NO_RESCAN;
+            ESP_LOGW(TAG, "rescan refused — not enough free internal memory");
+        } else {
+            s_sess->ap_count = n;
+            s_err = ERR_NONE;
+            build_aplist();     /* bumps data_seq, so the phone re-reads */
+        }
+        break;
+    }
 
     default:
         ESP_LOGW(TAG, "unknown command 0x%02x", op);
@@ -765,8 +835,27 @@ void ble_prov_poll(int64_t now)
     if (!s_running) return;
     if (s_t_state == 0) s_t_state = now;
 
+    /* Key agreement before commands, always, and both in the same pass: the
+     * two writes arrive together and the HELLO is meaningless until the key
+     * exists. Ordering this the other way is what made pairing fail. */
+    if (s_key_pending) {
+        s_key_pending = false;
+        if (derive_key(s_sess->peer_pub)) {
+            set_state(BLE_PROV_LINKED, now);
+        } else {
+            s_err = ERR_INTERNAL;
+            set_state(BLE_PROV_ERR, now);
+        }
+        state_notify();
+    }
+
     if (s_cmd_pending) {
         s_cmd_pending = false;
+        /* Any command is activity. Without this the idle timeout counts from
+         * when AUTHED was entered and never restarts, so a session dies mid-use
+         * while the user is reading the list or typing a password — and the
+         * phone just goes quiet with no explanation. */
+        s_t_state = now;
         handle_command(now);
     }
 
@@ -795,6 +884,23 @@ void ble_prov_poll(int64_t now)
         }
         break;
 
+    case BLE_PROV_HANDOFF:
+        /* Give the STATE notification time to reach the phone, then hand the
+         * credentials over and take the radio down. main.c must wait for
+         * ble_prov_active() to go false before touching Wi-Fi. */
+        if (age > HANDOFF_LINGER_MS && s_sess && s_sess->have_handoff) {
+            char ssid[33], pass[64];
+            snprintf(ssid, sizeof(ssid), "%s", s_sess->want_ssid);
+            snprintf(pass, sizeof(pass), "%s", s_sess->want_pass);
+            s_sess->have_handoff = false;
+            set_state(BLE_PROV_DONE, now);
+            state_notify();
+            ble_prov_stop();          /* frees s_sess, hence the local copies */
+            ble_prov_submit(ssid, pass);
+            memset(pass, 0, sizeof(pass));
+        }
+        break;
+
     case BLE_PROV_DONE:
         if (age > DONE_LINGER_MS) ble_prov_stop();
         break;
@@ -806,14 +912,6 @@ void ble_prov_poll(int64_t now)
     default:
         break;
     }
-}
-
-void ble_prov_scan_ready(void)
-{
-    if (!s_running || !s_sess || !s_scan_wanted) return;
-    s_scan_wanted = false;
-    build_aplist();
-    state_notify();
 }
 
 /* ---- memory probe ------------------------------------------------------
@@ -839,7 +937,7 @@ void ble_prov_mem_probe(void)
     for (int i = 1; i <= 3; i++) {
         size_t before = heap_caps_get_free_size(PROBE_CAPS);
 
-        bool ok = ble_prov_start();
+        bool ok = ble_prov_start(NULL, 0, "");
         vTaskDelay(pdMS_TO_TICKS(1500));      /* let advertising settle      */
         size_t during = heap_caps_get_free_size(PROBE_CAPS);
         size_t during_min = heap_caps_get_minimum_free_size(PROBE_CAPS);
@@ -863,21 +961,3 @@ void ble_prov_mem_probe(void)
              (int)first_before - (int)last_after);
 }
 
-void ble_prov_join_result(bool joined)
-{
-    if (!s_running) return;
-    if (joined) {
-        s_err = ERR_NONE;
-        set_state(BLE_PROV_DONE, s_t_state);
-        s_t_state = 0;               /* re-stamped by the next poll()        */
-        ESP_LOGI(TAG, "join succeeded");
-    } else {
-        /* Stay open. Retrying a mistyped password without re-pairing is the
-         * whole reason the session survives a join attempt. */
-        s_err = ERR_JOIN_FAILED;
-        set_state(BLE_PROV_AUTHED, 0);
-        s_t_state = 0;
-        ESP_LOGI(TAG, "join failed, session stays open for a retry");
-    }
-    state_notify();
-}

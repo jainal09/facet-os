@@ -65,6 +65,7 @@
 #include "credentials.h"
 #include "hud_fonts.h"
 #include "cJSON.h"
+#include "ble_prov.h"
 
 static const char *TAG = "funnel";
 
@@ -120,7 +121,7 @@ static EventGroupHandle_t s_evt;
 /* Apps are built when opened and destroyed when closed, so only the running
  * app costs RAM. That removes the widget ceiling entirely — the cost of a
  * switch is one rebuild, not a reboot. */
-enum { APP_CONTROL = 0, APP_MUSIC, APP_POMO, APP_PET, APP_WIFI, APP_COUNT };
+enum { APP_CONTROL = 0, APP_MUSIC, APP_POMO, APP_PET, APP_COUNT };
 #define APP_DRAWER (-1)
 #define APP_LOCK   (-2)
 #define AUTO_LOCK_MS  60000     /* unlocked and idle -> lock */
@@ -147,19 +148,6 @@ static lv_obj_t *s_events_label;
 
 /* ---- setup screen ---- */
 static lv_obj_t *s_scr_setup;
-static lv_obj_t *s_setup_title;
-static lv_obj_t *s_ap_list;
-static lv_obj_t *s_rescan_btn;
-static lv_obj_t *s_pw_panel;
-static lv_obj_t *s_pw_ssid_label;
-static lv_obj_t *s_pw_ta;
-static lv_obj_t *s_keyboard;
-static lv_obj_t *s_wifi_hdr;        /* "connected to X" banner above the list */
-static lv_obj_t *s_conn_panel;      /* details + disconnect for the joined AP */
-static lv_obj_t *s_conn_ssid;
-static lv_obj_t *s_conn_ip;
-static lv_obj_t *s_conn_btn;
-static lv_obj_t *s_conn_btn_label;
 
 /* ---- pet screen (widgets are declared with the scene, further down) ---- */
 static lv_obj_t *s_scr_pet;
@@ -182,12 +170,6 @@ static volatile bool s_pet_dirty;
 /* Wi-Fi credentials in use, and a pending change from the setup screen */
 static char s_ssid[33];
 static char s_pass[65];
-static char s_new_ssid[33];
-static char s_new_pass[65];
-static volatile bool s_req_scan;
-static volatile bool s_req_apply;
-static volatile bool s_req_wifi_off;   /* user tapped DISCONNECT  */
-static volatile bool s_req_wifi_on;    /* user tapped RECONNECT   */
 /* Set only by an explicit disconnect. Auto-reconnect must respect it, or the
  * station is back on the network a second after the user asked it not to be. */
 static bool s_wifi_disabled;
@@ -195,6 +177,20 @@ static char s_ip[16];
 static volatile int s_wifi_reason;      /* last disconnect reason, for the log */
 static int  s_wifi_tries;               /* drives the reconnect backoff */
 static bool s_wifi_diag_done;           /* one scan dump per boot when joining fails */
+
+/* BLE pairing. The radios cannot both be initialised (HARDWARE.md §7g), so a
+ * session tears the Wi-Fi driver down and rebuilds it afterwards. */
+static volatile bool s_req_ble_on;      /* CONTROL: start pairing  */
+static volatile bool s_req_ble_off;     /* CONTROL: stop pairing   */
+static bool s_wifi_torn_down;           /* driver deinitialised for a session */
+static bool s_ble_handoff;              /* credentials waiting to be applied  */
+/* Rescan brings Wi-Fi up only to look around. Without this the STA_START event
+ * immediately calls esp_wifi_connect(), and a scan cannot run while a connect
+ * is in flight — it returns zero networks, which reads as "no wi-fi in range"
+ * rather than "the radio was busy". */
+static volatile bool s_wifi_scan_only;
+static char s_ble_ssid[33];
+static char s_ble_pass[64];
 /* Credentials are not trusted until they actually work.
  *
  * A half-typed password on the on-screen keyboard used to be committed to NVS
@@ -226,8 +222,25 @@ static SemaphoreHandle_t s_log_mtx;
 static i2c_master_dev_handle_t s_axp;
 
 /* lock screen widgets */
+/* X-Art-Accent from the last download, 0 when the header was absent. Declared
+ * up here because sp_fetch_art() reads it and sits above the wallpaper code
+ * that owns the download sink. */
+static uint32_t s_dl_accent;
+
 static lv_obj_t *s_lock_time, *s_lock_date, *s_lock_batt;
 static lv_obj_t *s_lock_sweep, *s_lock_batt_arc;
+
+/* Now-playing panel on the lock screen. Hidden unless Spotify actually has an
+ * active device, so the screen stays as sparse as it was whenever there is
+ * nothing to say. s_lock_np_up is read by wall_service() on the network task: a
+ * wallpaper download and an album-art download must not overlap, because the
+ * wallpaper fetch is already the largest transient consumer of internal SRAM on
+ * this board and the margin is thinner than it has ever been. */
+static lv_obj_t *s_lock_np, *s_lock_np_art, *s_lock_np_ph, *s_lock_np_track;
+static lv_obj_t *s_lock_np_prev, *s_lock_np_play, *s_lock_np_next;
+static volatile bool s_lock_np_up;
+static uint32_t s_lock_np_bg;    /* last scrim colour, 0 = unset */
+static lv_obj_t *s_lock_rule;    /* divider under the clock; moves with it */
 static int s_sweep_deg;
 
 /* App state store + power state — defined further down, used from above */
@@ -454,6 +467,7 @@ static void pet_save(void) {
 
 static void wifi_event_handler(void *arg, esp_event_base_t base, int32_t id, void *data) {
     if (base == WIFI_EVENT && id == WIFI_EVENT_STA_START) {
+        if (s_wifi_scan_only) return;      /* scanning only; do not associate */
         esp_wifi_connect();
     } else if (base == WIFI_EVENT && id == WIFI_EVENT_STA_DISCONNECTED) {
         wifi_event_sta_disconnected_t *d = (wifi_event_sta_disconnected_t *)data;
@@ -497,27 +511,170 @@ static void wifi_apply_config(const char *ssid, const char *pass) {
     esp_wifi_set_config(WIFI_IF_STA, &wc);
 }
 
-static void wifi_init(void) {
+/* Wi-Fi comes up in two halves because the driver has to be torn down and
+ * rebuilt for a BLE pairing session — the two radios cannot both be
+ * initialised on this board (HARDWARE.md §7g). Only the driver half cycles.
+ *
+ * The once-per-boot half must never run twice: nothing here is ever
+ * deinitialised, and a second esp_netif_create_default_wifi_sta() leaks the
+ * first netif and then asserts. */
+static void wifi_init_once(void) {
     s_evt = xEventGroupCreate();
 
     ESP_ERROR_CHECK(esp_netif_init());
     ESP_ERROR_CHECK(esp_event_loop_create_default());
     esp_netif_create_default_wifi_sta();
 
-    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
-    ESP_ERROR_CHECK(esp_wifi_init(&cfg));
-
     ESP_ERROR_CHECK(esp_event_handler_instance_register(WIFI_EVENT, ESP_EVENT_ANY_ID,
                                                         &wifi_event_handler, NULL, NULL));
     ESP_ERROR_CHECK(esp_event_handler_instance_register(IP_EVENT, IP_EVENT_STA_GOT_IP,
                                                         &wifi_event_handler, NULL, NULL));
+}
+
+static esp_err_t wifi_driver_up(void) {
+    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
+    /* Not ESP_ERROR_CHECK: the rescan path calls this while BLE holds ~26 KB,
+     * where NO_MEM is a legitimate answer rather than a bug. Aborting there
+     * would turn "cannot rescan right now" into a reboot. */
+    esp_err_t err = esp_wifi_init(&cfg);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "esp_wifi_init failed (%s), wifi stays down",
+                 esp_err_to_name(err));
+        return err;
+    }
+
+    /* The default WIFI_STORAGE_FLASH mirrors every esp_wifi_set_config() into
+     * NVS, which is a flash erase. That stalls a BLE controller running from
+     * flash, and there is no auto-suspend available on this board's XMC part.
+     * Nothing reads the mirror back — creds_load() uses our own "wifi"
+     * namespace and wifi_apply_config() is called explicitly right here. */
+    esp_wifi_set_storage(WIFI_STORAGE_RAM);
 
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
     wifi_apply_config(s_ssid, s_pass);
     ESP_ERROR_CHECK(esp_wifi_start());
+    esp_wifi_set_ps(s_doze ? WIFI_PS_MAX_MODEM : WIFI_PS_MIN_MODEM);
 
-    esp_wifi_set_ps(WIFI_PS_MIN_MODEM);
-    ESP_LOGI(TAG, "WiFi connecting to \"%s\"...", s_ssid);
+    /* Reset the backoff so the rejoin after a session is immediate rather than
+     * up to 60 s late. */
+    s_wifi_tries     = 0;
+    s_wifi_diag_done = false;
+    s_wifi_torn_down = false;
+    /* ESP_LOGx needs a literal format string, so this cannot be a ternary. */
+    if (s_wifi_scan_only) ESP_LOGI(TAG, "WiFi up for a scan only");
+    else                  ESP_LOGI(TAG, "WiFi connecting to \"%s\"...", s_ssid);
+    return ESP_OK;
+}
+
+/* Frees ~53.5 KB of 8BIT|DMA|INTERNAL — the single largest block of that pool
+ * on this board. esp_wifi_stop() alone frees 96 bytes; the pools are allocated
+ * at init, so only a deinit returns them. */
+static void wifi_driver_down(void) {
+    if (s_wifi_torn_down) return;
+
+    /* Set the flag and clear s_wifi_up BEFORE deinit, never as a consequence of
+     * a disconnect event: a deinit does not reliably deliver one, so s_wifi_up
+     * would stay true with no driver underneath it. Four subsystems believe
+     * that flag — the Spotify poll, the asset fetch, and two status screens —
+     * and one of them would start a TLS handshake mid-advert. */
+    s_wifi_torn_down = true;
+    s_wifi_up        = false;
+    s_ip[0]          = '\0';
+    xEventGroupClearBits(s_evt, WIFI_CONNECTED_BIT);
+
+    esp_wifi_disconnect();
+    esp_wifi_stop();
+    esp_wifi_deinit();
+    ESP_LOGI(TAG, "wifi driver down (internal free %u)",
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_8BIT | MALLOC_CAP_DMA |
+                                               MALLOC_CAP_INTERNAL));
+}
+
+static void wifi_init(void) {
+    wifi_init_once();
+    wifi_driver_up();
+}
+
+/* The one thing ble_prov.c asks of us. Called from ble_prov_poll() immediately
+ * before the radio goes down, so it may only stash — Wi-Fi must not be touched
+ * until ble_prov_active() reads false. The main loop does the rest. */
+/* Defined below with the other Wi-Fi primitives; C needs it before use and
+ * moving the rescan callback down would separate it from wifi_driver_up/down,
+ * which is where it belongs. */
+static void wifi_scan_now(void);
+
+/* Wi-Fi's pools are ~53.5 KB and a live BLE session leaves ~41 KB, so this
+ * normally refuses. The check is on the REAL number at the moment of asking
+ * rather than a compile-time assumption, which means it starts working by
+ * itself if the Wi-Fi buffer counts are ever trimmed. */
+/* Derived from the buffer counts rather than hardcoded, so it follows any
+ * future trim of ESP_WIFI_STATIC_*_BUFFER_NUM without anyone remembering to
+ * revisit it — the day those come down, this starts succeeding on its own.
+ *
+ * The earlier constant was wrong in an instructive way: it came from what
+ * esp_wifi_deinit() *frees* (~53.5 KB) on a device that has been associated and
+ * running, which is an upper bound including buffers accumulated at runtime.
+ * What init actually needs up front is the static pools plus the driver task:
+ * 8 static RX + 16 static TX at ~1.6 KB each is 38.4 KB, plus a 6,656-byte task
+ * stack — about 45 KB. Measuring the wrong end of the lifecycle overstated the
+ * gap by three times. */
+#define WIFI_STATIC_BUFS ((CONFIG_ESP_WIFI_STATIC_RX_BUFFER_NUM + \
+                           CONFIG_ESP_WIFI_STATIC_TX_BUFFER_NUM) * 1600u)
+/* Overhead beyond the static pools, MEASURED rather than estimated: a rescan
+ * at 8+8 buffers took free from 42,503 to 2,156, i.e. 40,347 total against
+ * 25,600 of static pools — so ~14.7 KB of driver task stack, management short
+ * buffers, dynamic RX and descriptors. An earlier 8 KB guess let the gate pass
+ * with ~1.5 KB to spare, which is the razor-thin condition this project has
+ * twice been burned by. */
+#define WIFI_INIT_OVERHEAD (15u * 1024u)
+#define WIFI_INIT_NEED     (WIFI_STATIC_BUFS + WIFI_INIT_OVERHEAD)
+/* Below this much slack the rescan is technically possible and not worth doing:
+ * anything else allocating during the ~5 s window would fail. */
+#define WIFI_RESCAN_MARGIN (8u * 1024u)
+
+int ble_prov_rescan(ble_prov_ap_t *out, int max) {
+    const uint32_t need = WIFI_INIT_NEED;
+    uint32_t have = hp_free();
+    if (have < need) {
+        ESP_LOGW(TAG, "rescan refused: %u free, need ~%u (short by %u)",
+                 (unsigned)have, (unsigned)need, (unsigned)(need - have));
+        return -1;
+    }
+    if (have - need < WIFI_RESCAN_MARGIN) {
+        /* Loud on purpose. It will work, and it will keep working right up
+         * until something else allocates during the window. Trim
+         * ESP_WIFI_STATIC_TX_BUFFER_NUM further to buy margin. */
+        ESP_LOGW(TAG, "rescan margin THIN: %u free, need ~%u, only %u spare",
+                 (unsigned)have, (unsigned)need, (unsigned)(have - need));
+    }
+
+    ESP_LOGI(TAG, "rescan: bringing wifi up beside BLE (%u free)", (unsigned)have);
+    s_wifi_scan_only = true;
+    esp_err_t err = wifi_driver_up();
+    if (err == ESP_OK) {
+        /* Let the driver finish starting. esp_wifi_start() returns before the
+         * radio is ready and an immediate scan comes back empty. */
+        vTaskDelay(pdMS_TO_TICKS(300));
+        wifi_scan_now();
+    }
+    wifi_driver_down();
+    s_wifi_scan_only = false;
+    if (err != ESP_OK) return -1;
+
+    int n = (s_ap_count < max) ? s_ap_count : max;
+    for (int i = 0; i < n; i++) {
+        snprintf(out[i].ssid, sizeof(out[i].ssid), "%.32s", s_aps[i].ssid);
+        out[i].rssi   = s_aps[i].rssi;
+        out[i].secure = s_aps[i].secure;
+    }
+    ESP_LOGI(TAG, "rescan found %d networks", n);
+    return n;
+}
+
+void ble_prov_submit(const char *ssid, const char *pass) {
+    snprintf(s_ble_ssid, sizeof(s_ble_ssid), "%.32s", ssid);
+    snprintf(s_ble_pass, sizeof(s_ble_pass), "%.63s", pass);
+    s_ble_handoff = true;
 }
 
 /* Blocking scan — runs on the main task, never in the LVGL task */
@@ -902,6 +1059,11 @@ static void rotation_apply(int r) {
 }
 
 static void rot_off_save(void) {
+    /* Called straight from a UI callback, so it needs its own guard: an NVS
+     * commit is a flash erase and the BLE controller runs from flash. The
+     * calibration stays in RAM and is written on the next change after the
+     * session ends. */
+    if (ble_prov_nvs_blocked()) return;
     nvs_handle_t h;
     if (nvs_open("cfg", NVS_READWRITE, &h) == ESP_OK) {
         nvs_set_i32(h, "rotcfg", s_rot_cfg);
@@ -971,12 +1133,18 @@ static void imu_poll(void) {
 
 /* ---------------- GPIO keys with short/long press ---------------- */
 
-typedef enum { BTN_NONE = 0, BTN_SHORT, BTN_LONG } btn_ev_t;
+/* BTN_REPEAT fires over and over while a key stays down, after the long press.
+ * Only MUSIC's volume keys want it; every other consumer tests for BTN_SHORT or
+ * BTN_LONG specifically and so ignores repeats without needing to know they
+ * exist. */
+typedef enum { BTN_NONE = 0, BTN_SHORT, BTN_LONG, BTN_REPEAT } btn_ev_t;
+
+#define BTN_REPEAT_MS 130
 
 typedef struct {
     gpio_num_t pin;
     int stable, last_raw;
-    int64_t change_ms, press_ms;
+    int64_t change_ms, press_ms, repeat_ms;
     bool long_fired;
 } btn_t;
 
@@ -1013,15 +1181,26 @@ static btn_ev_t btn_poll(btn_t *b, int64_t t) {
         if (raw == 0) {                                   /* pressed */
             b->press_ms = t;
             b->long_fired = false;
+            b->repeat_ms = 0;
         } else if (!b->long_fired) {                      /* released, short */
             return BTN_SHORT;
         }
         return BTN_NONE;
     }
-    /* fire the long press while still held, so it feels immediate */
-    if (b->stable == 0 && !b->long_fired && (t - b->press_ms) >= LONG_PRESS_MS) {
-        b->long_fired = true;
-        return BTN_LONG;
+    if (b->stable == 0) {
+        /* fire the long press while still held, so it feels immediate */
+        if (!b->long_fired && (t - b->press_ms) >= LONG_PRESS_MS) {
+            b->long_fired = true;
+            b->repeat_ms = t;
+            return BTN_LONG;
+        }
+        /* then keep firing while it stays down. repeat_ms stays zero after
+         * btn_swallow(), so a key already held at wake-up does not auto-repeat
+         * its way through a volume ramp the moment the screen lights up. */
+        if (b->long_fired && b->repeat_ms && (t - b->repeat_ms) >= BTN_REPEAT_MS) {
+            b->repeat_ms = t;
+            return BTN_REPEAT;
+        }
     }
     return BTN_NONE;
 }
@@ -1030,11 +1209,23 @@ static btn_ev_t btn_poll(btn_t *b, int64_t t) {
 
 static void screen_toggle_power(void) {
     s_screen_on = !s_screen_on;
+
+    /* The backlight calls are panel IO, not a GPIO: bsp_display_backlight_off()
+     * writes panel command 0x51 over the same QSPI device the LVGL task flushes
+     * on (§7b). Driving that from this task unlocked is pitfall #13, and it
+     * deadlocked a board — the LVGL task blocked forever in
+     * spi_device_acquire_bus() inside panel_io_spi_tx_param() while holding the
+     * LVGL lock, so every other ui_lock() then timed out and the UI froze while
+     * the main loop kept running and logging.
+     *
+     * power_set_doze() already took the lock for its own panel command; these
+     * two were missed. Locked separately rather than around the whole function,
+     * because bsp_display_lock() is not recursive. */
     if (s_screen_on) {
         power_set_doze(false);
-        bsp_display_backlight_on();
+        if (ui_lock()) { bsp_display_backlight_on();  bsp_display_unlock(); }
     } else {
-        bsp_display_backlight_off();
+        if (ui_lock()) { bsp_display_backlight_off(); bsp_display_unlock(); }
         power_set_doze(true);
     }
     ESP_LOGI(TAG, "screen %s", s_screen_on ? "ON" : "OFF");
@@ -1518,8 +1709,12 @@ static void act_play_cb(lv_event_t *e) { pet_play(); }
 static void act_rest_cb(lv_event_t *e) { pet_rest(); }
 
 /* swipe down on a sub-screen returns home */
+/* Swipe UP from the bottom edge, like a phone. LV_DIR_TOP is the direction the
+ * finger travelled, not the edge it started from. Shared by every app screen, so
+ * home is one gesture everywhere — and in MUSIC, where all three keys are
+ * rebound to volume, it is the only way home. */
 static void gesture_home_cb(lv_event_t *e) {
-    if (lv_indev_get_gesture_dir(lv_indev_active()) == LV_DIR_BOTTOM) {
+    if (lv_indev_get_gesture_dir(lv_indev_active()) == LV_DIR_TOP) {
         app_request(APP_DRAWER);
     }
 }
@@ -1941,6 +2136,9 @@ static lv_obj_t *s_cfg_rot_val;
 static lv_obj_t *s_cfg_vol_val;
 static lv_obj_t *s_cfg_batt_bar, *s_cfg_batt_val, *s_cfg_batt_sub;
 static lv_obj_t *s_cfg_net_val;
+static lv_obj_t *s_cfg_ble_val;
+static lv_obj_t *s_cfg_ble_code;
+static lv_obj_t *s_cfg_ble_btn;
 static lv_obj_t *s_cfg_sys_val;
 static lv_obj_t *s_cfg_log;
 
@@ -2006,6 +2204,13 @@ static lv_obj_t *cfg_button(lv_obj_t *card, const char *text, uint32_t accent,
 
 static void cfg_fetch_cb(lv_event_t *e) {
     s_req_wallpaper = true;          /* the network task breaks its wait on this */
+}
+
+static void cfg_ble_cb(lv_event_t *e) {
+    /* Flags only. Starting a session tears the Wi-Fi driver down, which is
+     * far too much to do inside an LVGL callback. */
+    if (ble_prov_active()) s_req_ble_off = true;
+    else                   s_req_ble_on  = true;
 }
 
 static void cfg_rotate_cb(lv_event_t *e) {
@@ -2134,6 +2339,50 @@ static void cfg_timer_cb(lv_timer_t *t) {
                               s_doze ? "dozing" : "active");
     }
 
+    /* ---- pair ----
+     * Written only when something actually changed. Rewriting a label inside an
+     * LV_SIZE_CONTENT flex card re-lays out the whole scrolling column and
+     * invalidates it; at 400 ms that is a continuous stream of flushes for a
+     * card whose text is static almost all the time (§5). Continuous flushes
+     * are also what widens the window on the panel-IO race in pitfall #13. */
+    if (s_cfg_ble_val) {
+        /* ASCII only — hud_text_18 carries 0x20-0x7F and nothing else, so a
+         * typographic character would render as an empty box. */
+        static const char *ble_st[] = {
+            "idle", "waiting for phone", "phone connected", "ready",
+            "credentials taken", "closing", "error",
+        };
+        static int  last_key = -1;
+        bool act = ble_prov_active();
+        int  key = act ? (100 + (int)ble_prov_state())
+                       : (s_wifi_torn_down ? 1 : s_wifi_up ? 2 : 3);
+
+        if (key != last_key) {
+            last_key = key;
+            if (act) {
+                ble_prov_state_t st = ble_prov_state();
+                lv_label_set_text(s_cfg_ble_val,
+                                  st <= BLE_PROV_ERR ? ble_st[st] : "idle");
+                lv_obj_remove_flag(s_cfg_ble_code, LV_OBJ_FLAG_HIDDEN);
+                lv_label_set_text(lv_obj_get_child(s_cfg_ble_btn, 0),
+                                  LV_SYMBOL_CLOSE "  Stop pairing");
+            } else {
+                /* The join happens after the radio is down, so this card is
+                 * where the result shows — the phone cannot be told. */
+                lv_label_set_text(s_cfg_ble_val,
+                                  s_wifi_torn_down ? "restoring wi-fi" :
+                                  s_wifi_up        ? "wi-fi connected"
+                                                   : "pair to set up wi-fi");
+                lv_obj_add_flag(s_cfg_ble_code, LV_OBJ_FLAG_HIDDEN);
+                lv_label_set_text(lv_obj_get_child(s_cfg_ble_btn, 0),
+                                  LV_SYMBOL_BLUETOOTH "  Pair with phone");
+            }
+        }
+        /* The code itself changes only per session, but it is cheap to keep in
+         * step and it must be right the moment the card is built. */
+        if (act) lv_label_set_text_fmt(s_cfg_ble_code, "CODE  %s", ble_prov_code());
+    }
+
     /* ---- network ---- */
     wifi_ap_record_t ap;
     int rssi = (esp_wifi_sta_get_ap_info(&ap) == ESP_OK) ? ap.rssi : 0;
@@ -2245,6 +2494,18 @@ static void build_control_app(lv_obj_t *scr) {
     lv_obj_set_style_bg_color(s_cfg_batt_bar, lv_color_hex(0x1E293B), 0);
     s_cfg_batt_sub = cfg_text(c, 0x64748B);
 
+    /* ---- pair ---- */
+    /* Directly above NETWORK: pairing is what you reach for when the readout
+     * below it says "offline". */
+    c = cfg_card(col, "PAIR", CFG_ACCENT_NET);
+    s_cfg_ble_val  = cfg_text(c, 0xC7D2E0);
+    s_cfg_ble_code = cfg_text(c, 0x60A5FA);
+    lv_obj_set_style_text_font(s_cfg_ble_code, &hud_text_18, 0);
+    lv_obj_set_style_text_letter_space(s_cfg_ble_code, 4, 0);
+    lv_obj_add_flag(s_cfg_ble_code, LV_OBJ_FLAG_HIDDEN);
+    s_cfg_ble_btn = cfg_button(c, LV_SYMBOL_BLUETOOTH "  Pair with phone",
+                               CFG_ACCENT_NET, cfg_ble_cb);
+
     /* ---- network ---- */
     c = cfg_card(col, "NETWORK", CFG_ACCENT_NET);
     s_cfg_net_val = cfg_text(c, 0xC7D2E0);
@@ -2258,284 +2519,6 @@ static void build_control_app(lv_obj_t *scr) {
     s_app_timer = lv_timer_create(cfg_timer_cb, 400, NULL);
     cfg_timer_cb(NULL);
 }
-
-/* ---------------- setup screen ---------------- */
-
-/* true when this SSID is the one the station is actually associated with */
-static bool wifi_is_current(const char *ssid) {
-    return s_wifi_up && s_ssid[0] && strcmp(ssid, s_ssid) == 0;
-}
-
-/* The banner above the list. Which network you are on is the first thing this
- * screen should answer, and it used to not answer it at all. */
-static void wifi_hdr_refresh(void) {
-    if (!s_wifi_hdr) return;
-    if (s_wifi_up) {
-        lv_obj_set_style_text_color(s_wifi_hdr, lv_color_hex(0x35C759), 0);
-        lv_label_set_text_fmt(s_wifi_hdr, LV_SYMBOL_OK " %.24s", s_ssid);
-    } else if (s_wifi_disabled) {
-        lv_obj_set_style_text_color(s_wifi_hdr, lv_color_hex(0xFF453A), 0);
-        lv_label_set_text(s_wifi_hdr, "Wi-Fi off");
-    } else {
-        lv_obj_set_style_text_color(s_wifi_hdr, lv_color_hex(0x8A8AA0), 0);
-        lv_label_set_text(s_wifi_hdr, "Not connected");
-    }
-}
-
-static void show_list_mode(void) {
-    lv_label_set_text(s_setup_title, "Select Wi-Fi");
-    wifi_hdr_refresh();
-    lv_obj_remove_flag(s_wifi_hdr, LV_OBJ_FLAG_HIDDEN);
-    lv_obj_remove_flag(s_ap_list, LV_OBJ_FLAG_HIDDEN);
-    lv_obj_remove_flag(s_rescan_btn, LV_OBJ_FLAG_HIDDEN);
-    lv_obj_add_flag(s_pw_panel, LV_OBJ_FLAG_HIDDEN);
-    lv_obj_add_flag(s_keyboard, LV_OBJ_FLAG_HIDDEN);
-    lv_obj_add_flag(s_conn_panel, LV_OBJ_FLAG_HIDDEN);
-}
-
-static void show_password_mode(const char *ssid) {
-    lv_label_set_text(s_setup_title, "Password");
-    lv_label_set_text(s_pw_ssid_label, ssid);
-    lv_textarea_set_text(s_pw_ta, "");
-    lv_obj_add_flag(s_wifi_hdr, LV_OBJ_FLAG_HIDDEN);
-    lv_obj_add_flag(s_ap_list, LV_OBJ_FLAG_HIDDEN);
-    lv_obj_add_flag(s_rescan_btn, LV_OBJ_FLAG_HIDDEN);
-    lv_obj_add_flag(s_conn_panel, LV_OBJ_FLAG_HIDDEN);
-    lv_obj_remove_flag(s_pw_panel, LV_OBJ_FLAG_HIDDEN);
-    lv_obj_remove_flag(s_keyboard, LV_OBJ_FLAG_HIDDEN);
-    lv_keyboard_set_textarea(s_keyboard, s_pw_ta);
-}
-
-/* Tapping the network you are already on has no business opening a keyboard —
- * you are not entering a password for it. Show what it is and offer the one
- * action that makes sense. */
-static void show_conn_mode(const char *ssid) {
-    lv_label_set_text(s_setup_title, "Connected");
-    lv_label_set_text_fmt(s_conn_ssid, "%.28s", ssid);
-    lv_label_set_text_fmt(s_conn_ip, "%s", s_ip[0] ? s_ip : "no address");
-
-    bool on = s_wifi_up;
-    lv_label_set_text(s_conn_btn_label, on ? LV_SYMBOL_CLOSE "  Disconnect"
-                                           : LV_SYMBOL_WIFI  "  Reconnect");
-    lv_obj_set_style_bg_color(s_conn_btn,
-        lv_color_hex(on ? 0x7A1F26 : 0x1F5A46), 0);
-
-    lv_obj_add_flag(s_wifi_hdr, LV_OBJ_FLAG_HIDDEN);
-    lv_obj_add_flag(s_ap_list, LV_OBJ_FLAG_HIDDEN);
-    lv_obj_add_flag(s_rescan_btn, LV_OBJ_FLAG_HIDDEN);
-    lv_obj_add_flag(s_pw_panel, LV_OBJ_FLAG_HIDDEN);
-    lv_obj_add_flag(s_keyboard, LV_OBJ_FLAG_HIDDEN);
-    lv_obj_remove_flag(s_conn_panel, LV_OBJ_FLAG_HIDDEN);
-}
-
-static void conn_btn_cb(lv_event_t *e) {
-    /* deferred to the main task, like every other side effect here */
-    if (s_wifi_up) s_req_wifi_off = true;
-    else           s_req_wifi_on  = true;
-    show_list_mode();
-}
-
-static void ap_click_cb(lv_event_t *e) {
-    lv_obj_t *btn = lv_event_get_target(e);
-    int idx = (int)(intptr_t)lv_obj_get_user_data(btn);
-    if (idx < 0 || idx >= s_ap_count) return;
-
-    if (wifi_is_current(s_aps[idx].ssid)) {
-        show_conn_mode(s_aps[idx].ssid);
-        return;
-    }
-
-    snprintf(s_new_ssid, sizeof(s_new_ssid), "%s", s_aps[idx].ssid);
-    if (!s_aps[idx].secure) {
-        s_new_pass[0] = '\0';
-        s_req_apply = true;
-        app_request(APP_DRAWER);
-        return;
-    }
-    show_password_mode(s_new_ssid);
-}
-
-static void kb_event_cb(lv_event_t *e) {
-    lv_event_code_t code = lv_event_get_code(e);
-    if (code == LV_EVENT_READY) {
-        snprintf(s_new_pass, sizeof(s_new_pass), "%s", lv_textarea_get_text(s_pw_ta));
-        s_req_apply = true;
-        app_request(APP_DRAWER);
-    } else if (code == LV_EVENT_CANCEL) {
-        show_list_mode();
-    }
-}
-
-/* The disconnect is handled by the main task, so the UI only learns it worked a
- * moment later. Poll so the banner and the button follow reality. */
-static void wifi_timer_cb(lv_timer_t *t) {
-    if (!s_wifi_hdr || !s_conn_btn_label) return;
-    if (!lv_obj_has_flag(s_wifi_hdr, LV_OBJ_FLAG_HIDDEN)) {
-        wifi_hdr_refresh();
-    } else if (!lv_obj_has_flag(s_conn_panel, LV_OBJ_FLAG_HIDDEN)) {
-        bool on = s_wifi_up;
-        lv_label_set_text(s_conn_btn_label, on ? LV_SYMBOL_CLOSE "  Disconnect"
-                                               : LV_SYMBOL_WIFI  "  Reconnect");
-        lv_obj_set_style_bg_color(s_conn_btn,
-            lv_color_hex(on ? 0x7A1F26 : 0x1F5A46), 0);
-        lv_label_set_text(s_conn_ip, s_ip[0] ? s_ip : "no address");
-    }
-}
-
-static void rescan_cb(lv_event_t *e) {
-    lv_obj_clean(s_ap_list);
-    lv_label_set_text(s_setup_title, "Scanning...");
-    s_req_scan = true;
-}
-
-static void build_wifi_app(lv_obj_t *scr) {
-    s_scr_setup = scr;
-    lv_obj_set_style_bg_color(s_scr_setup, lv_color_hex(0x0B0B14), 0);
-    lv_obj_remove_flag(s_scr_setup, LV_OBJ_FLAG_SCROLLABLE);
-
-    s_setup_title = lv_label_create(s_scr_setup);
-    lv_obj_set_style_text_color(s_setup_title, lv_color_hex(0xE6E6EE), 0);
-    lv_label_set_text(s_setup_title, "Scanning...");
-    lv_obj_align(s_setup_title, LV_ALIGN_TOP_MID, 0, TOP_MARGIN + 4);
-
-    s_wifi_hdr = lv_label_create(s_scr_setup);
-    lv_obj_set_width(s_wifi_hdr, CONTENT_W);
-    lv_obj_set_style_text_align(s_wifi_hdr, LV_TEXT_ALIGN_CENTER, 0);
-    lv_label_set_long_mode(s_wifi_hdr, LV_LABEL_LONG_DOT);
-    lv_obj_align(s_wifi_hdr, LV_ALIGN_TOP_MID, 0, TOP_MARGIN + 34);
-    lv_label_set_text(s_wifi_hdr, "");
-
-    s_ap_list = lv_list_create(s_scr_setup);
-    lv_obj_set_size(s_ap_list, CONTENT_W, 264);
-    lv_obj_align(s_ap_list, LV_ALIGN_TOP_MID, 0, 96);
-    lv_obj_set_style_bg_color(s_ap_list, lv_color_hex(0x14141F), 0);
-    lv_obj_set_style_border_width(s_ap_list, 0, 0);
-    lv_obj_set_style_radius(s_ap_list, 16, 0);
-    lv_obj_set_style_pad_all(s_ap_list, 6, 0);
-
-    s_rescan_btn = lv_button_create(s_scr_setup);
-    lv_obj_set_size(s_rescan_btn, 150, 42);
-    lv_obj_align(s_rescan_btn, LV_ALIGN_BOTTOM_MID, 0, -BOTTOM_MARGIN);
-    lv_obj_set_style_bg_color(s_rescan_btn, lv_color_hex(0x24243A), 0);
-    lv_obj_add_event_cb(s_rescan_btn, rescan_cb, LV_EVENT_CLICKED, NULL);
-    lv_obj_t *rl = lv_label_create(s_rescan_btn);
-    lv_label_set_text(rl, LV_SYMBOL_REFRESH " Rescan");
-    lv_obj_center(rl);
-
-    s_pw_panel = lv_obj_create(s_scr_setup);
-    lv_obj_remove_style_all(s_pw_panel);
-    lv_obj_set_size(s_pw_panel, CONTENT_W, 110);
-    lv_obj_align(s_pw_panel, LV_ALIGN_TOP_MID, 0, 74);
-    lv_obj_remove_flag(s_pw_panel, LV_OBJ_FLAG_SCROLLABLE);
-
-    s_pw_ssid_label = lv_label_create(s_pw_panel);
-    lv_obj_set_width(s_pw_ssid_label, CONTENT_W);
-    lv_obj_set_style_text_align(s_pw_ssid_label, LV_TEXT_ALIGN_CENTER, 0);
-    lv_obj_set_style_text_color(s_pw_ssid_label, lv_color_hex(0x8A8AA0), 0);
-    lv_label_set_long_mode(s_pw_ssid_label, LV_LABEL_LONG_DOT);
-    lv_label_set_text(s_pw_ssid_label, "");
-    lv_obj_align(s_pw_ssid_label, LV_ALIGN_TOP_MID, 0, 0);
-
-    s_pw_ta = lv_textarea_create(s_pw_panel);
-    lv_obj_set_size(s_pw_ta, 320, 48);
-    lv_obj_align(s_pw_ta, LV_ALIGN_TOP_MID, 0, 30);
-    lv_textarea_set_one_line(s_pw_ta, true);
-    lv_textarea_set_password_mode(s_pw_ta, true);
-    lv_textarea_set_placeholder_text(s_pw_ta, "password");
-    lv_obj_set_style_bg_color(s_pw_ta, lv_color_hex(0x14141F), 0);
-    lv_obj_set_style_border_color(s_pw_ta, lv_color_hex(0x38B2AC), LV_PART_MAIN);
-
-    s_conn_panel = lv_obj_create(s_scr_setup);
-    lv_obj_remove_style_all(s_conn_panel);
-    lv_obj_set_size(s_conn_panel, CONTENT_W, 250);
-    lv_obj_align(s_conn_panel, LV_ALIGN_TOP_MID, 0, 104);
-    lv_obj_remove_flag(s_conn_panel, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_set_style_bg_color(s_conn_panel, lv_color_hex(0x14141F), 0);
-    lv_obj_set_style_bg_opa(s_conn_panel, LV_OPA_COVER, 0);
-    lv_obj_set_style_radius(s_conn_panel, 16, 0);
-    lv_obj_set_style_pad_all(s_conn_panel, 14, 0);
-
-    lv_obj_t *ct = lv_label_create(s_conn_panel);
-    lv_obj_set_style_text_color(ct, lv_color_hex(0x35C759), 0);
-    lv_label_set_text(ct, LV_SYMBOL_OK "  CONNECTED TO");
-    lv_obj_align(ct, LV_ALIGN_TOP_MID, 0, 4);
-
-    s_conn_ssid = lv_label_create(s_conn_panel);
-    lv_obj_set_width(s_conn_ssid, CONTENT_W - 36);
-    lv_obj_set_style_text_align(s_conn_ssid, LV_TEXT_ALIGN_CENTER, 0);
-    lv_obj_set_style_text_color(s_conn_ssid, lv_color_hex(0xE6E6EE), 0);
-    lv_obj_set_style_text_font(s_conn_ssid, &lv_font_montserrat_20, 0);
-    lv_label_set_long_mode(s_conn_ssid, LV_LABEL_LONG_DOT);
-    lv_label_set_text(s_conn_ssid, "");
-    lv_obj_align(s_conn_ssid, LV_ALIGN_TOP_MID, 0, 36);
-
-    s_conn_ip = lv_label_create(s_conn_panel);
-    lv_obj_set_width(s_conn_ip, CONTENT_W - 36);
-    lv_obj_set_style_text_align(s_conn_ip, LV_TEXT_ALIGN_CENTER, 0);
-    lv_obj_set_style_text_color(s_conn_ip, lv_color_hex(0x8A8AA0), 0);
-    lv_label_set_text(s_conn_ip, "");
-    lv_obj_align(s_conn_ip, LV_ALIGN_TOP_MID, 0, 74);
-
-    s_conn_btn = lv_button_create(s_conn_panel);
-    lv_obj_set_size(s_conn_btn, 210, 50);
-    lv_obj_align(s_conn_btn, LV_ALIGN_BOTTOM_MID, 0, -6);
-    lv_obj_set_style_radius(s_conn_btn, 14, 0);
-    lv_obj_add_event_cb(s_conn_btn, conn_btn_cb, LV_EVENT_CLICKED, NULL);
-    s_conn_btn_label = lv_label_create(s_conn_btn);
-    lv_obj_center(s_conn_btn_label);
-    lv_label_set_text(s_conn_btn_label, "");
-
-    s_keyboard = lv_keyboard_create(s_scr_setup);
-    lv_obj_set_size(s_keyboard, KB_W, KB_H);
-    lv_obj_align(s_keyboard, LV_ALIGN_BOTTOM_MID, 0, -BOTTOM_MARGIN);
-    lv_obj_set_style_bg_color(s_keyboard, lv_color_hex(0x12121C), 0);
-    lv_obj_set_style_radius(s_keyboard, 14, 0);
-    lv_obj_set_style_pad_all(s_keyboard, 4, 0);
-    lv_keyboard_set_textarea(s_keyboard, s_pw_ta);
-    lv_obj_add_event_cb(s_keyboard, kb_event_cb, LV_EVENT_READY, NULL);
-    lv_obj_add_event_cb(s_keyboard, kb_event_cb, LV_EVENT_CANCEL, NULL);
-    lv_obj_add_event_cb(s_scr_setup, gesture_home_cb, LV_EVENT_GESTURE, NULL);
-
-    show_list_mode();
-    s_app_timer = lv_timer_create(wifi_timer_cb, 500, NULL);
-}
-
-/* caller holds the LVGL lock */
-static void setup_fill_list(void) {
-    lv_obj_clean(s_ap_list);
-    if (s_ap_count == 0) {
-        lv_label_set_text(s_setup_title, "No networks");
-        return;
-    }
-    lv_label_set_text(s_setup_title, "Select Wi-Fi");
-    wifi_hdr_refresh();
-
-    /* The joined network goes first and is marked, so it is obvious at a glance
-     * which one you are on without reading signal strengths. */
-    for (int pass = 0; pass < 2; pass++) {
-        for (int i = 0; i < s_ap_count; i++) {
-            bool cur = wifi_is_current(s_aps[i].ssid);
-            if (cur != (pass == 0)) continue;
-
-            char row[64];
-            if (cur) {
-                snprintf(row, sizeof(row), "%.32s  connected", s_aps[i].ssid);
-            } else {
-                snprintf(row, sizeof(row), "%.32s  %ddBm%s", s_aps[i].ssid,
-                         s_aps[i].rssi, s_aps[i].secure ? "" : "  open");
-            }
-            lv_obj_t *btn = lv_list_add_button(s_ap_list,
-                                               cur ? LV_SYMBOL_OK : LV_SYMBOL_WIFI,
-                                               row);
-            lv_obj_set_user_data(btn, (void *)(intptr_t)i);
-            lv_obj_add_event_cb(btn, ap_click_cb, LV_EVENT_CLICKED, NULL);
-            lv_obj_set_style_bg_color(btn, lv_color_hex(cur ? 0x14332A : 0x1C1C2B), 0);
-            lv_obj_set_style_text_color(btn,
-                lv_color_hex(cur ? 0x35C759 : 0xD8D8E4), 0);
-        }
-    }
-}
-
 
 /* ---------------- POMODORO: the cube is the interface ----------------
  *
@@ -2789,9 +2772,38 @@ static void pomo_refresh(void) {
 
 /* The only thing a tap does. Not pause, not cancel, not skip — those are the
  * cube's job (lay it flat, or hold the right key). */
+/* Pause and resume in one place, because there are now two ways to ask for it —
+ * a tap and laying the cube flat — and two copies would drift.
+ *
+ * Resuming MUST re-stamp s_pomo_tick_ms. The countdown is driven by elapsed wall
+ * time rather than by counting ticks, so without it the entire pause is charged to
+ * the session the instant it resumes. Both callers get that for free here.
+ *
+ * Guarded on the current state, so asking for a transition that does not apply is
+ * a no-op: that is what lets the tap and the gesture coexist without fighting. */
+static void pomo_set_running(bool run, const char *why) {
+    if (run && s_pomo_state == POMO_PAUSE) {
+        s_pomo_state = POMO_RUN;
+        s_pomo_tick_ms = now_ms();
+        sfx_play(SFX_RESUME);
+        ESP_LOGI(TAG, "pomodoro: resumed (%s)", why);
+    } else if (!run && s_pomo_state == POMO_RUN) {
+        s_pomo_state = POMO_PAUSE;
+        sfx_play(SFX_PAUSE);
+        ESP_LOGI(TAG, "pomodoro: paused (%s)", why);
+    }
+}
+
 static void pomo_tap_cb(lv_event_t *e) {
-    if (s_pomo_state != POMO_IDLE) return;
-    pomo_begin(pomo_top_edge(), true);
+    /* Tap starts an idle timer and toggles a live one. DONE deliberately ignores
+     * taps: the finish screen retires itself after POMO_DONE_MS, and a stray tap
+     * on it would otherwise start a whole new session by accident. */
+    switch (s_pomo_state) {
+    case POMO_IDLE:  pomo_begin(pomo_top_edge(), true); break;
+    case POMO_RUN:   pomo_set_running(false, "tap");     break;
+    case POMO_PAUSE: pomo_set_running(true,  "tap");     break;
+    default: break;
+    }
 }
 
 static void pomo_timer_cb(lv_timer_t *t) {
@@ -2895,16 +2907,10 @@ static void pomo_poll(int64_t t) {
         if (t - s_pomo_flat_since >= POMO_FLAT_MS) {
             s_pomo_flat = flat;
             s_pomo_flat_since = 0;
-            if (flat && s_pomo_state == POMO_RUN) {
-                s_pomo_state = POMO_PAUSE;
-                sfx_play(SFX_PAUSE);
-                ESP_LOGI(TAG, "pomodoro: paused (laid flat)");
-            } else if (!flat && s_pomo_state == POMO_PAUSE) {
-                s_pomo_state = POMO_RUN;
-                s_pomo_tick_ms = t;
-                sfx_play(SFX_RESUME);
-                ESP_LOGI(TAG, "pomodoro: resumed");
-            }
+            /* Flat pauses, upright resumes. The helper ignores whichever of the
+             * two does not apply, so a session already paused by tap is not
+             * disturbed by the cube being set down. */
+            pomo_set_running(!flat, flat ? "laid flat" : "upright");
         }
     } else {
         s_pomo_flat_since = 0;
@@ -2983,7 +2989,13 @@ static void pomo_poll(int64_t t) {
 #define SP_API        "https://api.spotify.com/v1"
 #define SP_TOKEN_URL  "https://accounts.spotify.com/api/token"
 #define SP_POLL_MS    3000
-#define SP_ART_PX     240
+/* The cover has to end above the track title at y262, and it starts at y110, so
+ * 148 is the whole budget. It was 240 for three commits — the Apple Watch
+ * relayout moved the labels up and never shrank the art, which drew the title,
+ * the artist and the top of the play button straight over the artwork. The fetch
+ * uses the same number: asking the broker for exactly the drawn size means no
+ * scaling and a 43 KB file instead of 115 KB. */
+#define SP_ART_PX     148
 #define SP_ART_PATH   WALL_DIR "/art.bin"
 #define SP_ART_LV     "S:" WALL_DIR "/art.bin"
 
@@ -2992,6 +3004,8 @@ typedef enum {
     SP_CMD_PLAY, SP_CMD_PAUSE, SP_CMD_NEXT, SP_CMD_PREV, SP_CMD_SHUFFLE,
     SP_CMD_DEVICES,
     SP_CMD_TRANSFER,
+    SP_CMD_VOLUME,
+    SP_CMD_LIKE,
 } sp_cmd_t;
 
 #define SP_MAX_DEV 8
@@ -3018,6 +3032,47 @@ static volatile bool s_sp_art_ready;
  * context is running, and skipping can be blocked too. Only disallowed actions
  * appear in that object, so absent means allowed. */
 static volatile bool s_sp_no_shuffle, s_sp_no_next, s_sp_no_prev;
+/* Liked state. Spotify deprecated /me/tracks/contains and /me/tracks in the
+ * February 2026 Dev Mode changes: both now answer 403 even with
+ * user-library-read granted, while /me/tracks?limit=1 on the same token still
+ * returns 200 — which reads exactly like a scope problem and is not one. The
+ * replacement is /me/library, keyed on Spotify **URIs** rather than bare ids. */
+static char s_sp_track_id[26];
+static char s_sp_liked_id[26];          /* which id s_sp_liked refers to */
+static volatile bool s_sp_liked;
+static volatile bool s_sp_liked_known;
+
+/* Volume. s_sp_vol is what the UI shows and what the keys move: stepped locally
+ * so the bar tracks the finger. s_sp_vol_sent is the last value Spotify accepted,
+ * so the two being unequal *is* the "one PUT owed" flag — no separate request
+ * slot to lose. A held key therefore costs a trickle of requests rather than one
+ * per step, and the pair can only ever converge. */
+/* Accent tint, from the broker's X-Art-Accent header on the art fetch. Spotify
+ * green is the fallback and it is what a monochrome cover keeps: the broker
+ * declines to guess rather than handing back a grey that would be
+ * indistinguishable from the UI's own chrome. */
+/* 0 means "no accent known yet". The backdrop stays black until a cover has
+ * actually supplied one — a default-tinted screen while the app is still waiting
+ * for /me/player reads as a colour chosen on purpose, which is worse than black. */
+static volatile uint32_t s_sp_accent;
+
+/* The accent is a full-strength colour, fit for a glyph but not for 480x480 of
+ * backdrop: at full value it fights white text and, on an AMOLED, every lit pixel
+ * costs power. A quarter strength reads clearly as "this album is copper" while
+ * leaving the controls and the title legible on top. Flat, never a gradient —
+ * RGB565 bands visibly on a dark ramp (HARDWARE.md 5). */
+static uint32_t accent_bg(uint32_t c) {
+    uint32_t r = ((c >> 16) & 0xFF) * 26 / 100;
+    uint32_t g = ((c >> 8) & 0xFF) * 26 / 100;
+    uint32_t b = (c & 0xFF) * 26 / 100;
+    return (r << 16) | (g << 8) | b;
+}
+
+static volatile int  s_sp_vol = -1;     /* 0..100, -1 = not read yet */
+static volatile int  s_sp_vol_sent = -1;
+static volatile bool s_sp_vol_ok;       /* device reports supports_volume */
+static int  s_sp_vol_premute = 35;      /* restore point for unmute */
+static int64_t s_sp_vol_shown;          /* when the HUD last had something to say */
 static sp_dev_t s_sp_dev[SP_MAX_DEV];
 static volatile int s_sp_devcount;
 static volatile int s_sp_transfer_idx = -1;
@@ -3212,7 +3267,7 @@ static int sp_call(esp_http_client_method_t method, const char *path, const char
 
     s_sp_len = 0;
     if (s_sp_body) s_sp_body[0] = '\0';
-    esp_http_client_perform(s_sp_http);
+    esp_err_t err = esp_http_client_perform(s_sp_http);
     int code = esp_http_client_get_status_code(s_sp_http);
 
     if (code == 401) {
@@ -3225,9 +3280,25 @@ static int sp_call(esp_http_client_method_t method, const char *path, const char
             esp_http_client_set_header(s_sp_http, "Authorization", auth);
             s_sp_len = 0;
             if (s_sp_body) s_sp_body[0] = '\0';
-            esp_http_client_perform(s_sp_http);
+            err = esp_http_client_perform(s_sp_http);
             code = esp_http_client_get_status_code(s_sp_http);
         }
+    }
+
+    /* A transport failure leaves the socket unusable, and perform() will not
+     * redial on its own — it retries the dead fd forever. Observed live: the
+     * server reset a connection mid-transfer and every 3 s poll after it logged
+     * "esp_tls_conn_read error / Socket is not connected" while the app sat
+     * frozen, with no error path anywhere near the UI. Closing here costs one
+     * 390 ms handshake on the next call and is the only way back.
+     *
+     * ESP_ERR_NOT_SUPPORTED is the Bearer-challenge return handled above, not a
+     * transport fault, so it must not trigger a redial. */
+    if (err != ESP_OK && !(err == ESP_ERR_NOT_SUPPORTED && code > 0)) {
+        ESP_LOGW(TAG, "spotify: transport error %s (HTTP %d) — redialling",
+                 esp_err_to_name(err), code);
+        esp_http_client_close(s_sp_http);
+        code = 0;
     }
     return code;
 }
@@ -3264,10 +3335,30 @@ static void sp_poll_state(void) {
     if (dev) {
         cJSON *n = cJSON_GetObjectItem(dev, "name");
         if (cJSON_IsString(n)) ascii_fold(n->valuestring, s_sp_devname, sizeof(s_sp_devname));
+
+        /* Plenty of endpoints cannot be set remotely — Echos and most Connect
+         * speakers report false — so the keys have to be able to say "no". */
+        s_sp_vol_ok = cJSON_IsTrue(cJSON_GetObjectItem(dev, "supports_volume"));
+
+        /* Adopt the server's level only when nothing local is owed. Spotify keeps
+         * reporting the pre-PUT value for a moment, so trusting it while a press
+         * is in flight makes the bar jump backwards under the finger. */
+        cJSON *vp = cJSON_GetObjectItem(dev, "volume_percent");
+        if (cJSON_IsNumber(vp) && s_sp_vol == s_sp_vol_sent) {
+            s_sp_vol = s_sp_vol_sent = vp->valueint;
+        }
     }
     if (item) {
         cJSON *n = cJSON_GetObjectItem(item, "name");
         if (cJSON_IsString(n)) ascii_fold(n->valuestring, s_sp_track, sizeof(s_sp_track));
+
+        cJSON *tid = cJSON_GetObjectItem(item, "id");
+        if (cJSON_IsString(tid)) {
+            snprintf(s_sp_track_id, sizeof(s_sp_track_id), "%s", tid->valuestring);
+            /* A stale heart is worse than no heart: it invites a tap that
+             * un-likes something. Drop it until this track is checked. */
+            if (strcmp(s_sp_track_id, s_sp_liked_id) != 0) s_sp_liked_known = false;
+        }
 
         cJSON *arts = cJSON_GetObjectItem(item, "artists");
         if (cJSON_IsArray(arts) && cJSON_GetArraySize(arts) > 0) {
@@ -3322,12 +3413,99 @@ static void sp_poll_devices(void) {
     ESP_LOGI(TAG, "spotify: %d device(s)", n);
 }
 
+/* Is the current track in Liked Songs? Needs user-library-read. Checked once per
+ * track rather than per poll — the answer only changes when we change it. */
+/* Push the level if one is owed. Nothing is cleared up front, so a press landing
+ * mid-flight cannot be dropped by a read-then-clear race: the trailing check
+ * simply notices s_sp_vol moved again and queues another round. Called on every
+ * poll too, which makes any missed command self-healing within one cycle. */
+static void sp_send(sp_cmd_t c);        /* defined with the task, below */
+
+/* The colon in a Spotify URI is legal in a query string, but %3A is what was
+ * verified against the live API, so that is what goes on the wire. */
+#define SP_URI_FMT "spotify%%3Atrack%%3A%s"
+
+static void sp_check_liked(void) {
+    if (!s_sp_track_id[0]) return;
+    if (s_sp_liked_known && strcmp(s_sp_track_id, s_sp_liked_id) == 0) return;
+
+    char path[96];
+    snprintf(path, sizeof(path), "/me/library/contains?uris=" SP_URI_FMT, s_sp_track_id);
+    int code = sp_call(HTTP_METHOD_GET, path, NULL);
+    if (code == 200 && s_sp_len > 0) {
+        s_sp_liked = (strstr(s_sp_body, "true") != NULL);   /* body is [true]/[false] */
+        snprintf(s_sp_liked_id, sizeof(s_sp_liked_id), "%s", s_sp_track_id);
+        s_sp_liked_known = true;
+    } else {
+        /* leave the heart blank rather than showing a state we cannot verify */
+        s_sp_liked_known = false;
+        ESP_LOGW(TAG, "spotify: library check failed (HTTP %d)", code);
+    }
+}
+
+static void sp_toggle_like(void) {
+    if (!s_sp_track_id[0]) return;
+    char path[96];
+    snprintf(path, sizeof(path), "/me/library?uris=" SP_URI_FMT, s_sp_track_id);
+    /* s_sp_liked already holds the optimistic target set by the tap. */
+    int code = sp_call(s_sp_liked ? HTTP_METHOD_PUT : HTTP_METHOD_DELETE, path, NULL);
+    ESP_LOGI(TAG, "spotify: %s -> HTTP %d", s_sp_liked ? "like" : "unlike", code);
+    if (code == 200 || code == 204) {
+        snprintf(s_sp_liked_id, sizeof(s_sp_liked_id), "%s", s_sp_track_id);
+        s_sp_liked_known = true;
+    } else {
+        s_sp_liked = !s_sp_liked;      /* it did not take — put the heart back */
+        s_sp_liked_known = false;
+    }
+}
+
+static void sp_push_volume(void) {
+    int v = s_sp_vol;
+    if (v < 0 || v == s_sp_vol_sent) return;      /* nothing owed */
+
+    char path[56];
+    snprintf(path, sizeof(path), "/me/player/volume?volume_percent=%d", v);
+    int code = sp_call(HTTP_METHOD_PUT, path, NULL);
+    if (code == 200 || code == 204) {
+        s_sp_vol_sent = v;
+        ESP_LOGI(TAG, "spotify: volume -> %d", v);
+    } else if (code == 403 || code == 404) {
+        /* the endpoint refuses remote volume after all — stop pretending */
+        s_sp_vol_ok = false;
+        s_sp_vol_sent = v;                        /* don't retry forever */
+        ESP_LOGW(TAG, "spotify: volume rejected (HTTP %d)", code);
+    }
+
+    /* moved again while that was in flight — chase it rather than settle short */
+    if (s_sp_vol != s_sp_vol_sent) sp_send(SP_CMD_VOLUME);
+}
+
 /* Album art, pre-decoded by the broker into LVGL's RGB565 binary format. The
  * device never decodes an image: LVGL's bin decoder reads rows straight off the
  * card per draw chunk. Reuses the wallpaper download path wholesale. */
+/* A failed art fetch used to retry on every poll, because only success recorded
+ * the URL. A truncated download therefore became a 43 KB request every 3 s —
+ * hammering the broker and holding internal SRAM near its floor for as long as
+ * the track played. Back off instead: art is decoration, and the next track
+ * clears the block anyway. */
+#define SP_ART_RETRY_MS 30000
+static int64_t s_sp_art_failed_at;
+static char s_sp_art_failed[160];
+
 static void sp_fetch_art(void) {
     if (!s_sd_ok || !s_sp_art_url[0] || BROKER_URL[0] == '\0') return;
-    if (strcmp(s_sp_art_url, s_sp_art_have) == 0) return;   /* same track */
+
+    /* Same art as the file already on the card — the next track off the same
+     * album, usually. Re-assert ready rather than returning silently: sp_art_clear()
+     * lowers the flag on every track change, and without this the placeholder
+     * would stay up forever for anything that does not need a new download. */
+    if (strcmp(s_sp_art_url, s_sp_art_have) == 0) {
+        s_sp_art_ready = true;
+        return;
+    }
+
+    if (strcmp(s_sp_art_url, s_sp_art_failed) == 0 &&
+        (now_ms() - s_sp_art_failed_at) < SP_ART_RETRY_MS) return;
 
     char url[512];
     int n = snprintf(url, sizeof(url), "%s/art.bin?s=%d&u=", BROKER_URL, SP_ART_PX);
@@ -3351,7 +3529,14 @@ static void sp_fetch_art(void) {
             bsp_display_unlock();
         }
         s_sp_art_ready = true;
+        s_sp_art_failed[0] = '\0';
+        if (s_dl_accent) s_sp_accent = s_dl_accent;
         ESP_LOGI(TAG, "spotify: art updated");
+    } else {
+        snprintf(s_sp_art_failed, sizeof(s_sp_art_failed), "%s", s_sp_art_url);
+        s_sp_art_failed_at = now_ms();
+        ESP_LOGW(TAG, "spotify: art fetch failed, backing off %d s",
+                 SP_ART_RETRY_MS / 1000);
     }
 }
 
@@ -3369,8 +3554,15 @@ static void sp_task(void *arg) {
         if (!s_wifi_up) continue;
 
         switch (cmd) {
-        case SP_CMD_POLL:    sp_poll_state(); sp_fetch_art(); break;
+        /* sp_push_volume() is a no-op unless a level is owed, so putting it on the
+         * poll costs nothing and guarantees a dropped command is picked up. */
+        case SP_CMD_POLL:    sp_poll_state(); sp_push_volume();
+                             sp_check_liked(); sp_fetch_art(); break;
         case SP_CMD_DEVICES: sp_poll_devices(); break;
+        case SP_CMD_LIKE:    sp_toggle_like(); break;
+        /* No confirm poll: the bar is already showing the value we just sent,
+         * and a read-back would only fight the next press. */
+        case SP_CMD_VOLUME:  sp_push_volume(); break;
 
         /* Optimistic UI: the icon already flipped, so a poll follows to confirm
          * rather than to discover. */
@@ -3407,6 +3599,7 @@ static void sp_task(void *arg) {
     confirm:
         vTaskDelay(pdMS_TO_TICKS(350));   /* let Spotify settle before reading back */
         sp_poll_state();
+        sp_check_liked();
         sp_fetch_art();
     }
 }
@@ -3431,9 +3624,16 @@ static void sp_init(void) {
 
 static lv_obj_t *s_sp_art, *s_sp_art_ph, *s_sp_lbl_track, *s_sp_lbl_artist;
 static lv_obj_t *s_sp_btn_play_lbl, *s_sp_btn_shuf, *s_sp_btn_dev;
-static lv_obj_t *s_sp_btn_prev, *s_sp_btn_next;
+static lv_obj_t *s_sp_btn_prev, *s_sp_btn_next, *s_sp_btn_like;
+/* The volume HUD: a vertical fill beside the cover plus a glyph that goes to
+ * mute at zero. Hidden until a key says otherwise, so the cover keeps the space
+ * and nothing permanent is spent on it. */
+static lv_obj_t *s_sp_vol_bar, *s_sp_vol_icon;
 static int s_sp_devdrawn = -1;   /* signature of the drawn device list */
+static int s_sp_devlit = -1;     /* last device-button tint, -1 = unset */
 static lv_obj_t *s_sp_devpanel, *s_sp_devlist;
+static lv_obj_t *s_sp_scr;      /* the MUSIC screen, for the accent backdrop */
+static uint32_t s_sp_bg_drawn;  /* last backdrop colour, 0 = unset */
 static char s_sp_art_shown[160];
 
 /* Circular button placed by centre, in absolute screen coordinates.
@@ -3471,6 +3671,17 @@ static lv_obj_t *sp_round_btn(lv_obj_t *par, const char *glyph, const lv_font_t 
 /* Every control flips the UI first and enqueues second. At 6 ms the round trip is
  * nearly instant anyway, but this makes a dropped call invisible rather than
  * making every tap feel laggy. */
+/* Drop the cover the instant a track change is asked for. The new art is a poll
+ * plus a fetch away, and leaving the previous album up makes the gesture look
+ * like it did nothing — or worse, like it changed to the wrong track. The
+ * placeholder is honest about not knowing yet. */
+static void sp_art_clear(void) {
+    if (s_sp_art)    lv_obj_add_flag(s_sp_art, LV_OBJ_FLAG_HIDDEN);
+    if (s_sp_art_ph) lv_obj_remove_flag(s_sp_art_ph, LV_OBJ_FLAG_HIDDEN);
+    s_sp_art_ready = false;
+    s_sp_art_shown[0] = '\0';
+}
+
 static void sp_play_cb(lv_event_t *e) {
     s_sp_playing = !s_sp_playing;
     if (s_sp_btn_play_lbl) {
@@ -3478,8 +3689,16 @@ static void sp_play_cb(lv_event_t *e) {
     }
     sp_send(s_sp_playing ? SP_CMD_PLAY : SP_CMD_PAUSE);
 }
-static void sp_next_cb(lv_event_t *e) { if (!s_sp_no_next) sp_send(SP_CMD_NEXT); }
-static void sp_prev_cb(lv_event_t *e) { if (!s_sp_no_prev) sp_send(SP_CMD_PREV); }
+static void sp_next_cb(lv_event_t *e) {
+    if (s_sp_no_next) return;
+    sp_art_clear();
+    sp_send(SP_CMD_NEXT);
+}
+static void sp_prev_cb(lv_event_t *e) {
+    if (s_sp_no_prev) return;
+    sp_art_clear();
+    sp_send(SP_CMD_PREV);
+}
 static void sp_shuf_cb(lv_event_t *e) {
     if (s_sp_no_shuffle) return;
     s_sp_shuffle = !s_sp_shuffle;
@@ -3490,12 +3709,35 @@ static void sp_shuf_cb(lv_event_t *e) {
  * background rather than a tint on a small glyph — that was too subtle to read.
  * Unavailable is a third state, drawn dimmer than off and not clickable, so a tap
  * cannot fire a request Spotify would reject. */
+/* lv_label_set_text() has no equality short-circuit — set_text_internal() always
+ * reallocates, re-measures and invalidates, and on a SCROLL_CIRCULAR label it
+ * re-runs the scroll setup. Rewriting unchanged text on a 400 ms tick therefore
+ * buys a needless flush every tick, which costs frames and, because continuous
+ * flushes are exactly what widens the panel-IO lock race in pitfall #13, makes a
+ * freeze more likely rather than merely wasting cycles. */
+static void label_set_changed(lv_obj_t *lbl, const char *s) {
+    if (!lbl) return;
+    const char *cur = lv_label_get_text(lbl);
+    if (cur && strcmp(cur, s) == 0) return;
+    lv_label_set_text(lbl, s);
+}
+
 static void sp_style_toggle(lv_obj_t *lbl, bool on, bool avail,
                             uint32_t accent, const char *glyph)
 {
     if (!lbl) return;
     lv_obj_t *b = lv_obj_get_parent(lbl);
-    if (glyph) lv_label_set_text(lbl, glyph);
+    if (glyph) label_set_changed(lbl, glyph);
+
+    /* Same reasoning for the style properties: each setter invalidates whether or
+     * not the value moved, and these five buttons are re-styled every tick. The
+     * signature lives in the label's user_data — free on these, since sp_round_btn
+     * does not use it and only the device cards do. Bit 26 marks "set", so a
+     * legitimately all-zero state is distinguishable from never-styled. */
+    uintptr_t sig = (uintptr_t)(accent & 0xFFFFFF) |
+                    ((uintptr_t)on << 24) | ((uintptr_t)avail << 25) | (1u << 26);
+    if ((uintptr_t)lv_obj_get_user_data(lbl) == sig) return;
+    lv_obj_set_user_data(lbl, (void *)sig);
 
     if (!avail) {
         lv_obj_set_style_bg_color(b, lv_color_hex(0x0A0E14), 0);
@@ -3542,18 +3784,187 @@ static void sp_devtap_cb(lv_event_t *e) {
 
 static void sp_devbtn_cb(lv_event_t *e) { sp_show_devices(true); }
 
+/* A swipe is invisible until Spotify answers, and that is a poll plus a 350 ms
+ * settle away — long enough to read as "nothing happened" and swipe again. So the
+ * card nudges in the direction of the flick and springs back, which says
+ * "received" without claiming the track already changed. Translate, not position:
+ * it is purely visual, composes with the existing alignment, and unlike a
+ * transform it allocates no transient layer.
+ *
+ * A refused flick gets a much smaller bounce — the iOS rubber-band idea. Silence
+ * would be ambiguous between "not detected" and "not allowed". */
+static void sp_nudge_exec(void *obj, int32_t v) {
+    lv_obj_set_style_translate_x((lv_obj_t *)obj, v, 0);
+}
+
+static void sp_nudge(int dir, int32_t dist) {
+    lv_obj_t *card[] = { s_sp_art, s_sp_art_ph, s_sp_lbl_track, s_sp_lbl_artist };
+    for (unsigned i = 0; i < sizeof(card) / sizeof(card[0]); i++) {
+        if (!card[i]) continue;
+        lv_anim_t a;
+        lv_anim_init(&a);
+        lv_anim_set_var(&a, card[i]);
+        lv_anim_set_exec_cb(&a, sp_nudge_exec);
+        lv_anim_set_values(&a, 0, dir * dist);
+        lv_anim_set_duration(&a, 100);
+        lv_anim_set_playback_duration(&a, 200);   /* slower return reads as spring */
+        lv_anim_set_path_cb(&a, lv_anim_path_ease_out);
+        lv_anim_start(&a);
+    }
+}
+
+/* MUSIC's own gesture handler, replacing gesture_home_cb on this screen: swipe
+ * up still goes home, and a horizontal flick changes track. Left means the
+ * finger travelled left, which flicks the current card away and brings the next
+ * one in — the direction every carousel uses. Skipped while the device picker is
+ * up, where a flick belongs to the list, and honours the same actions.disallows
+ * that grey out the transport buttons.
+ *
+ * Runs in the LVGL task as a touch event, so the lock is already held. */
+static void sp_gesture_cb(lv_event_t *e) {
+    lv_dir_t d = lv_indev_get_gesture_dir(lv_indev_active());
+
+    if (d == LV_DIR_TOP) { app_request(APP_DRAWER); return; }
+    if (!s_sp_devpanel || !lv_obj_has_flag(s_sp_devpanel, LV_OBJ_FLAG_HIDDEN)) return;
+    if (d != LV_DIR_LEFT && d != LV_DIR_RIGHT) return;
+
+    int dir = (d == LV_DIR_LEFT) ? -1 : 1;      /* the card follows the finger */
+    bool ok = s_sp_have_state &&
+              (d == LV_DIR_LEFT ? !s_sp_no_next : !s_sp_no_prev);
+
+    sp_nudge(dir, ok ? 36 : 10);
+    if (ok) {
+        sp_art_clear();
+        sp_send(d == LV_DIR_LEFT ? SP_CMD_NEXT : SP_CMD_PREV);
+    }
+}
+
+static void sp_like_cb(lv_event_t *e) {
+    if (!s_sp_track_id[0]) return;
+    s_sp_liked = !s_sp_liked;          /* optimistic; sp_toggle_like reverts on failure */
+    s_sp_liked_known = true;
+    sp_send(SP_CMD_LIKE);
+}
+
+/* ---- volume ----
+ *
+ * MUSIC takes all three keys: left down, right up, middle mute. That overrides
+ * the global contract (left = lock, middle = home), so the way out is the
+ * swipe-down gesture the screen already carries — see gesture_home_cb. Lock is
+ * one swipe plus one key away rather than being unreachable.
+ *
+ * Held keys repeat, so the HUD has to be cheap to update and the network side
+ * has to coalesce; sp_push_volume() handles the latter.
+ */
+#define SP_VOL_STEP     5
+#define SP_VOL_HUD_MS   2600      /* how long the bar lingers after the last press */
+
+/* The numeric readout borrows the track-title line rather than claiming space of
+ * its own: while you are holding a volume key the level matters more than the
+ * song name, and the title is the only place on this layout with room for a
+ * figure big enough to read at arm's length. The title comes back on its own,
+ * because sp_timer_cb rewrites it every tick once the HUD retires. */
+static void sp_vol_hud_paint(void) {
+    if (!s_sp_vol_bar) return;
+
+    int v = s_sp_vol < 0 ? 0 : s_sp_vol;
+    lv_bar_set_value(s_sp_vol_bar, v, LV_ANIM_OFF);
+
+    uint32_t c;
+    if (!s_sp_vol_ok) {
+        c = 0x64748B;
+        label_set_changed(s_sp_vol_icon, ICON_VOL_MUTE);
+        if (s_sp_lbl_track) label_set_changed(s_sp_lbl_track, "no volume control");
+    } else if (v == 0) {
+        c = 0xF43F5E;                               /* muted reads as a warning */
+        label_set_changed(s_sp_vol_icon, ICON_VOL_MUTE);
+        if (s_sp_lbl_track) label_set_changed(s_sp_lbl_track, "MUTED");
+    } else {
+        c = 0x1DB954;
+        label_set_changed(s_sp_vol_icon, ICON_VOL_UP);
+        if (s_sp_lbl_track) {
+            char t[20];
+            snprintf(t, sizeof(t), "VOLUME %d", v);
+            label_set_changed(s_sp_lbl_track, t);   /* the HUD repaints every tick */
+        }
+    }
+    lv_obj_set_style_text_color(s_sp_vol_icon, lv_color_hex(c), 0);
+    lv_obj_set_style_bg_color(s_sp_vol_bar, lv_color_hex(c), LV_PART_INDICATOR);
+}
+
+static void sp_vol_hud_show(void) {
+    s_sp_vol_shown = now_ms();
+    if (!s_sp_vol_bar) return;
+    sp_vol_hud_paint();
+    lv_obj_remove_flag(s_sp_vol_bar,  LV_OBJ_FLAG_HIDDEN);
+    lv_obj_remove_flag(s_sp_vol_icon, LV_OBJ_FLAG_HIDDEN);
+}
+
+/* Step the level. Local first so the bar answers the key immediately, then the
+ * task pushes it — at 6 ms warm the round trip is invisible anyway, but this also
+ * keeps a held key from stalling on the network. */
+static void sp_vol_step(int delta) {
+    if (s_sp_vol < 0) s_sp_vol = 50;      /* no reading yet; assume mid-scale */
+    int v = s_sp_vol + delta;
+    if (v < 0)   v = 0;
+    if (v > 100) v = 100;
+
+    if (v != s_sp_vol && s_sp_vol_ok) {
+        s_sp_vol = v;
+        sp_send(SP_CMD_VOLUME);
+    }
+    sp_vol_hud_show();                    /* show even when refused, to say why */
+}
+
+static void sp_vol_mute_toggle(void) {
+    if (!s_sp_vol_ok) { sp_vol_hud_show(); return; }
+
+    int v;
+    if (s_sp_vol > 0) {
+        s_sp_vol_premute = s_sp_vol;      /* remember where to come back to */
+        v = 0;
+    } else {
+        v = s_sp_vol_premute > 0 ? s_sp_vol_premute : 35;
+    }
+    s_sp_vol = v;
+    sp_send(SP_CMD_VOLUME);
+    sp_vol_hud_show();
+}
+
+/* Called from the main loop with the LVGL lock held. Returns true when MUSIC has
+ * consumed the key, so the global lock/home/back bindings are skipped. */
+static bool sp_keys(btn_ev_t kleft, btn_ev_t kright, bool pwr) {
+    /* The device picker keeps the global bindings. Volume there would leave the
+     * sub-scene with no way to pop, and the only exit would be leaving the app. */
+    if (!s_sp_devpanel || !lv_obj_has_flag(s_sp_devpanel, LV_OBJ_FLAG_HIDDEN)) return false;
+
+    /* Left raises, right lowers. This deliberately contradicts the silkscreen —
+     * the board labels the leftmost key "minus" and the rightmost "plus" — because
+     * it matches how the cube is actually held. Requested explicitly; do not
+     * "fix" it back to the labels. */
+    bool used = false;
+    if (kleft  == BTN_SHORT || kleft  == BTN_LONG || kleft  == BTN_REPEAT) {
+        sp_vol_step(+SP_VOL_STEP); used = true;
+    }
+    if (kright == BTN_SHORT || kright == BTN_LONG || kright == BTN_REPEAT) {
+        sp_vol_step(-SP_VOL_STEP); used = true;
+    }
+    if (pwr) { sp_vol_mute_toggle(); used = true; }
+    return used;
+}
+
 static void sp_timer_cb(lv_timer_t *t) {
     if (!s_sp_lbl_track) return;
 
     if (s_sp_authfail) {
-        lv_label_set_text(s_sp_lbl_track, "not authorised");
-        lv_label_set_text(s_sp_lbl_artist, "check SPOTIFY_REFRESH_TOKEN");
+        label_set_changed(s_sp_lbl_track, "not authorised");
+        label_set_changed(s_sp_lbl_artist, "check SPOTIFY_REFRESH_TOKEN");
     } else if (!s_sp_have_state) {
-        lv_label_set_text(s_sp_lbl_track, "nothing playing");
-        lv_label_set_text(s_sp_lbl_artist, "pick a device to start");
+        label_set_changed(s_sp_lbl_track, "nothing playing");
+        label_set_changed(s_sp_lbl_artist, "pick a device to start");
     } else {
-        lv_label_set_text(s_sp_lbl_track, s_sp_track);
-        lv_label_set_text(s_sp_lbl_artist, s_sp_artist);
+        label_set_changed(s_sp_lbl_track, s_sp_track);
+        label_set_changed(s_sp_lbl_artist, s_sp_artist);
     }
 
     sp_style_toggle(s_sp_btn_play_lbl, s_sp_playing, s_sp_have_state, 0x1DB954,
@@ -3561,20 +3972,72 @@ static void sp_timer_cb(lv_timer_t *t) {
     sp_style_toggle(s_sp_btn_shuf, s_sp_shuffle, s_sp_have_state && !s_sp_no_shuffle,
                     0x1DB954, NULL);
     sp_style_toggle(s_sp_btn_prev, false, s_sp_have_state && !s_sp_no_prev, 0x334155, NULL);
+    /* Unknown is its own state: an unverified heart invites a tap that would
+     * silently un-like something. */
+    sp_style_toggle(s_sp_btn_like, s_sp_liked_known && s_sp_liked,
+                    s_sp_have_state && s_sp_liked_known && s_sp_track_id[0],
+                    0xF43F5E,
+                    (s_sp_liked_known && s_sp_liked) ? ICON_HEART : ICON_HEART_OPEN);
     sp_style_toggle(s_sp_btn_next, false, s_sp_have_state && !s_sp_no_next, 0x334155, NULL);
+
+    /* Backdrop follows the cover. Change-gated because setting a screen's
+     * background invalidates all 480x480 of it, which at a 400 ms tick would be
+     * a full-frame flush forever. */
+    if (s_sp_scr) {
+        /* No state or no accent -> the original near-black. */
+        uint32_t bg = (s_sp_have_state && s_sp_accent)
+                      ? accent_bg(s_sp_accent) : 0x05070B;
+        if (bg != s_sp_bg_drawn) {
+            s_sp_bg_drawn = bg;
+            lv_obj_set_style_bg_color(s_sp_scr, lv_color_hex(bg), 0);
+            if (s_sp_art_ph) lv_obj_set_style_bg_color(s_sp_art_ph, lv_color_hex(bg), 0);
+        }
+    }
+
+    /* The volume HUD is on demand: it appears when a key moves the level and
+     * retires itself, so the cover keeps the space the rest of the time. */
+    if (s_sp_vol_bar) {
+        bool up = s_sp_vol_shown && (now_ms() - s_sp_vol_shown) < SP_VOL_HUD_MS;
+        if (up) {
+            sp_vol_hud_paint();           /* after the title write above, so it wins */
+        } else {
+            lv_obj_add_flag(s_sp_vol_bar,  LV_OBJ_FLAG_HIDDEN);
+            lv_obj_add_flag(s_sp_vol_icon, LV_OBJ_FLAG_HIDDEN);
+        }
+    }
     /* Which device is playing lives on the corner button's colour, not on a
      * permanent caption — the name itself is in the picker. */
     if (s_sp_btn_dev) {
-        lv_obj_set_style_text_color(s_sp_btn_dev,
-            lv_color_hex(s_sp_have_state ? 0x1DB954 : 0x475569), 0);
+        /* Holds the drawn colour, not a flag, so a new accent repaints it too. */
+        uint32_t c = s_sp_have_state ? 0x1DB954 : 0x475569;
+        if ((uint32_t)s_sp_devlit != c) {
+            s_sp_devlit = (int)c;
+            lv_obj_set_style_text_color(s_sp_btn_dev, lv_color_hex(c), 0);
+        }
     }
 
-    /* Swap the art in only when the file behind it actually changed. */
-    if (s_sp_art_ready && strcmp(s_sp_art_shown, s_sp_art_have) != 0) {
+    /* Show the cover only while the file on the card is the one this track wants.
+     * Asking "is what we have what is wanted" rather than reacting to whatever
+     * caused the change covers every path with one rule — swipe, button, and a
+     * track ending on its own — and needs no flag from the Spotify task, which
+     * cannot touch widgets anyway. A stale cover under a new title is worse than
+     * no cover: it reads as the wrong track rather than as a pending one.
+     *
+     * The explicit sp_art_clear() on swipe and button still earns its place: it
+     * drops the cover on the touch, where this rule would wait for the poll that
+     * moves s_sp_art_url. */
+    bool art_current = s_sp_art_ready && s_sp_art_url[0] &&
+                       strcmp(s_sp_art_have, s_sp_art_url) == 0;
+
+    if (art_current && strcmp(s_sp_art_shown, s_sp_art_have) != 0) {
         snprintf(s_sp_art_shown, sizeof(s_sp_art_shown), "%s", s_sp_art_have);
         lv_image_set_src(s_sp_art, SP_ART_LV);
         lv_obj_remove_flag(s_sp_art, LV_OBJ_FLAG_HIDDEN);
         lv_obj_add_flag(s_sp_art_ph, LV_OBJ_FLAG_HIDDEN);
+    } else if (!art_current && !lv_obj_has_flag(s_sp_art, LV_OBJ_FLAG_HIDDEN)) {
+        lv_obj_add_flag(s_sp_art, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_remove_flag(s_sp_art_ph, LV_OBJ_FLAG_HIDDEN);
+        s_sp_art_shown[0] = '\0';
     }
 
     /* Rebuild the device list only when the set changes, not every tick — it is
@@ -3608,9 +4071,9 @@ static void sp_timer_cb(lv_timer_t *t) {
             lv_obj_add_event_cb(b, sp_devtap_cb, LV_EVENT_CLICKED, NULL);
 
             lv_obj_t *ic = lv_label_create(b);
-            lv_obj_set_style_text_font(ic, &lv_font_montserrat_20, 0);
+            lv_obj_set_style_text_font(ic, on ? &lv_font_montserrat_20 : &hud_icons_30, 0);
             lv_obj_set_style_text_color(ic, lv_color_hex(on ? 0x1DB954 : 0x64748B), 0);
-            lv_label_set_text(ic, on ? LV_SYMBOL_OK : LV_SYMBOL_VOLUME_MAX);
+            lv_label_set_text(ic, on ? LV_SYMBOL_OK : ICON_DEVICES);
             lv_obj_align(ic, LV_ALIGN_LEFT_MID, 0, 0);
 
             lv_obj_t *nm = lv_label_create(b);
@@ -3634,6 +4097,8 @@ static void sp_timer_cb(lv_timer_t *t) {
 }
 
 static void build_music_app(lv_obj_t *scr) {
+    s_sp_scr = scr;
+    s_sp_bg_drawn = 0;                       /* force a repaint on this build */
     lv_obj_set_style_bg_color(scr, lv_color_hex(0x05070B), 0);
     lv_obj_remove_flag(scr, LV_OBJ_FLAG_SCROLLABLE);
 
@@ -3651,14 +4116,20 @@ static void build_music_app(lv_obj_t *scr) {
     /* top corners: shuffle left, device picker right */
     s_sp_btn_shuf = sp_round_btn(scr, LV_SYMBOL_SHUFFLE, NULL, 80, 68, 64,
                                  sp_shuf_cb, 0x1DB954, 0x10161F);
-    s_sp_btn_dev = sp_round_btn(scr, LV_SYMBOL_VOLUME_MAX, NULL, 400, 68, 64,
+    /* Matches the glyph Spotify itself uses for Connect — see ICON_DEVICES. */
+    s_sp_btn_dev = sp_round_btn(scr, ICON_DEVICES, &hud_icons_30, 400, 68, 64,
                                 sp_devbtn_cb, 0x1DB954, 0x10161F);
+    /* Top middle, between shuffle and the device picker. Smaller than the
+     * transport on purpose — liking is a deliberate act, not something you want
+     * to hit by accident while reaching for pause. */
+    s_sp_btn_like = sp_round_btn(scr, ICON_HEART_OPEN, &hud_icons_30, 240, 58, 56,
+                                 sp_like_cb, 0xF43F5E, 0x10161F);
 
     /* cover, smaller than before on purpose */
     s_sp_art_ph = lv_obj_create(scr);
     lv_obj_remove_style_all(s_sp_art_ph);
     lv_obj_set_size(s_sp_art_ph, SP_ART_PX, SP_ART_PX);
-    lv_obj_align(s_sp_art_ph, LV_ALIGN_TOP_MID, 0, 104);
+    lv_obj_align(s_sp_art_ph, LV_ALIGN_TOP_MID, 0, 110);
     lv_obj_set_style_bg_color(s_sp_art_ph, lv_color_hex(0x11161F), 0);
     lv_obj_set_style_bg_opa(s_sp_art_ph, LV_OPA_COVER, 0);
     lv_obj_set_style_radius(s_sp_art_ph, 14, 0);
@@ -3671,10 +4142,33 @@ static void build_music_app(lv_obj_t *scr) {
 
     s_sp_art = lv_image_create(scr);
     lv_obj_set_size(s_sp_art, SP_ART_PX, SP_ART_PX);
-    lv_obj_align(s_sp_art, LV_ALIGN_TOP_MID, 0, 104);
+    lv_obj_align(s_sp_art, LV_ALIGN_TOP_MID, 0, 110);
     lv_image_set_inner_align(s_sp_art, LV_IMAGE_ALIGN_COVER);
     lv_obj_add_flag(s_sp_art, LV_OBJ_FLAG_HIDDEN);
     lv_obj_remove_flag(s_sp_art, LV_OBJ_FLAG_CLICKABLE);
+
+    /* Volume HUD, in the gap to the left of the cover. The cover is 148 wide and
+     * centred, so it occupies x166..314; an 18 px fill at x128 sits in clear
+     * space and still clears the r=110 corner arcs, which only cut x<110. The
+     * readout goes top-middle, in the slot the like button vacated, where it is
+     * big enough to read at a glance without crowding the corner buttons. */
+    s_sp_vol_bar = lv_bar_create(scr);
+    lv_obj_set_size(s_sp_vol_bar, 18, SP_ART_PX);
+    lv_obj_set_pos(s_sp_vol_bar, 128, 110);
+    lv_bar_set_range(s_sp_vol_bar, 0, 100);
+    lv_obj_set_style_radius(s_sp_vol_bar, 9, 0);
+    lv_obj_set_style_radius(s_sp_vol_bar, 9, LV_PART_INDICATOR);
+    lv_obj_set_style_bg_color(s_sp_vol_bar, lv_color_hex(0x18202C), 0);
+    lv_obj_set_style_bg_opa(s_sp_vol_bar, LV_OPA_COVER, 0);
+    lv_obj_remove_flag(s_sp_vol_bar, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_flag(s_sp_vol_bar, LV_OBJ_FLAG_HIDDEN);
+
+    s_sp_vol_icon = lv_label_create(scr);
+    lv_obj_set_style_text_font(s_sp_vol_icon, &hud_icons_30, 0);
+    lv_obj_set_style_text_color(s_sp_vol_icon, lv_color_hex(0x1DB954), 0);
+    label_set_changed(s_sp_vol_icon, ICON_VOL_UP);
+    lv_obj_set_pos(s_sp_vol_icon, 122, 74);
+    lv_obj_add_flag(s_sp_vol_icon, LV_OBJ_FLAG_HIDDEN);
 
     s_sp_lbl_track = lv_label_create(scr);
     lv_obj_set_width(s_sp_lbl_track, CONTENT_W);
@@ -3695,12 +4189,18 @@ static void build_music_app(lv_obj_t *scr) {
     lv_obj_align(s_sp_lbl_artist, LV_ALIGN_TOP_MID, 0, 292);
 
     /* transport: the things you actually press, sized accordingly */
-    s_sp_btn_prev = sp_round_btn(scr, LV_SYMBOL_PREV, NULL, 118, 376, 96,
-                                 sp_prev_cb, 0x334155, 0x141B26);
-    s_sp_btn_play_lbl = sp_round_btn(scr, LV_SYMBOL_PLAY, &lv_font_montserrat_20,
+    /* Glyph sizes are 36 for the skips and 48 for play/pause, against the 14 px
+     * default and 20 px they started at — icons sized for a button a third as
+     * wide, which read as timid rather than as small. The two sizes are the
+     * hierarchy: play is the primary verb and gets the bigger circle *and* the
+     * bigger glyph, while a matched 48 made all three compete. 36 is enabled in
+     * sdkconfig.defaults purely for this; nothing sits between 20 and 48. */
+    s_sp_btn_prev = sp_round_btn(scr, LV_SYMBOL_PREV, &lv_font_montserrat_36,
+                                 118, 376, 96, sp_prev_cb, 0x334155, 0x141B26);
+    s_sp_btn_play_lbl = sp_round_btn(scr, LV_SYMBOL_PLAY, &lv_font_montserrat_48,
                                      240, 376, 116, sp_play_cb, 0x1DB954, 0x16241C);
-    s_sp_btn_next = sp_round_btn(scr, LV_SYMBOL_NEXT, NULL, 362, 376, 96,
-                                 sp_next_cb, 0x334155, 0x141B26);
+    s_sp_btn_next = sp_round_btn(scr, LV_SYMBOL_NEXT, &lv_font_montserrat_36,
+                                 362, 376, 96, sp_next_cb, 0x334155, 0x141B26);
 
     /* Device picker, full-screen over the top. Same shape as the Wi-Fi app's
      * sub-scene so the right key pops it the same way. */
@@ -3729,9 +4229,10 @@ static void build_music_app(lv_obj_t *scr) {
     lv_obj_set_scroll_dir(s_sp_devlist, LV_DIR_VER);
     lv_obj_set_scrollbar_mode(s_sp_devlist, LV_SCROLLBAR_MODE_OFF);
 
-    lv_obj_add_event_cb(scr, gesture_home_cb, LV_EVENT_GESTURE, NULL);
+    lv_obj_add_event_cb(scr, sp_gesture_cb, LV_EVENT_GESTURE, NULL);
 
     s_sp_devdrawn = -1;
+    s_sp_devlit = -1;
     s_sp_art_shown[0] = '\0';
     sp_send(SP_CMD_POLL);
     sp_send(SP_CMD_DEVICES);
@@ -3754,7 +4255,6 @@ static const app_def_t s_apps[APP_COUNT] = {
     [APP_PET]    = { "PIP",    "pet",    ICON_PETS,      0xF59E0B, build_pet_app,    pet_save },
     [APP_MUSIC]  = { "MUSIC",  "music",  ICON_MUSIC,     0x1DB954, build_music_app,  NULL      },
     [APP_POMO]   = { "FOCUS",  "pomo",   ICON_TARGET,    0xFFB454, build_pomo_app,   pomo_save },
-    [APP_WIFI]   = { "WI-FI",  "wifi",   ICON_WIFI,      0x34D399, build_wifi_app,   NULL     },
 };
 
 static void tile_cb(lv_event_t *e) {
@@ -3994,6 +4494,9 @@ static esp_err_t dl_evt(esp_http_client_event_t *e) {
     if (e->event_id == HTTP_EVENT_ON_HEADER) {
         if (e->header_key && strcasecmp(e->header_key, "Content-Length") == 0) {
             s_dl_total = atoll(e->header_value);
+        } else if (e->header_key && strcasecmp(e->header_key, "X-Art-Accent") == 0) {
+            /* Rides the art fetch, so the tint costs no request and no bytes. */
+            s_dl_accent = (uint32_t)strtoul(e->header_value, NULL, 16);
         }
     } else if (e->event_id == HTTP_EVENT_ON_DATA && s_dl_file && e->data_len > 0) {
         fwrite(e->data, 1, e->data_len, s_dl_file);
@@ -4014,6 +4517,7 @@ static bool asset_fetch_auth(const char *url, const char *path, const char *bear
     s_dl_got = 0;
     s_dl_pct = 0;
     s_dl_kb = 0;
+    s_dl_accent = 0;
 
     char tmp[80];
     snprintf(tmp, sizeof(tmp), "%s.part", path);
@@ -4194,6 +4698,10 @@ static void wall_service(void) {
      * two hours and then drops to one replacement every WALLPAPER_PERIOD_MS. */
     if (!s_sd_ok || !s_wifi_up) return;
     if (s_pomo_state == POMO_RUN) return;   /* not during a session */
+    if (ble_prov_active()) return;          /* nor during pairing        */
+    /* nor while the lock screen is showing now-playing, which fetches album art
+     * on the same internal heap this download already drives to its low point */
+    if (s_lock_np_up) return;
 
     bool filling = (wall_first_empty() >= 0);
     int64_t due = filling ? 0 : WALLPAPER_PERIOD_MS;
@@ -4257,6 +4765,8 @@ static bool store_save(const char *id, const void *data, size_t len) {
         ESP_LOGW(TAG, "store: SD write failed for %s (%s)", id, strerror(errno));
     }
     nvs_handle_t h;                                  /* fall back to NVS */
+    /* Only the NVS fallback is flash; the SD path above is the card. */
+    if (ble_prov_nvs_blocked()) return false;
     if (nvs_open("appstate", NVS_READWRITE, &h) != ESP_OK) return false;
     esp_err_t e = nvs_set_blob(h, id, data, len);
     nvs_commit(h);
@@ -4445,8 +4955,59 @@ static int s_lock_slow;
  * so the readouts are correct on the very first frame — a persistent "slow"
  * counter used to make a freshly rebuilt lock screen skip its first update,
  * which is how the placeholder text kept reappearing. */
+/* Driven from lock_refresh() at 1 Hz rather than from a timer of its own. The
+ * sweep already invalidates this screen every 40 ms, so the cost that matters is
+ * not how often this runs but whether it touches widgets when nothing changed —
+ * hence label_set_changed() and the visibility check. */
+static void lock_np_refresh(void) {
+    if (!s_lock_np) return;
+
+    bool show = s_sp_have_state && s_sp_track[0];
+    if (show == s_lock_np_up) {
+        if (!show) return;                      /* nothing to do while hidden */
+    } else {
+        s_lock_np_up = show;
+        if (show) lv_obj_remove_flag(s_lock_np, LV_OBJ_FLAG_HIDDEN);
+        else      lv_obj_add_flag(s_lock_np, LV_OBJ_FLAG_HIDDEN);
+
+        /* Move the clock stack up rather than shrinking the player to fit under
+         * it. The first attempt kept the clock centred and squeezed the transport
+         * into what was left, which produced 46 px targets — small enough to
+         * ghost-touch, which is the same mistake the first MUSIC layout made. The
+         * clock has nothing below it worth protecting, so it yields. */
+        lv_obj_set_style_text_font(s_lock_time,
+                                   show ? &hud_clock_48 : &hud_clock_76, 0);
+        lv_obj_align(s_lock_time, LV_ALIGN_CENTER, 0, show ? -140 : -18);
+        lv_obj_align(s_lock_date, LV_ALIGN_CENTER, 0, show ? -104 :  46);
+        if (s_lock_rule) {
+            if (show) lv_obj_add_flag(s_lock_rule, LV_OBJ_FLAG_HIDDEN);
+            else      lv_obj_remove_flag(s_lock_rule, LV_OBJ_FLAG_HIDDEN);
+        }
+
+        if (!show) return;
+    }
+
+    label_set_changed(s_lock_np_track, s_sp_track);
+    sp_style_toggle(s_lock_np_play, s_sp_playing, true, 0x1DB954,
+                    s_sp_playing ? LV_SYMBOL_PAUSE : LV_SYMBOL_PLAY);
+    sp_style_toggle(s_lock_np_prev, false, !s_sp_no_prev, 0x334155, NULL);
+    sp_style_toggle(s_lock_np_next, false, !s_sp_no_next, 0x334155, NULL);
+
+    /* Same rule as MUSIC: show the cover only while the file on the card is the
+     * one this track wants, so a stale album never sits under a new title. */
+    bool art_ok = s_sp_art_ready && s_sp_art_url[0] &&
+                  strcmp(s_sp_art_have, s_sp_art_url) == 0;
+    if (art_ok && lv_obj_has_flag(s_lock_np_art, LV_OBJ_FLAG_HIDDEN)) {
+        lv_image_set_src(s_lock_np_art, SP_ART_LV);
+        lv_obj_remove_flag(s_lock_np_art, LV_OBJ_FLAG_HIDDEN);
+    } else if (!art_ok && !lv_obj_has_flag(s_lock_np_art, LV_OBJ_FLAG_HIDDEN)) {
+        lv_obj_add_flag(s_lock_np_art, LV_OBJ_FLAG_HIDDEN);
+    }
+}
+
 static void lock_refresh(void) {
     if (!s_lock_time) return;
+    lock_np_refresh();
 
     time_t now;
     struct tm ti;
@@ -4454,7 +5015,7 @@ static void lock_refresh(void) {
     localtime_r(&now, &ti);
 
     if (ti.tm_year < (2024 - 1900)) {
-        lv_label_set_text(s_lock_time, "--:--");
+        lv_label_set_text(s_lock_time, "00:00");
         lv_label_set_text(s_lock_date, "");
     } else {
         char hm[8], date[40];
@@ -4596,13 +5157,13 @@ static void build_lock_screen(lv_obj_t *scr) {
     lv_label_set_text(s_lock_time, "--:--");
     lv_obj_align(s_lock_time, LV_ALIGN_CENTER, 0, -18);
 
-    lv_obj_t *rule = lv_obj_create(scr);
-    lv_obj_remove_style_all(rule);
-    lv_obj_set_size(rule, 190, 1);
-    lv_obj_set_style_bg_color(rule, lv_color_hex(0x1B4E68), 0);
-    lv_obj_set_style_bg_opa(rule, LV_OPA_COVER, 0);
-    lv_obj_align(rule, LV_ALIGN_CENTER, 0, 26);
-    lv_obj_remove_flag(rule, LV_OBJ_FLAG_CLICKABLE);
+    s_lock_rule = lv_obj_create(scr);
+    lv_obj_remove_style_all(s_lock_rule);
+    lv_obj_set_size(s_lock_rule, 190, 1);
+    lv_obj_set_style_bg_color(s_lock_rule, lv_color_hex(0x1B4E68), 0);
+    lv_obj_set_style_bg_opa(s_lock_rule, LV_OPA_COVER, 0);
+    lv_obj_align(s_lock_rule, LV_ALIGN_CENTER, 0, 26);
+    lv_obj_remove_flag(s_lock_rule, LV_OBJ_FLAG_CLICKABLE);
 
     s_lock_date = lv_label_create(scr);
     lv_obj_set_style_text_font(s_lock_date, &hud_text_18, 0);
@@ -4625,6 +5186,59 @@ static void build_lock_screen(lv_obj_t *scr) {
 
     s_lock_slow = 0;
     lock_refresh();                       /* correct on the first frame */
+    /* Now-playing panel, in the band between the date and the inner ring —
+     * y 326..436, the only clear space on this screen. It sits on a scrim because
+     * it has to stay legible over an arbitrary photograph, and it starts hidden:
+     * lock_np_refresh() reveals it only when Spotify reports an active device, so
+     * a cube with nothing playing looks exactly as sparse as it did before.
+     *
+     * Reuses sp_round_btn and the MUSIC transport callbacks wholesale. Those
+     * callbacks null-check every widget they touch, which is what makes them safe
+     * to fire from a screen where the MUSIC widgets do not exist. */
+    s_lock_np = lv_obj_create(scr);
+    lv_obj_remove_style_all(s_lock_np);
+    lv_obj_set_size(s_lock_np, 400, 246);
+    lv_obj_align(s_lock_np, LV_ALIGN_BOTTOM_MID, 0, -42);
+    lv_obj_set_style_bg_color(s_lock_np, lv_color_hex(0x05070B), 0);
+    lv_obj_set_style_bg_opa(s_lock_np, 190, 0);       /* scrim, not opaque */
+    lv_obj_set_style_radius(s_lock_np, 20, 0);
+    lv_obj_remove_flag(s_lock_np, LV_OBJ_FLAG_SCROLLABLE);
+    /* Not clickable: a tap on the panel background must still unlock, the same as
+     * a tap anywhere else. Only the three buttons swallow their own clicks. */
+    lv_obj_remove_flag(s_lock_np, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_flag(s_lock_np, LV_OBJ_FLAG_HIDDEN);
+
+    s_lock_np_ph = lv_obj_create(s_lock_np);
+    lv_obj_remove_style_all(s_lock_np_ph);
+    lv_obj_set_size(s_lock_np_ph, 100, 100);
+    lv_obj_set_pos(s_lock_np_ph, 16, 18);
+    lv_obj_set_style_bg_color(s_lock_np_ph, lv_color_hex(0x11161F), 0);
+    lv_obj_set_style_bg_opa(s_lock_np_ph, LV_OPA_COVER, 0);
+    lv_obj_set_style_radius(s_lock_np_ph, 10, 0);
+    lv_obj_remove_flag(s_lock_np_ph, LV_OBJ_FLAG_CLICKABLE);
+
+    s_lock_np_art = lv_image_create(s_lock_np);
+    lv_obj_set_size(s_lock_np_art, 100, 100);
+    lv_obj_set_pos(s_lock_np_art, 16, 18);
+    lv_image_set_inner_align(s_lock_np_art, LV_IMAGE_ALIGN_COVER);
+    lv_obj_remove_flag(s_lock_np_art, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_flag(s_lock_np_art, LV_OBJ_FLAG_HIDDEN);
+
+    s_lock_np_track = lv_label_create(s_lock_np);
+    lv_obj_set_width(s_lock_np_track, 254);
+    lv_obj_set_pos(s_lock_np_track, 130, 58);
+    lv_obj_set_style_text_font(s_lock_np_track, &hud_text_18, 0);
+    lv_obj_set_style_text_color(s_lock_np_track, lv_color_hex(0xF2E9DC), 0);
+    lv_label_set_long_mode(s_lock_np_track, LV_LABEL_LONG_DOT);
+    lv_label_set_text(s_lock_np_track, "");
+
+    s_lock_np_prev = sp_round_btn(s_lock_np, LV_SYMBOL_PREV, &lv_font_montserrat_36,
+                                  100, 172, 76, sp_prev_cb, 0x334155, 0x141B26);
+    s_lock_np_play = sp_round_btn(s_lock_np, LV_SYMBOL_PLAY, &lv_font_montserrat_48,
+                                  200, 172, 88, sp_play_cb, 0x1DB954, 0x16241C);
+    s_lock_np_next = sp_round_btn(s_lock_np, LV_SYMBOL_NEXT, &lv_font_montserrat_36,
+                                  300, 172, 76, sp_next_cb, 0x334155, 0x141B26);
+
     s_app_timer = lv_timer_create(lock_timer_cb, 40, NULL);   /* drives the sweep */
 }
 
@@ -4687,15 +5301,7 @@ static bool app_back(void) {
         }
         return false;
     }
-    if (s_app != APP_WIFI) return false;
-    bool on_pw   = s_pw_panel   && !lv_obj_has_flag(s_pw_panel, LV_OBJ_FLAG_HIDDEN);
-    bool on_conn = s_conn_panel && !lv_obj_has_flag(s_conn_panel, LV_OBJ_FLAG_HIDDEN);
-    if (!on_pw && !on_conn) return false;
-    if (ui_lock()) {
-        show_list_mode();          /* password or details -> network list */
-        bsp_display_unlock();
-    }
-    return true;
+    return false;
 }
 
 static void app_action(void) {
@@ -4706,14 +5312,6 @@ static void app_action(void) {
         break;
     case APP_PET:
         pet_play();
-        break;
-    case APP_WIFI:
-        if (ui_lock()) {
-            if (s_ap_list)     lv_obj_clean(s_ap_list);
-            if (s_setup_title) lv_label_set_text(s_setup_title, "Scanning...");
-            bsp_display_unlock();
-        }
-        s_req_scan = true;
         break;
     case APP_CONTROL:
         s_req_wallpaper = true;      /* the card shows real progress for this */
@@ -4749,6 +5347,15 @@ static void app_open(int idx) {
     if (t0 - last_switch < 250000) return;      /* debounce double taps */
     last_switch = t0;
 
+    /* Leaving CONTROL ends any pairing session. The code is only shown on that
+     * card, so a session outliving it would advertise with no way to read the
+     * code — and would hold the Wi-Fi driver down the whole time. The main
+     * loop's restore path brings Wi-Fi back. Deliberately before ui_lock():
+     * teardown does not touch LVGL and can take a moment. */
+    if (s_app == APP_CONTROL && idx != APP_CONTROL && ble_prov_active()) {
+        s_req_ble_off = true;
+    }
+
     if (!ui_lock()) return;
 
     /* let the outgoing app flush its state before its widgets disappear */
@@ -4759,10 +5366,6 @@ static void app_open(int idx) {
     s_scr_home = s_scr_setup = s_scr_pet = NULL;
     s_status_label = NULL; s_batt_bar = NULL; s_batt_label = NULL;
     s_bolt_label = NULL; s_fps_label = NULL; s_events_label = NULL;
-    s_ap_list = NULL; s_keyboard = NULL; s_pw_ta = NULL;
-    s_pw_panel = NULL; s_setup_title = NULL;
-    s_wifi_hdr = NULL; s_conn_panel = NULL; s_conn_ssid = NULL;
-    s_conn_ip = NULL; s_conn_btn = NULL; s_conn_btn_label = NULL;
     s_ch_wrap = NULL;
     s_cfg_wall_pool = NULL; s_cfg_wall_state = NULL;
     s_cfg_wall_bar = NULL; s_cfg_wall_sub = NULL;
@@ -4770,15 +5373,27 @@ static void app_open(int idx) {
     s_cfg_batt_bar = NULL;
     s_cfg_batt_val = NULL; s_cfg_batt_sub = NULL;
     s_cfg_net_val = NULL; s_cfg_sys_val = NULL; s_cfg_log = NULL;
+    s_cfg_ble_val = NULL; s_cfg_ble_code = NULL; s_cfg_ble_btn = NULL;
     s_sp_art = NULL; s_sp_art_ph = NULL; s_sp_lbl_track = NULL;
     s_sp_lbl_artist = NULL; s_sp_btn_play_lbl = NULL; s_sp_btn_shuf = NULL;
     s_sp_btn_dev = NULL; s_sp_devpanel = NULL; s_sp_devlist = NULL;
-    s_sp_btn_prev = NULL; s_sp_btn_next = NULL;
+    s_sp_btn_prev = NULL; s_sp_btn_next = NULL; s_sp_btn_like = NULL;
+    s_sp_vol_bar = NULL; s_sp_vol_icon = NULL;
+    s_sp_scr = NULL; s_sp_bg_drawn = 0;
     s_pomo_clock = NULL; s_pomo_word = NULL;
     s_pomo_ring = NULL; s_pomo_arc = NULL; s_pomo_fill = NULL;
     for (int i = 0; i < POMO_SLOTS; i++) s_pomo_dial[i] = NULL;
     s_lock_time = NULL; s_lock_date = NULL; s_lock_batt = NULL;
     s_lock_sweep = NULL; s_lock_batt_arc = NULL;
+    s_lock_np = NULL; s_lock_np_art = NULL; s_lock_np_ph = NULL;
+    s_lock_np_track = NULL; s_lock_np_prev = NULL; s_lock_np_play = NULL;
+    s_lock_np_next = NULL;
+    /* Must clear, not just null: wall_service() runs on the network task and would
+     * otherwise keep suppressing wallpaper downloads forever after the lock screen
+     * is torn down, with nothing left on screen to explain why. */
+    s_lock_np_up = false;
+    s_lock_np_bg = 0;
+    s_lock_rule = NULL;
 
     /* Free the outgoing app BEFORE building the next one. A cross-fade with
      * auto_del keeps both alive at once, and that peak drove internal heap to
@@ -4801,7 +5416,6 @@ static void app_open(int idx) {
              (long long)((esp_timer_get_time() - t0) / 1000),
              (unsigned)hp_free());
 
-    if (idx == APP_WIFI) s_req_scan = true;     /* scan as soon as it opens */
 }
 
 /* One-shot per-app memory bench.
@@ -4977,7 +5591,21 @@ void app_main(void) {
             }
         }
 
-        if (kleft == BTN_SHORT || kleft == BTN_LONG) {
+        /* MUSIC rebinds all three keys to volume, so it is offered them first.
+         * It declines on the device-picker scene, which leaves the right key free
+         * to pop that sub-scene the usual way. Home there is the swipe-down
+         * gesture the music screen already carries. */
+        bool key_used = false;
+        if (s_app == APP_MUSIC && (kleft || kright || pwr)) {
+            if (ui_lock()) {
+                key_used = sp_keys(kleft, kright, pwr);
+                bsp_display_unlock();
+            }
+        }
+
+        if (key_used) {
+            /* consumed by MUSIC; the global bindings sit this one out */
+        } else if (kleft == BTN_SHORT || kleft == BTN_LONG) {
             ESP_LOGI(TAG, "LEFT -> lock");
             lock_engage();
         } else if (s_app == APP_LOCK) {
@@ -5045,52 +5673,101 @@ void app_main(void) {
             if (want != s_app) app_open(want);
         }
 
-        if (s_req_scan) {
-            s_req_scan = false;
-            wifi_scan_now();
-            if (ui_lock()) {
-                if (s_ap_list) setup_fill_list();
-                bsp_display_unlock();
-            }
-        }
-
-        if (s_req_apply) {
-            s_req_apply = false;
-            s_wifi_disabled = false;       /* joining is an explicit "on" */
-            snprintf(s_ssid, sizeof(s_ssid), "%s", s_new_ssid);
-            snprintf(s_pass, sizeof(s_pass), "%s", s_new_pass);
-            s_creds_pending = true;      /* saved only once it actually joins */
-            s_wifi_tries = 0;
-            ESP_LOGI(TAG, "applying new credentials for \"%s\"", s_ssid);
-            log_event("join %s", s_ssid);
-            esp_wifi_disconnect();
-            wifi_apply_config(s_ssid, s_pass);
-            esp_wifi_connect();
-        }
-
-        if (s_app == APP_MUSIC && s_wifi_up && t - last_sp_poll >= SP_POLL_MS) {
+        /* Poll while MUSIC is open, and while the lock screen is actually being
+         * looked at so its now-playing panel is live. Never while dozing: §7b's
+         * whole design is stopping periodic work nobody can see, and at 80 MHz
+         * with WIFI_PS_MAX_MODEM an HTTPS call costs ~4 s, so a 3 s cadence would
+         * keep the radio permanently awake and undo the battery projection.
+         *
+         * The lock screen polls at half the rate. It only needs to be right at a
+         * glance, and desk-clock mode never sleeps — an ungated 3 s poll there
+         * would run for as long as the cube sat on the desk. */
+        bool sp_poll_lock = (s_app == APP_LOCK && s_screen_on && !s_doze);
+        int64_t sp_due = sp_poll_lock ? (SP_POLL_MS * 2) : SP_POLL_MS;
+        if ((s_app == APP_MUSIC || sp_poll_lock) && s_wifi_up &&
+            t - last_sp_poll >= sp_due) {
             last_sp_poll = t;
             sp_send(SP_CMD_POLL);
         }
 
-        if (s_req_vol_save) {
+        if (s_req_vol_save && !ble_prov_nvs_blocked()) {
             s_req_vol_save = false;
             vol_save();
         }
 
-        if (s_req_wifi_off) {
-            s_req_wifi_off = false;
-            s_wifi_disabled = true;
-            ESP_LOGI(TAG, "wifi disconnect requested");
-            log_event("wifi off");
-            esp_wifi_disconnect();
+        if (s_req_ble_on) {
+            s_req_ble_on = false;
+
+            /* Scan while there is still a driver to scan with. This snapshot is
+             * the entire list the phone will ever see — Wi-Fi is gone for the
+             * whole session, so there is no rescan. */
+            if (!s_wifi_disabled) wifi_scan_now();
+
+            ble_prov_ap_t snap[16];
+            int n = (s_ap_count < 16) ? s_ap_count : 16;
+            for (int i = 0; i < n; i++) {
+                /* %.32s: the truncation is intentional and -Werror=format-
+                 * truncation fires without an explicit bound (pitfall #7). */
+                snprintf(snap[i].ssid, sizeof(snap[i].ssid), "%.32s", s_aps[i].ssid);
+                snap[i].rssi   = s_aps[i].rssi;
+                snap[i].secure = s_aps[i].secure;
+            }
+            char cur[33];
+            snprintf(cur, sizeof(cur), "%.32s", s_wifi_up ? s_ssid : "");
+
+            log_event("ble pairing (%d networks)", n);
+            wifi_driver_down();
+
+            if (!ble_prov_start(snap, n, cur)) {
+                ESP_LOGE(TAG, "BLE failed to start; restoring wifi");
+                log_event("ble start failed");
+                /* wifi_driver_up() happens in the restore block below, which
+                 * every exit route funnels through. */
+            }
         }
-        if (s_req_wifi_on) {
-            s_req_wifi_on = false;
-            s_wifi_disabled = false;
-            ESP_LOGI(TAG, "wifi reconnect requested");
-            log_event("wifi on");
-            esp_wifi_connect();
+
+        if (s_req_ble_off) {
+            s_req_ble_off = false;
+            ble_prov_stop();
+        }
+
+        ble_prov_poll(t);
+
+        /* A pairing session is neither touch nor key activity, so without this
+         * the 60 s auto-lock tears down the very screen showing the code.
+         * Same reason pomo_poll() does it. */
+        if (ble_prov_active()) lv_display_trigger_activity(NULL);
+
+        /* The single restore path. Every way a session can end funnels through
+         * here — handed off, timed out, Stop pressed, phone walked away, or the
+         * stack refused to start. Restoring only after a successful hand-off
+         * would strand the cube offline until reboot whenever someone opened
+         * pairing and wandered off, which is the likeliest way this gets used
+         * wrong. */
+        if (s_wifi_torn_down && !ble_prov_active()) {
+            if (s_ble_handoff) {
+                s_ble_handoff = false;
+                if (s_ble_ssid[0]) {
+                    snprintf(s_ssid, sizeof(s_ssid), "%.32s", s_ble_ssid);
+                    snprintf(s_pass, sizeof(s_pass), "%.63s", s_ble_pass);
+                    s_wifi_disabled = false;
+                    /* Pending, not saved. NVS wins over the compiled-in values,
+                     * so committing a password that turns out to be wrong would
+                     * permanently override a working config and present as
+                     * reason=201 forever. The GOT_IP handler commits it once it
+                     * actually joins — which also puts the flash erase well
+                     * after the BLE controller is down. */
+                    s_creds_pending = true;
+                    s_wifi_tries = 0;
+                    log_event("ble join %s", s_ssid);
+                } else {
+                    s_wifi_disabled = true;   /* the "stay off" hand-off */
+                    log_event("ble wifi off");
+                }
+                memset(s_ble_pass, 0, sizeof(s_ble_pass));
+            }
+            wifi_driver_up();
+            if (!s_wifi_disabled) esp_wifi_connect();
         }
 
         /* The single owner of reconnection. The event handler only records the
@@ -5101,9 +5778,25 @@ void app_main(void) {
          * not there, and it can stay that way for hours. Hammering it every
          * 10 s achieves nothing, keeps the radio busy and floods the log. Ramp
          * 5 s -> 60 s and sit there. */
-        if (s_wifi_up || s_wifi_disabled) {
+        if (s_wifi_up || s_wifi_disabled || s_wifi_torn_down || s_wifi_scan_only) {
+            /* s_wifi_torn_down: the driver is deinitialised for a pairing
+             * session. Reconnecting into a dead driver would return
+             * ESP_ERR_WIFI_NOT_INIT on the backoff schedule for the whole
+             * session, burying real failures in the log.
+             *
+             * s_wifi_scan_only: a look-only bring-up for the phone's rescan. The
+             * event handler already declines to associate on STA_START, but that
+             * is not sufficient — ble_prov_rescan() runs on the NimBLE host task
+             * while this loop keeps its own schedule, and wifi_driver_up() clears
+             * s_wifi_torn_down, so for the second or two the scan takes this
+             * branch would otherwise be eligible to call esp_wifi_connect() and
+             * associate underneath it. A scan cannot run during a connect, so the
+             * result would be an empty list reported as "no networks in range".
+             * It would depend on where the backoff timer happened to land, which
+             * makes it the intermittent version of the bug the event-handler
+             * guard fixes deterministically. */
             s_wifi_tries = 0;
-        } else if (s_app != APP_WIFI) {
+        } else {
             int64_t wait = 5000LL << (s_wifi_tries < 4 ? s_wifi_tries : 4);
             if (wait > 60000) wait = 60000;
             if (t - last_rejoin >= wait) {
@@ -5142,7 +5835,10 @@ void app_main(void) {
             last_pet = t;
             pet_tick();
         }
-        if (s_pet_dirty && (t - last_pet_save) >= 60000) {
+        /* NVS commits erase flash, which stalls a BLE controller running
+         * from flash. The dirty flag stays set, so the write lands on the
+         * first pass after teardown rather than being dropped. */
+        if (s_pet_dirty && !ble_prov_nvs_blocked() && (t - last_pet_save) >= 60000) {
             last_pet_save = t;
             pet_save();
         }

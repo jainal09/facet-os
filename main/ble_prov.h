@@ -31,14 +31,15 @@
 #include <stdint.h>
 
 /* Session lifecycle, as shown on the CONTROL card and pushed to the phone.
- * Ordering matters only in that ERR is terminal until the next start(). */
+ * Numbering is wire-visible — the web page indexes a label table by it — so
+ * append rather than reorder. ERR is terminal until the next start(). */
 typedef enum {
     BLE_PROV_OFF = 0,      /* radio down, nothing allocated                  */
     BLE_PROV_ADV,          /* advertising, waiting for a phone               */
     BLE_PROV_LINKED,       /* phone connected, key exchange not finished     */
     BLE_PROV_AUTHED,       /* the 6-digit code checked out; channel is sealed */
-    BLE_PROV_JOINING,      /* credentials handed to Wi-Fi, awaiting result   */
-    BLE_PROV_DONE,         /* joined; session winding down                   */
+    BLE_PROV_HANDOFF,      /* credentials taken; closing so Wi-Fi can start  */
+    BLE_PROV_DONE,         /* handed off cleanly; radio going down           */
     BLE_PROV_ERR,          /* wrong code, too many attempts, or stack failure */
 } ble_prov_state_t;
 
@@ -54,10 +55,16 @@ typedef struct {
 /* ---- provided by ble_prov.c ------------------------------------------- */
 
 /* Bring up the controller and host and start advertising. Generates a fresh
- * key pair and a fresh 6-digit code. Returns false if the stack would not
- * come up, in which case nothing is left allocated. Call from the main loop,
- * never from an LVGL callback. */
-bool ble_prov_start(void);
+ * key pair and a fresh 6-digit code. Returns false if the stack would not come
+ * up, in which case nothing is left allocated. Call from the main loop, never
+ * from an LVGL callback.
+ *
+ * The scan list is passed in as a SNAPSHOT rather than fetched on demand,
+ * because BLE and an initialised Wi-Fi cannot coexist on this board (§7g): the
+ * caller scans, deinitialises Wi-Fi, then starts a session. There is no live
+ * rescan — the list is whatever was on the air when pairing began. `current` is
+ * the SSID the device was joined to, or "" / NULL. */
+bool ble_prov_start(const ble_prov_ap_t *aps, int n, const char *current);
 
 /* Disconnect any phone, stop advertising, and tear the stack down. Safe to
  * call when not running. Blocks briefly waiting for the host task to exit. */
@@ -85,29 +92,26 @@ void ble_prov_poll(int64_t now_ms);
  * Blocks for ~8 s, so call it once at boot and never from a running session. */
 void ble_prov_mem_probe(void);
 
-/* main.c reports the outcome of the join it was asked to perform. */
-void ble_prov_join_result(bool joined);
-
-/* main.c reports that a scan requested through ble_prov_request_scan() has
- * finished and s_aps[] is fresh. */
-void ble_prov_scan_ready(void);
-
-/* ---- provided by main.c ------------------------------------------------ */
-
-/* Copy up to max entries from the live scan list; returns how many. */
-int  ble_prov_get_aps(ble_prov_ap_t *out, int max);
-
-/* Ask the main loop for a fresh scan. Asynchronous — ble_prov_scan_ready()
- * comes back when it lands. */
-void ble_prov_request_scan(void);
-
-/* Hand credentials to the main loop to join with. The raw SSID bytes are
- * passed through untouched: they are arbitrary octets and only the *display*
- * path needs ASCII sanitising. */
+/* ---- provided by main.c ------------------------------------------------
+ * One callback, deliberately. Everything else the module needs is handed to it
+ * at start(), so it never reaches into main.c's state.
+ *
+ * Called once from ble_prov_poll(), immediately before the radio is torn down.
+ * The caller must re-initialise Wi-Fi and join only AFTER ble_prov_active()
+ * reads false — the two radios cannot both be up (§7g). An empty ssid means
+ * "stay off": the user asked to disconnect rather than to join something.
+ *
+ * The raw SSID bytes pass through untouched. They are arbitrary octets; only
+ * the display path needs ASCII sanitising. */
 void ble_prov_submit(const char *ssid, const char *pass);
 
-/* Ask the main loop to drop the current association. */
-void ble_prov_request_wifi_off(void);
-
-/* The currently joined SSID, or "" when not associated. */
-const char *ble_prov_current_ssid(void);
+/* Force a fresh Wi-Fi scan mid-session and refill `out`. Returns the number of
+ * networks, or -1 if it was refused.
+ *
+ * Refusal is the normal answer on this board today, and is not an error: Wi-Fi
+ * is deinitialised for the duration of a session precisely because its pools
+ * (~53.5 KB) do not fit beside a running BLE controller, and a live session has
+ * only ~41 KB free. The caller checks the real headroom at the moment of asking
+ * rather than assuming, so this starts succeeding on its own if the Wi-Fi
+ * buffer counts are ever trimmed — no code change needed to switch it on. */
+int ble_prov_rescan(ble_prov_ap_t *out, int max);

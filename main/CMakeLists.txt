@@ -66,7 +66,7 @@ configure_file("${CMAKE_CURRENT_LIST_DIR}/credentials.h.in"
                "${FACET_GEN_DIR}/credentials.h" @ONLY)
 
 idf_component_register(
-    SRCS "main.c" "hud_clock_76.c" "hud_text_18.c" "app_icons_64.c"
+    SRCS "main.c" "ble_prov.c" "hud_clock_76.c" "hud_clock_48.c" "hud_text_18.c" "app_icons_64.c" "hud_icons_30.c"
     INCLUDE_DIRS "." "${FACET_GEN_DIR}"
     # UI sounds live in flash, not on the card: ~99 KB of a 2.4 MB free app
     # slot, and no dependency on the SD card or the network to make a noise.
@@ -76,7 +76,7 @@ idf_component_register(
                 "../assets/sounds/pause.wav"
                 "../assets/sounds/resume.wav"
                 "../assets/sounds/done.wav"
-    REQUIRES nvs_flash esp_wifi esp_event esp_netif esp_http_client mbedtls
+    REQUIRES bt nvs_flash esp_wifi esp_event esp_netif esp_http_client mbedtls
              esp_timer esp_driver_gpio esp_driver_i2c esp_lcd_touch fatfs json esp_codec_dev esp_driver_i2s esp_app_format
              esp32_s3_touch_amoled_2_16
 )

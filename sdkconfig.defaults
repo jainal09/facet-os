@@ -146,3 +146,53 @@ CONFIG_LV_USE_LODEPNG=y
 # 3 MB of cache lives in PSRAM and holds the decoded 480x480 bitmap resident.
 CONFIG_LV_CACHE_DEF_SIZE=3145728
 CONFIG_LV_IMAGE_HEADER_CACHE_DEF_CNT=8
+
+#### Bluetooth LE — on-demand Wi-Fi provisioning from a phone (main/ble_prov.c)
+# BLE and Wi-Fi cannot both be initialised on this board: BLE costs 23-26.5 KB
+# of internal DMA-capable heap while up, against a floor of ~22 KB with an app
+# open. A pairing session deinitialises Wi-Fi first. See docs/HARDWARE.md §7g.
+CONFIG_BT_ENABLED=y
+CONFIG_BT_NIMBLE_ENABLED=y
+CONFIG_BT_CONTROLLER_ENABLED=y
+# THE load-bearing line. Measured with idf.py size-components on this target:
+# the stock controller costs ~22.6 KB of internal SRAM statically, which this
+# board does not have. Moving it out of IRAM into flash drops that to ~3.7 KB
+# for ~123 KB of flash, against ~11.9 MB unallocated. Cost: BLE misbehaves
+# during a flash *erase*, and SPI_FLASH_AUTO_SUSPEND is not available to us
+# (IDF disqualifies this board's XMC part), so NVS commits are gated on
+# ble_prov_nvs_blocked() while a session is open.
+CONFIG_BT_CTRL_RUN_IN_FLASH_ONLY=y
+# Host allocations to PSRAM. The host *task stack* cannot follow — the port
+# uses a plain xTaskCreatePinnedToCore — so that is trimmed instead.
+CONFIG_BT_NIMBLE_MEM_ALLOC_MODE_EXTERNAL=y
+CONFIG_BT_NIMBLE_HOST_TASK_STACK_SIZE=3072
+# One phone, peripheral only. Central and observer are dead weight here.
+CONFIG_BT_NIMBLE_MAX_CONNECTIONS=1
+CONFIG_BT_NIMBLE_ROLE_CENTRAL=n
+CONFIG_BT_NIMBLE_ROLE_OBSERVER=n
+CONFIG_BT_NIMBLE_MAX_BONDS=1
+CONFIG_BT_NIMBLE_MAX_CCCDS=2
+CONFIG_BT_NIMBLE_GATT_MAX_PROCS=2
+CONFIG_BT_NIMBLE_WHITELIST_SIZE=1
+CONFIG_BT_NIMBLE_ATT_MAX_PREP_ENTRIES=8
+# Buffer pools sized for one phone exchanging a few sub-512-byte messages
+# rather than for a busy central. These live in PSRAM via the alloc mode above,
+# so trimming them is tidiness, not a memory win — the ~23 KB is the controller.
+CONFIG_BT_NIMBLE_MSYS_1_BLOCK_COUNT=8
+CONFIG_BT_NIMBLE_MSYS_2_BLOCK_COUNT=4
+CONFIG_BT_NIMBLE_TRANSPORT_ACL_FROM_LL_COUNT=6
+CONFIG_BT_NIMBLE_TRANSPORT_EVT_COUNT=8
+CONFIG_BT_NIMBLE_TRANSPORT_EVT_DISCARD_COUNT=2
+# We authenticate at the application layer with ECDH plus a code on the panel,
+# so the whole SM/bonding/link-encryption stack is dead weight.
+CONFIG_BT_NIMBLE_SECURITY_ENABLE=n
+CONFIG_BT_NIMBLE_LL_CFG_FEAT_LE_ENCRYPTION=n
+CONFIG_BT_NIMBLE_50_FEATURE_SUPPORT=n
+CONFIG_BT_NIMBLE_ENABLE_CONN_REATTEMPT=n
+# 2 is the floor, not a preference: with BLE_MAX_ACT=1 advertising fails with
+# 519 (BLE_HS_HCI_ERR(7), memory capacity exceeded) because the controller
+# needs one activity for the advert and one for the connection it produces.
+CONFIG_BT_CTRL_BLE_MAX_ACT=2
+CONFIG_BT_CTRL_ADV_DUP_FILT_MAX=1
+CONFIG_BT_CTRL_BLE_SCAN_DUPL=n
+CONFIG_BT_CTRL_BLE_ADV_REPORT_FLOW_CTRL_SUPP=n
