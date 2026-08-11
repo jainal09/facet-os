@@ -2,6 +2,8 @@ package main
 
 import (
 	"bytes"
+	"encoding/binary"
+	"fmt"
 	"image"
 	"image/color"
 	"image/jpeg"
@@ -180,5 +182,57 @@ func TestEncodeLVGLBinPixelOrder(t *testing.T) {
 	// Pure red in RGB565 is 0xF800; little-endian on the wire is 0x00 then 0xF8.
 	if out[12] != 0x00 || out[13] != 0xF8 {
 		t.Fatalf("first pixel bytes %02X %02X, want 00 F8 (0xF800 little-endian)", out[12], out[13])
+	}
+}
+
+// dominantColor is the accent the player tints itself with, so the cases that
+// matter are the ones where naive averaging would produce something unusable.
+func TestDominantColor(t *testing.T) {
+	// build a size x size RGB565 buffer in LVGL's container, every pixel the same
+	solid := func(r, g, b uint8) []byte {
+		const size = 16
+		out := make([]byte, lvglHeaderLen+size*size*2)
+		out[0], out[1] = lvImageHeaderMagic, lvColorFormatRGB565
+		v := uint16(r>>3)<<11 | uint16(g>>2)<<5 | uint16(b>>3)
+		for i := lvglHeaderLen; i+1 < len(out); i += 2 {
+			binary.LittleEndian.PutUint16(out[i:i+2], v)
+		}
+		return out
+	}
+
+	if _, ok := dominantColor(solid(0xE0, 0x10, 0x10)); !ok {
+		t.Fatal("saturated red should yield an accent")
+	}
+
+	// Greyscale art has no hue to find. Returning a washed-out grey would tint the
+	// UI with something indistinguishable from its own chrome, so it must decline
+	// and let the caller keep its default.
+	if got, ok := dominantColor(solid(0x80, 0x80, 0x80)); ok {
+		t.Fatalf("grey art must not yield an accent, got %q", got)
+	}
+	// Near-black is skipped for the same reason, before saturation is even judged.
+	if got, ok := dominantColor(solid(0x08, 0x06, 0x02)); ok {
+		t.Fatalf("near-black art must not yield an accent, got %q", got)
+	}
+
+	// A dark but colourful cover must come back light enough to read a glyph
+	// against, which is the whole point of conditioning it here.
+	got, ok := dominantColor(solid(0x30, 0x08, 0x08))
+	if !ok {
+		t.Fatal("dark red should still yield an accent")
+	}
+	var rr, gg, bb int
+	if _, err := fmt.Sscanf(got, "%02X%02X%02X", &rr, &gg, &bb); err != nil {
+		t.Fatalf("accent %q is not RRGGBB: %v", got, err)
+	}
+	if mx := max(rr, max(gg, bb)); mx < 130 {
+		t.Errorf("accent %q too dark to draw on (max channel %d, want >=130)", got, mx)
+	}
+	if rr <= gg || rr <= bb {
+		t.Errorf("accent %q lost the red hue", got)
+	}
+
+	if _, ok := dominantColor([]byte{1, 2, 3}); ok {
+		t.Error("a truncated buffer must not yield an accent")
 	}
 }

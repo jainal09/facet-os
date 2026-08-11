@@ -26,6 +26,7 @@ import (
 	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/base64"
+	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -35,6 +36,7 @@ import (
 	"image/jpeg"
 	"io"
 	"log"
+	"math"
 	"net/http"
 	"net/url"
 	"os"
@@ -53,7 +55,10 @@ const (
 
 	// Only what a remote control needs. Asking for less makes the consent
 	// screen honest and limits the damage if a refresh token ever leaks.
-	spotifyScopes = "user-read-playback-state user-modify-playback-state"
+	// The library pair is for the like button: read to show whether the current
+	// track is already saved, modify to toggle it.
+	spotifyScopes = "user-read-playback-state user-modify-playback-state " +
+		"user-library-read user-library-modify"
 
 	pairTTL     = 5 * time.Minute
 	artMaxSize  = 640
@@ -473,7 +478,8 @@ func (s *stringWriter) Write(p []byte) (int, error) { return s.b.Write(p) }
 // draw chunk directly off the SD card.
 const (
 	lvImageHeaderMagic  = 0x19 // LV_IMAGE_HEADER_MAGIC
-	lvColorFormatRGB565 = 0x12 // LV_COLOR_FORMAT_RGB565
+	lvColorFormatRGB565 = 0x12
+	lvglHeaderLen       = 12 // LV_COLOR_FORMAT_RGB565
 )
 
 // encodeLVGLBin produces a pre-decoded RGB565 bitmap in LVGL's own container.
@@ -498,7 +504,7 @@ func encodeLVGLBin(img image.Image, size int) ([]byte, error) {
 	draw.CatmullRom.Scale(scaled, scaled.Bounds(), img, crop, draw.Over, nil)
 
 	stride := size * 2
-	out := make([]byte, 12+stride*size)
+	out := make([]byte, lvglHeaderLen+stride*size)
 
 	out[0] = lvImageHeaderMagic
 	out[1] = lvColorFormatRGB565
@@ -526,9 +532,100 @@ func putU16(b []byte, v uint16) {
 	b[1] = byte(v >> 8)
 }
 
+// dominantColor picks a UI-usable accent from an encoded RGB565 buffer.
+//
+// Derived from the served bytes rather than stored beside them, so a cache hit and
+// a cache miss can never disagree and no existing cache entry is invalidated.
+//
+// Averaging the image is not usable: album art averages to mud, and a near-black
+// or near-white tint makes a glyph drawn on top unreadable. So this weights every
+// sample by how colourful it is, discards the greys and the near-blacks entirely,
+// and then forces the result into a saturation and lightness band the UI can
+// actually use. Conditioning happens here rather than on the device because there
+// is float math available and one place to tune it.
+func dominantColor(bin []byte) (string, bool) {
+	if len(bin) < lvglHeaderLen+2 {
+		return "", false
+	}
+	px := bin[lvglHeaderLen:]
+
+	var sr, sg, sb, wsum float64
+	// Step 4 pixels: a 148x148 cover still yields ~5,400 samples, which is far
+	// more than enough to find a dominant hue and keeps this well under a
+	// millisecond.
+	for i := 0; i+1 < len(px); i += 8 {
+		v := binary.LittleEndian.Uint16(px[i : i+2])
+		// RGB565 -> 8 bit, replicating high bits into the low ones so full-scale
+		// channels reach 255 rather than 248/252.
+		r := float64((v>>11&0x1F)<<3 | (v >> 13 & 0x07))
+		g := float64((v>>5&0x3F)<<2 | (v >> 9 & 0x03))
+		b := float64((v&0x1F)<<3 | (v >> 2 & 0x07))
+
+		mx := math.Max(r, math.Max(g, b))
+		mn := math.Min(r, math.Min(g, b))
+		if mx < 40 {
+			continue // near-black: contributes no usable hue
+		}
+		sat := (mx - mn) / mx
+		if sat < 0.15 {
+			continue // grey, white, sepia wash
+		}
+		wt := sat * mx
+		sr += r * wt
+		sg += g * wt
+		sb += b * wt
+		wsum += wt
+	}
+	if wsum == 0 {
+		return "", false // monochrome art; caller keeps its own default
+	}
+
+	r, g, b := sr/wsum, sg/wsum, sb/wsum
+
+	// Force into a usable band. Below ~0.55 saturation the tint reads as grey
+	// against a dark UI; above ~0.95 value it starts to fight white text.
+	mx := math.Max(r, math.Max(g, b))
+	mn := math.Min(r, math.Min(g, b))
+	if mx == 0 {
+		return "", false
+	}
+	sat, val := (mx-mn)/mx, mx/255
+	if sat < 0.55 {
+		// pull each channel away from the grey axis until saturation reaches the
+		// floor, which preserves hue exactly
+		for _, c := range []*float64{&r, &g, &b} {
+			*c = mn + (*c-mn)*(mx-mn*(1-0.55))/math.Max(mx-mn, 1)
+		}
+	}
+	if val < 0.55 {
+		k := 0.55 / val
+		r, g, b = r*k, g*k, b*k
+	} else if val > 0.95 {
+		k := 0.95 / val
+		r, g, b = r*k, g*k, b*k
+	}
+
+	cl := func(f float64) uint8 {
+		if f < 0 {
+			return 0
+		}
+		if f > 255 {
+			return 255
+		}
+		return uint8(f + 0.5)
+	}
+	return fmt.Sprintf("%02X%02X%02X", cl(r), cl(g), cl(b)), true
+}
+
 func serveArt(w http.ResponseWriter, data []byte, rawOut bool) {
 	if rawOut {
 		w.Header().Set("Content-Type", "application/octet-stream")
+		// Ride the fetch the device already makes: a header costs no extra bytes
+		// and no extra round trip, where a second endpoint would cost a ~390 ms
+		// cold TLS handshake on the device.
+		if accent, ok := dominantColor(data); ok {
+			w.Header().Set("X-Art-Accent", accent)
+		}
 	} else {
 		w.Header().Set("Content-Type", "image/jpeg")
 	}
