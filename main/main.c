@@ -488,7 +488,118 @@ static void wifi_scan_now(void) {
 
 /* ---------------- HTTPS (Funnel profile) ---------------- */
 
+/* ---------------- network latency bench (temporary) ----------------
+ *
+ * A Spotify remote has to feel instant, and our HTTPS calls currently take
+ * ~1.5 s. Almost none of that is the request: it is DNS, TCP, and above all
+ * verifying a certificate chain with asymmetric crypto on a 240 MHz Xtensa.
+ *
+ * Aimed at api.spotify.com deliberately, with no Authorization header. The 401
+ * costs the same as a 200 everywhere that matters, and it exercises Spotify's
+ * real cert chain, cipher suite, edge node and network path — which is what
+ * actually sets the number. No credentials needed to measure any of this.
+ *
+ * Measures the same call two ways: a fresh client each time (what the firmware
+ * does today) against one handle reused with keep-alive.
+ */
+#define NET_BENCH 0        /* flip to 1 to re-measure; see HARDWARE.md 7f */
+#define NET_BENCH_URL "https://api.spotify.com/v1/me/player"
+#define NET_BENCH_N   5
+
+#if NET_BENCH
+static void net_bench_run(void) {
+    int64_t cold[NET_BENCH_N], warm[NET_BENCH_N];
+
+    ESP_LOGW(TAG, "=== net bench: %d cold calls (new connection each) ===", NET_BENCH_N);
+    for (int i = 0; i < NET_BENCH_N; i++) {
+        esp_http_client_config_t cfg = {
+            .url = NET_BENCH_URL,
+            .crt_bundle_attach = esp_crt_bundle_attach,
+            .timeout_ms = 10000,
+        };
+        int64_t t0 = esp_timer_get_time();
+        esp_http_client_handle_t c = esp_http_client_init(&cfg);
+        int code = 0, clen = 0;
+        if (c) {
+            esp_http_client_perform(c);
+            code = esp_http_client_get_status_code(c);
+            clen = (int)esp_http_client_get_content_length(c);
+            esp_http_client_cleanup(c);
+        }
+        cold[i] = (esp_timer_get_time() - t0) / 1000;
+        ESP_LOGW(TAG, "  cold[%d] HTTP %d  %d B  %lld ms", i, code, clen, (long long)cold[i]);
+        vTaskDelay(pdMS_TO_TICKS(300));
+    }
+
+    ESP_LOGW(TAG, "=== net bench: %d warm calls (one connection reused) ===", NET_BENCH_N);
+    {
+        esp_http_client_config_t cfg = {
+            .url = NET_BENCH_URL,
+            .crt_bundle_attach = esp_crt_bundle_attach,
+            .timeout_ms = 10000,
+            .keep_alive_enable = true,
+        };
+        esp_http_client_handle_t c = esp_http_client_init(&cfg);
+        for (int i = 0; i < NET_BENCH_N; i++) {
+            int64_t t0 = esp_timer_get_time();
+            int code = 0, clen = 0;
+            if (c) {
+                esp_http_client_perform(c);
+                code = esp_http_client_get_status_code(c);
+                clen = (int)esp_http_client_get_content_length(c);
+            }
+            warm[i] = (esp_timer_get_time() - t0) / 1000;
+            ESP_LOGW(TAG, "  warm[%d] HTTP %d  %d B  %lld ms", i, code, clen, (long long)warm[i]);
+            vTaskDelay(pdMS_TO_TICKS(300));
+        }
+        if (c) esp_http_client_cleanup(c);
+    }
+
+    ESP_LOGW(TAG, "=== net bench: 8 calls at a 3 s poll cadence (one connection) ===");
+    {
+        esp_http_client_config_t cfg = {
+            .url = NET_BENCH_URL,
+            .crt_bundle_attach = esp_crt_bundle_attach,
+            .timeout_ms = 10000,
+            .keep_alive_enable = true,
+        };
+        esp_http_client_handle_t c = esp_http_client_init(&cfg);
+        for (int i = 0; i < 8; i++) {
+            vTaskDelay(pdMS_TO_TICKS(3000));
+            int64_t t0 = esp_timer_get_time();
+            int code = 0, clen = 0;
+            if (c) {
+                esp_http_client_perform(c);
+                code = esp_http_client_get_status_code(c);
+                clen = (int)esp_http_client_get_content_length(c);
+            }
+            ESP_LOGW(TAG, "  poll[%d] HTTP %d  %d B  %lld ms", i, code, clen,
+                     (long long)((esp_timer_get_time() - t0) / 1000));
+        }
+        if (c) esp_http_client_cleanup(c);
+    }
+
+    int64_t cs = 0, ws = 0;
+    for (int i = 0; i < NET_BENCH_N; i++) { cs += cold[i]; ws += warm[i]; }
+    /* the first warm call still pays for the handshake, so the steady-state
+     * figure is the mean of the rest — that is what a poll would actually cost */
+    int64_t ws_steady = 0;
+    for (int i = 1; i < NET_BENCH_N; i++) ws_steady += warm[i];
+
+    ESP_LOGW(TAG, "=== net bench result: cold mean %lld ms | warm mean %lld ms | "
+                  "warm steady-state %lld ms | heap %u ===",
+             (long long)(cs / NET_BENCH_N), (long long)(ws / NET_BENCH_N),
+             (long long)(ws_steady / (NET_BENCH_N - 1)),
+             (unsigned)esp_get_free_internal_heap_size());
+}
+#endif
+
 static void https_task(void *arg) {
+#if NET_BENCH
+    xEventGroupWaitBits(s_evt, WIFI_CONNECTED_BIT, pdFALSE, pdTRUE, portMAX_DELAY);
+    vTaskDelay(pdMS_TO_TICKS(4000));      /* let SNTP and the UI settle first */
+    net_bench_run();
+#endif
     while (1) {
         xEventGroupWaitBits(s_evt, WIFI_CONNECTED_BIT, pdFALSE, pdTRUE, portMAX_DELAY);
 

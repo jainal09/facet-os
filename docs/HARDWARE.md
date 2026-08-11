@@ -354,6 +354,37 @@ onboard mics), both on the shared I²C bus, with a power amp enabled by
   in PSRAM (`xTaskCreateWithCaps`, `CONFIG_FREERTOS_TASK_CREATE_ALLOW_EXT_MEM`)
   so it costs no internal SRAM.
 
+## 7f. HTTPS latency — reuse the connection
+
+Measured against `api.spotify.com` (no token, so a 401 with a 94-byte body —
+which costs the same as a 200 everywhere that matters, and exercises a real
+cert chain, cipher suite and edge node without needing credentials):
+
+| | |
+|---|---|
+| New connection per call | **390 ms** |
+| Connection reused | **6 ms** |
+| Reused, called every 3 s for 24 s | **6 ms, every call** |
+
+Almost all of the 390 ms is TCP plus the TLS handshake — chiefly asymmetric
+crypto and certificate-chain verification on a 240 MHz Xtensa, not the request.
+So `.keep_alive_enable = true` on a **long-lived `esp_http_client` handle** is
+worth roughly **65x**, and it survives idle gaps, which is what makes it useful
+for polling rather than only for bursts. Creating a fresh client per request
+throws all of it away.
+
+Two things to know when measuring this:
+
+- **`esp_http_client_perform()` returns an error for a 401 carrying
+  `WWW-Authenticate: Bearer`** — it treats it as an auth challenge it cannot
+  answer. The headers and body have already arrived, so read
+  `esp_http_client_get_status_code()` **unconditionally**; gating it on
+  `perform() == ESP_OK` reports `HTTP 0` and makes a working request look broken.
+- Don't generalise from one host. An earlier ~1.5 s figure came from
+  `example.com` and was mostly that server, not our TLS cost.
+
+A re-runnable bench lives behind `#define NET_BENCH` in `main.c`.
+
 ## 8. Recovery when the board won't flash
 
 - **A connected battery defeats "unplug USB to power-cycle".** The board keeps
