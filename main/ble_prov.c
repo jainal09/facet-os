@@ -52,7 +52,7 @@ static const char *TAG = "ble_prov";
 /* ---- timing ------------------------------------------------------------ */
 
 #define ADV_TIMEOUT_MS     180000   /* nobody connected                      */
-#define AUTH_TIMEOUT_MS     60000   /* connected but never proved the code   */
+#define AUTH_TIMEOUT_MS    180000   /* connected but never proved the code   */
 #define IDLE_TIMEOUT_MS    180000   /* authenticated but gone quiet          */
 #define DONE_LINGER_MS      15000   /* let the phone see the good news       */
 #define MAX_AUTH_ATTEMPTS       5
@@ -73,6 +73,8 @@ static const char *TAG = "ble_prov";
 #define CMD_WIFI_OFF    0x04
 #define CMD_BYE         0x05
 #define CMD_RESCAN      0x06
+#define CMD_JOIN_SAVED  0x07
+#define CMD_FORGET      0x08
 
 /* cube -> phone, in DATA */
 #define RSP_APLIST      0x81
@@ -92,6 +94,7 @@ static const char *TAG = "ble_prov";
 #define DATA_CAP        512
 #define DATA_PT_CAP     (DATA_CAP - NONCE_LEN - TAG_LEN)
 #define CMD_CAP         256
+#define CMD_QUEUE       4    /* frames buffered between main-loop passes */
 
 /* Worst case (14 x 32-char SSIDs) only 12 entries fit one 512-byte attribute;
  * real SSIDs are far shorter, so the snapshot holds more than will ever be
@@ -126,11 +129,26 @@ typedef struct {
     uint8_t  key[KEY_LEN];
     char     code[7];               /* six ASCII digits + NUL                */
 
-    uint8_t  data[DATA_CAP];        /* sealed, ready for a GATT read         */
-    uint16_t data_len;
+    /* Two slots, published by flipping an index. NimBLE re-invokes the read
+     * callback for EVERY Read Blob Request and slices at `offset`
+     * (ble_gatts.c ble_gatts_val_access), so a >MTU payload is served across
+     * several callbacks spanning 60-200 ms — while the main task may be sealing
+     * a new one into the same memory. Writing in place hands the phone the head
+     * of one ciphertext and the tail of another, which fails the GCM tag. */
+    uint8_t  data[2][DATA_CAP];
+    uint16_t data_len[2];
+    volatile uint8_t data_idx;      /* published last; host task reads once   */
 
-    uint8_t  cmd[CMD_CAP];          /* sealed, straight off the host task    */
-    uint16_t cmd_len;
+    /* A QUEUE, not a buffer. GATT writes arrive on the NimBLE host task and
+     * the main loop only drains them every 20 ms, so a phone that writes twice
+     * in quick succession — HELLO then SCAN, which is exactly what the page
+     * does — puts the second frame where the first has not been read yet. With
+     * a single slot the first is lost silently and the second is judged in its
+     * place: the HELLO never gets examined and a correct pairing code is
+     * reported as wrong. */
+    struct { uint8_t buf[CMD_CAP]; volatile uint16_t len; } cmdq[CMD_QUEUE];
+    volatile uint8_t cmdq_head;     /* written by the host task */
+    volatile uint8_t cmdq_tail;     /* written by the main loop */
 
     /* Separate from cmd[] on purpose. The page writes SESSION and CMD back to
      * back, both land on the host task within milliseconds, and the main loop
@@ -139,6 +157,7 @@ typedef struct {
      * derived, the HELLO could not open, and the user was told "wrong code"
      * while typing the right one. */
     uint8_t  peer_pub[PUBKEY_LEN];
+    uint8_t  last_peer[PUBKEY_LEN];  /* tells a re-handshake from a replay    */
 
     /* The scan list as it was when pairing began. Wi-Fi is deinitialised for
      * the duration of a session, so there is nothing to rescan against. */
@@ -149,6 +168,7 @@ typedef struct {
     char     want_ssid[33];         /* handed back to main.c at teardown     */
     char     want_pass[64];
     bool     have_handoff;
+    bool     use_saved;        /* join with the stored password, not one sent */
 
     uint64_t tx_ctr;
     uint64_t rx_ctr;                /* highest accepted; replays are dropped */
@@ -158,18 +178,19 @@ typedef struct {
 
     int      auth_attempts;
     bool     have_key;
+    bool     authed;           /* proved the code once; survives HANDOFF   */
+    bool     lockout;          /* terminal; close as soon as poll() sees it */
 } session_t;
 
 static session_t *s_sess;
 
 static volatile bool  s_running;    /* stack is up, or coming up/going down  */
-static volatile bool  s_cmd_pending;
 static volatile bool  s_key_pending;
 static ble_prov_state_t s_state = BLE_PROV_OFF;
 static uint8_t  s_err;
 static uint8_t  s_data_seq;         /* bumped so the phone knows to re-read  */
 
-static uint16_t s_conn = BLE_HS_CONN_HANDLE_NONE;
+static volatile uint16_t s_conn = BLE_HS_CONN_HANDLE_NONE;   /* host task writes */
 static uint16_t s_state_handle;
 static uint8_t  s_own_addr_type;
 
@@ -313,8 +334,21 @@ static bool derive_key(const uint8_t *peer_pub)
 
     if (ok) {
         s_sess->have_key = true;
-        s_sess->tx_ctr = 0;
-        s_sess->rx_ctr = 0;
+        /* Anything staged was sealed under the key that just died — unreadable
+         * now, and advertising it as fresh makes the phone fetch a payload it
+         * can never decrypt. Drop it and reset the cue. */
+        s_sess->data_len[0] = s_sess->data_len[1] = 0;
+        s_data_seq = 0;
+        /* Reset the replay floor ONLY for a peer point we have not seen. The
+         * SESSION write is plaintext on the air, so replaying a captured one
+         * would otherwise re-zero rx_ctr and let every frame captured after it
+         * be replayed too. A genuine re-handshake always brings a fresh
+         * ephemeral point, so this costs nothing legitimate. */
+        if (memcmp(s_sess->last_peer, peer_pub, PUBKEY_LEN) != 0) {
+            memcpy(s_sess->last_peer, peer_pub, PUBKEY_LEN);
+            s_sess->tx_ctr = 0;
+            s_sess->rx_ctr = 0;
+        }
     } else {
         ESP_LOGW(TAG, "key agreement failed");
     }
@@ -352,19 +386,21 @@ static void build_aplist(void)
         memcpy(pt + o, aps[i].ssid, sl);
         o += sl;
         pt[o++] = (uint8_t)aps[i].rssi;
-        pt[o++] = aps[i].secure ? 1 : 0;
+        /* bit0 = needs a password, bit1 = we already have one */
+        pt[o++] = (uint8_t)((aps[i].secure ? 1 : 0) | (aps[i].saved ? 2 : 0));
         written++;
     }
     pt[count_at] = written;
 
+    uint8_t slot = (uint8_t)(s_sess->data_idx ^ 1);
     size_t sealed = 0;
-    if (seal(pt, o, s_sess->data, DATA_CAP, &sealed)) {
-        s_sess->data_len = (uint16_t)sealed;
+    if (seal(pt, o, s_sess->data[slot], DATA_CAP, &sealed)) {
+        s_sess->data_len[slot] = (uint16_t)sealed;
+        s_sess->data_idx = slot;    /* publish only once it is complete */
         s_data_seq++;
         ESP_LOGI(TAG, "aplist: %u of %d networks, %u bytes sealed",
                  written, n, (unsigned)sealed);
     } else {
-        s_sess->data_len = 0;
         ESP_LOGW(TAG, "aplist seal failed");
     }
     memset(pt, 0, sizeof(pt));
@@ -375,8 +411,27 @@ static void build_aplist(void)
 static int gatt_access(uint16_t conn, uint16_t attr,
                        struct ble_gatt_access_ctxt *ctxt, void *arg)
 {
-    (void)conn; (void)attr; (void)arg;
+    (void)conn; (void)arg;
     const ble_uuid_t *u = ctxt->chr->uuid;
+
+    /* Which characteristic, by handle and by our own name for it. The phone
+     * side reports only an opaque ATT code, so without this there is no way to
+     * tell "asked for the wrong thing" from "asked at the wrong time". */
+    /* Any GATT traffic is the user still being there. Refreshing only on
+     * commands meant the timer ran flat out through the pick-a-network and
+     * type-a-password step, which sends nothing at all — the session would
+     * expire underneath someone mid-password and simply go quiet. */
+    s_t_state = 0;   /* poll() re-stamps it on its next pass */
+
+    {
+        const char *nm = "?";
+        if      (!ble_uuid_cmp(u, &s_uuid_pubkey.u))  nm = "PUBKEY";
+        else if (!ble_uuid_cmp(u, &s_uuid_session.u)) nm = "SESSION";
+        else if (!ble_uuid_cmp(u, &s_uuid_cmd.u))     nm = "CMD";
+        else if (!ble_uuid_cmp(u, &s_uuid_data.u))    nm = "DATA";
+        else if (!ble_uuid_cmp(u, &s_uuid_state.u))   nm = "STATE";
+        ESP_LOGI(TAG, "gatt op=%d attr=%u chr=%s", ctxt->op, attr, nm);
+    }
 
     if (ble_uuid_cmp(u, &s_uuid_pubkey.u) == 0) {
         if (!s_sess) return BLE_ATT_ERR_UNLIKELY;
@@ -394,8 +449,16 @@ static int gatt_access(uint16_t conn, uint16_t attr,
     }
 
     if (ble_uuid_cmp(u, &s_uuid_data.u) == 0) {
-        if (!s_sess || !s_sess->data_len) return BLE_ATT_ERR_UNLIKELY;
-        return os_mbuf_append(ctxt->om, s_sess->data, s_sess->data_len) == 0
+        /* Read the index ONCE: the main task may flip it mid-transaction. */
+        uint8_t i = s_sess ? s_sess->data_idx : 0;
+        if (!s_sess || !s_sess->data_len[i]) {
+            /* The phone asked for a list we do not have. Logged because from
+             * the phone this is an opaque GATT error code with no context. */
+            ESP_LOGW(TAG, "DATA read with nothing staged (sess=%d)",
+                     s_sess ? 1 : 0);
+            return BLE_ATT_ERR_UNLIKELY;
+        }
+        return os_mbuf_append(ctxt->om, s_sess->data[i], s_sess->data_len[i]) == 0
                    ? 0 : BLE_ATT_ERR_INSUFFICIENT_RES;
     }
 
@@ -417,12 +480,22 @@ static int gatt_access(uint16_t conn, uint16_t attr,
 
     if (ble_uuid_cmp(u, &s_uuid_cmd.u) == 0) {
         if (!s_sess) return BLE_ATT_ERR_UNLIKELY;
+        uint8_t head = s_sess->cmdq_head;
+        uint8_t next = (uint8_t)((head + 1) % CMD_QUEUE);
+        if (next == s_sess->cmdq_tail) {
+            ESP_LOGW(TAG, "command queue full, dropping a frame");
+            return BLE_ATT_ERR_INSUFFICIENT_RES;
+        }
         uint16_t len = 0;
-        if (ble_hs_mbuf_to_flat(ctxt->om, s_sess->cmd, CMD_CAP, &len) != 0) {
+        if (ble_hs_mbuf_to_flat(ctxt->om, s_sess->cmdq[head].buf,
+                                CMD_CAP, &len) != 0) {
             return BLE_ATT_ERR_INVALID_ATTR_VALUE_LEN;
         }
-        s_sess->cmd_len = len;
-        s_cmd_pending = true;
+        s_sess->cmdq[head].len = len;
+        /* Release: everything above must be visible before the index that
+         * exposes it. Without the barrier the compiler is free to publish
+         * cmdq_head first and the main task reads a half-filled slot. */
+        __atomic_store_n(&s_sess->cmdq_head, next, __ATOMIC_RELEASE);
         return 0;
     }
 
@@ -572,7 +645,7 @@ bool ble_prov_start(const ble_prov_ap_t *aps, int n, const char *current)
         memcpy(s_sess->aps, aps, (size_t)n * sizeof(ble_prov_ap_t));
         s_sess->ap_count = n;
     }
-    if (current) snprintf(s_sess->cur_ssid, sizeof(s_sess->cur_ssid), "%s", current);
+    if (current) snprintf(s_sess->cur_ssid, sizeof(s_sess->cur_ssid), "%.32s", current);
 
     mbedtls_ecp_group_init(&s_sess->grp);
     mbedtls_mpi_init(&s_sess->d);
@@ -603,7 +676,6 @@ bool ble_prov_start(const ble_prov_ap_t *aps, int n, const char *current)
                                         from the first moment the radio can
                                         touch flash, not after it succeeds */
     s_conn        = BLE_HS_CONN_HANDLE_NONE;
-    s_cmd_pending = false;
     s_key_pending = false;
     s_err         = ERR_NONE;
     s_data_seq    = 0;
@@ -662,11 +734,15 @@ void ble_prov_stop(void)
     /* blecent's order. nimble_port_stop() waits for the host task to leave
      * nimble_port_run(); only then is it safe to free the controller. */
     int rc = nimble_port_stop();
-    if (rc == 0) {
-        nimble_port_deinit();
-    } else {
-        ESP_LOGE(TAG, "nimble_port_stop failed (%d) — leaving the stack up", rc);
+    if (rc != 0) {
+        /* The controller is still running. Freeing s_sess here would pull it
+         * out from under a live host task, and clearing s_running below would
+         * tell main.c that NVS and Wi-Fi are safe while they are not. Leave
+         * everything up; poll() retries. */
+        ESP_LOGE(TAG, "nimble_port_stop failed (%d) — session stays up", rc);
+        return;
     }
+    nimble_port_deinit();
 
     if (s_sess) {
         mbedtls_mpi_free(&s_sess->d);
@@ -676,7 +752,6 @@ void ble_prov_stop(void)
         s_sess = NULL;
     }
 
-    s_cmd_pending = false;
     s_key_pending = false;
     s_state = BLE_PROV_OFF;
     s_running = false;               /* last: unblocks NVS only once the
@@ -694,7 +769,7 @@ const char *ble_prov_code(void)
 
 /* ---- command handling (main task) -------------------------------------- */
 
-static void handle_command(int64_t now)
+static void handle_command(const uint8_t *frame, uint16_t frame_len, int64_t now)
 {
     uint8_t pt[CMD_CAP];
     size_t  n = 0;
@@ -703,18 +778,27 @@ static void handle_command(int64_t now)
      * this is a frame that arrived before key agreement completed. */
     if (!s_sess->have_key) {
         ESP_LOGW(TAG, "command before key agreement — dropping %u bytes",
-                 s_sess->cmd_len);
+                 frame_len);
         return;
     }
 
-    if (!unseal(s_sess->cmd, s_sess->cmd_len, pt, sizeof(pt), &n) || n < 1) {
+    /* A sealed HELLO is exactly this long. Anything else is not a code
+     * attempt, and counting it lets any peer that writes junk burn the limit
+     * and kill an open session. */
+    const bool hello_shaped = (frame_len == NONCE_LEN + 1 + 8 + TAG_LEN);
+    if (!unseal(frame, frame_len, pt, sizeof(pt), &n) || n < 1) {
         /* Before AUTHED this is the wrong 6 digits, which is a user error and
          * expected. After AUTHED it is a corrupt or replayed frame. */
-        if (s_state != BLE_PROV_AUTHED) {
+        if (!s_sess->authed && hello_shaped) {
             s_sess->auth_attempts++;
             s_err = (s_sess->auth_attempts >= MAX_AUTH_ATTEMPTS)
                         ? ERR_LOCKED_OUT : ERR_BAD_CODE;
             ESP_LOGW(TAG, "bad code (attempt %d)", s_sess->auth_attempts);
+            /* The page fires CMD_SCAN straight after HELLO without waiting for
+             * a verdict it cannot know yet. Both land in the queue, and judging
+             * both charged two attempts for one wrong code — three tries and
+             * the user was locked out. Drop the rest of the batch. */
+            s_sess->cmdq_tail = s_sess->cmdq_head;
             if (s_sess->auth_attempts >= MAX_AUTH_ATTEMPTS) {
                 /* Six digits is only 10^6 — trivial to grind over a radio link
                  * if guessing is free. The limit is what makes the code worth
@@ -724,8 +808,12 @@ static void handle_command(int64_t now)
                  * needs a physical press of PAIR and a fresh code. */
                 set_state(BLE_PROV_ERR, now);
                 ble_gap_adv_stop();
-                ESP_LOGW(TAG, "locked out after %d attempts — session closing",
+                ESP_LOGW(TAG, "locked out after %d attempts — session over",
                          MAX_AUTH_ATTEMPTS);
+                /* Terminal immediately. Lingering left s_running true, so the
+                 * user's first press of PAIR only tore the dead session down
+                 * and a second was needed to start a new one. */
+                s_sess->lockout = true;
             }
         } else {
             ESP_LOGW(TAG, "dropping an unopenable frame");
@@ -736,18 +824,24 @@ static void handle_command(int64_t now)
 
     uint8_t op = pt[0];
 
-    if (s_state != BLE_PROV_AUTHED) {
-        /* The first frame that opens proves the phone saw the screen. It must
-         * be HELLO and nothing else, so a malformed first frame cannot slip
-         * past as an accidental authentication. */
+    if (!s_sess->authed) {
+        /* Keyed on "has never authenticated", not "is not AUTHED right now":
+         * after CMD_JOIN the state is HANDOFF, and testing the state made every
+         * frame drained in that window count as a wrong code. */
         if (op != CMD_HELLO || n != 1 + 8 ||
             memcmp(pt + 1, HELLO_MAGIC, 8) != 0) {
+            /* Logged: this path was silent, and its silence cost a whole
+             * debugging round. A frame that decrypts but is not HELLO means the
+             * phone got ahead of itself, not that the code was wrong. */
+            ESP_LOGW(TAG, "pre-auth frame op=0x%02x len=%u is not HELLO",
+                     op, (unsigned)n);
             s_err = ERR_BAD_CODE;
             state_notify();
             return;
         }
         s_err = ERR_NONE;
         s_sess->auth_attempts = 0;
+        s_sess->authed = true;
         set_state(BLE_PROV_AUTHED, now);
         ESP_LOGI(TAG, "phone authenticated");
         state_notify();
@@ -766,12 +860,14 @@ static void handle_command(int64_t now)
 
     case CMD_JOIN: {
         /* [op][ssid_len][ssid][pass_len][pass] */
-        if (n < 2) break;
+        /* Each of these was a bare `break`, which fell through to the
+         * unchanged state_notify() and let the page read [AUTHED, err=0] as
+         * "Ready." — a malformed frame reported to the user as success. */
+        if (n < 2 || pt[1] > 32) { s_err = ERR_INTERNAL; break; }
         size_t sl = pt[1];
-        if (2 + sl + 1 > n) break;
+        if (2 + sl + 1 > n) { s_err = ERR_INTERNAL; break; }
         size_t pl = pt[2 + sl];
-        if (2 + sl + 1 + pl > n) break;
-        if (sl > 32 || pl > 63) break;
+        if (2 + sl + 1 + pl > n || pl > 63) { s_err = ERR_INTERNAL; break; }
 
         char ssid[33], pass[64];
         memcpy(ssid, pt + 2, sl);        ssid[sl] = '\0';
@@ -786,6 +882,42 @@ static void handle_command(int64_t now)
         s_sess->have_handoff = true;
         set_state(BLE_PROV_HANDOFF, now);
         memset(pass, 0, sizeof(pass));
+        break;
+    }
+
+    case CMD_JOIN_SAVED: {
+        /* [op][ssid_len][ssid] — no password on the wire at all. */
+        if (n < 2 || pt[1] > 32) { s_err = ERR_INTERNAL; break; }
+        size_t sl = pt[1];
+        if (2 + sl > n) { s_err = ERR_INTERNAL; break; }
+        char ssid[33];
+        memcpy(ssid, pt + 2, sl); ssid[sl] = '\0';
+        ESP_LOGI(TAG, "rejoin \"%s\" using stored credentials", ssid);
+        snprintf(s_sess->want_ssid, sizeof(s_sess->want_ssid), "%.32s", ssid);
+        s_sess->want_pass[0] = '\0';
+        s_sess->have_handoff = true;
+        s_sess->use_saved    = true;
+        set_state(BLE_PROV_HANDOFF, now);
+        break;
+    }
+
+    case CMD_FORGET: {
+        /* Deliberately does NOT end the session. The whole point is to escape a
+         * bad stored password, so the user must still be connected afterwards
+         * to type the right one. The actual NVS erase is deferred to main.c for
+         * after teardown — a flash erase with the controller running from flash
+         * is exactly what §7g forbids. */
+        if (n < 2 || pt[1] > 32) { s_err = ERR_INTERNAL; break; }
+        size_t fl = pt[1];
+        if (2 + fl > n) { s_err = ERR_INTERNAL; break; }
+        char fssid[33];
+        memcpy(fssid, pt + 2, fl); fssid[fl] = '\0';
+        ESP_LOGI(TAG, "forget \"%s\"", fssid);
+        ble_prov_forget(fssid);
+        for (int i = 0; i < s_sess->ap_count; i++) {
+            if (strncmp(s_sess->aps[i].ssid, fssid, 33) == 0) s_sess->aps[i].saved = false;
+        }
+        build_aplist();                 /* re-send so the phone drops the offer */
         break;
     }
 
@@ -849,14 +981,17 @@ void ble_prov_poll(int64_t now)
         state_notify();
     }
 
-    if (s_cmd_pending) {
-        s_cmd_pending = false;
+    /* Drain everything queued since the last pass, in arrival order. */
+    while (s_sess &&
+           s_sess->cmdq_tail != __atomic_load_n(&s_sess->cmdq_head,
+                                                __ATOMIC_ACQUIRE)) {
+        uint8_t t = s_sess->cmdq_tail;
         /* Any command is activity. Without this the idle timeout counts from
          * when AUTHED was entered and never restarts, so a session dies mid-use
-         * while the user is reading the list or typing a password — and the
-         * phone just goes quiet with no explanation. */
+         * while the user is reading the list or typing a password. */
         s_t_state = now;
-        handle_command(now);
+        handle_command(s_sess->cmdq[t].buf, s_sess->cmdq[t].len, now);
+        s_sess->cmdq_tail = (uint8_t)((t + 1) % CMD_QUEUE);
     }
 
     int64_t age = now - s_t_state;
@@ -872,8 +1007,15 @@ void ble_prov_poll(int64_t now)
 
     case BLE_PROV_LINKED:
         if (age > AUTH_TIMEOUT_MS) {
-            ESP_LOGI(TAG, "no authentication, closing");
-            ble_prov_stop();
+            /* Back to advertising with the SAME code rather than tearing the
+             * session down. The timer starts when the phone connects — before
+             * the user has even been shown the code — so someone who walked off
+             * to read it should find the cube still waiting. */
+            ESP_LOGI(TAG, "no authentication, back to advertising");
+            if (s_conn != BLE_HS_CONN_HANDLE_NONE) {
+                ble_gap_terminate(s_conn, BLE_ERR_REM_USER_CONN_TERM);
+            }
+            set_state(BLE_PROV_ADV, now);
         }
         break;
 
@@ -890,13 +1032,14 @@ void ble_prov_poll(int64_t now)
          * ble_prov_active() to go false before touching Wi-Fi. */
         if (age > HANDOFF_LINGER_MS && s_sess && s_sess->have_handoff) {
             char ssid[33], pass[64];
-            snprintf(ssid, sizeof(ssid), "%s", s_sess->want_ssid);
-            snprintf(pass, sizeof(pass), "%s", s_sess->want_pass);
+            bool saved = s_sess->use_saved;
+            snprintf(ssid, sizeof(ssid), "%.32s", s_sess->want_ssid);
+            snprintf(pass, sizeof(pass), "%.63s", s_sess->want_pass);
             s_sess->have_handoff = false;
             set_state(BLE_PROV_DONE, now);
             state_notify();
             ble_prov_stop();          /* frees s_sess, hence the local copies */
-            ble_prov_submit(ssid, pass);
+            ble_prov_submit(ssid, saved ? NULL : pass);
             memset(pass, 0, sizeof(pass));
         }
         break;
@@ -906,7 +1049,7 @@ void ble_prov_poll(int64_t now)
         break;
 
     case BLE_PROV_ERR:
-        if (age > DONE_LINGER_MS) ble_prov_stop();
+        if ((s_sess && s_sess->lockout) || age > DONE_LINGER_MS) ble_prov_stop();
         break;
 
     default:

@@ -50,6 +50,7 @@ typedef struct {
     char   ssid[33];
     int8_t rssi;
     bool   secure;
+    bool   saved;    /* we hold a password for this one; offer to reuse it */
 } ble_prov_ap_t;
 
 /* ---- provided by ble_prov.c ------------------------------------------- */
@@ -102,8 +103,20 @@ void ble_prov_mem_probe(void);
  * "stay off": the user asked to disconnect rather than to join something.
  *
  * The raw SSID bytes pass through untouched. They are arbitrary octets; only
- * the display path needs ASCII sanitising. */
+ * the display path needs ASCII sanitising.
+ *
+ * `pass == NULL` means "join this SSID with the credentials already stored".
+ * The device knows the password for the network it last joined — that is how it
+ * rejoins after a reboot — so making the user retype it into a phone to get back
+ * onto a network it already knows is pure friction. */
 void ble_prov_submit(const char *ssid, const char *pass);
+
+/* Discard the stored password for one network. Called mid-session, so it only
+ * marks the intent — the erase is an NVS write and must wait until the radio is
+ * down. Exists so a wrong saved password is escapable: without it the phone
+ * offers "reconnect", the reconnect fails, and there is no route back to a
+ * password field. */
+void ble_prov_forget(const char *ssid);
 
 /* Force a fresh Wi-Fi scan mid-session and refill `out`. Returns the number of
  * networks, or -1 if it was refused.

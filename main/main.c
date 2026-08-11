@@ -183,6 +183,12 @@ static bool s_wifi_diag_done;           /* one scan dump per boot when joining f
 static volatile bool s_req_ble_on;      /* CONTROL: start pairing  */
 static volatile bool s_req_ble_off;     /* CONTROL: stop pairing   */
 static bool s_wifi_torn_down;           /* driver deinitialised for a session */
+static bool s_ble_forget;               /* discard stored creds after teardown */
+/* GOT_IP runs on the esp_event task. Both the credential commit and the known
+ * table belong to the main task — one is a flash write that BLE may be gating,
+ * the other is a shared array with no lock. Stage here, act in the main loop. */
+static volatile bool s_req_creds_save;
+static volatile bool s_req_known_remember;
 static bool s_ble_handoff;              /* credentials waiting to be applied  */
 /* Rescan brings Wi-Fi up only to look around. Without this the STA_START event
  * immediately calls esp_wifi_connect(), and a scan cannot run while a connect
@@ -244,6 +250,11 @@ static lv_obj_t *s_lock_rule;    /* divider under the clock; moves with it */
 static int s_sweep_deg;
 
 /* App state store + power state — defined further down, used from above */
+/* Known-network table lives further down with the other credential code, but
+ * the Wi-Fi event handler confirms a join before that point. */
+static void known_remember(const char *ssid, const char *pass);
+static const char *known_pass(const char *ssid);
+
 static void store_init_dirs(void);
 static bool store_save(const char *id, const void *data, size_t len);
 static bool store_load(const char *id, void *data, size_t len);
@@ -471,6 +482,13 @@ static void wifi_event_handler(void *arg, esp_event_base_t base, int32_t id, voi
         esp_wifi_connect();
     } else if (base == WIFI_EVENT && id == WIFI_EVENT_STA_DISCONNECTED) {
         wifi_event_sta_disconnected_t *d = (wifi_event_sta_disconnected_t *)data;
+        if (s_creds_pending) {
+            /* Credentials that never worked. The phone is already gone by now
+             * (the radio came down to let Wi-Fi up), so the panel is the only
+             * place this can be said. */
+            log_event(d->reason == 201 ? "join failed: not found"
+                                       : "join failed: rejected");
+        }
         s_wifi_up = false;
         s_ip[0] = '\0';
         xEventGroupClearBits(s_evt, WIFI_CONNECTED_BIT);
@@ -491,10 +509,15 @@ static void wifi_event_handler(void *arg, esp_event_base_t base, int32_t id, voi
         s_wifi_up = true;
         log_event("wifi " IPSTR, IP2STR(&e->ip_info.ip));
         if (!s_time_synced) s_req_sntp = true;
+        /* Every confirmed join, not just credentials that arrived over BLE.
+         * Gating this on s_creds_pending meant a device that had been working
+         * since before the table existed had an EMPTY table — so the phone
+         * showed nothing as saved and asked for a password the cube held. */
+        s_req_known_remember = true;
         /* It works — now it is safe to remember. */
         if (s_creds_pending) {
             s_creds_pending = false;
-            creds_save(s_ssid, s_pass);
+            s_req_creds_save = true;
             ESP_LOGI(TAG, "credentials for \"%s\" confirmed and saved", s_ssid);
         }
         xEventGroupSetBits(s_evt, WIFI_CONNECTED_BIT);
@@ -666,14 +689,141 @@ int ble_prov_rescan(ble_prov_ap_t *out, int max) {
         snprintf(out[i].ssid, sizeof(out[i].ssid), "%.32s", s_aps[i].ssid);
         out[i].rssi   = s_aps[i].rssi;
         out[i].secure = s_aps[i].secure;
+        /* Must be recomputed, not inherited. `out` aliases the live snapshot,
+         * which already carries saved bits for the PREVIOUS list — leaving them
+         * alone attaches them to whatever SSID now occupies that index. */
+        out[i].saved  = known_pass(out[i].ssid) != NULL;
     }
     ESP_LOGI(TAG, "rescan found %d networks", n);
     return n;
 }
 
+/* ---- known networks -------------------------------------------------
+ * The device used to remember exactly one network, so "saved" could only ever
+ * mean the one it was last on — useless for rejoining anywhere else. This keeps
+ * a small table instead, the way a phone does.
+ *
+ * NVS, not the SD card: these are plaintext passwords and the card is
+ * removable. KNOWN_MAX x sizeof(known_net_t) is under 1 KB, which NVS holds
+ * comfortably as a single blob. */
+#define KNOWN_MAX 8
+typedef struct { char ssid[33]; char pass[64]; } known_net_t;
+static known_net_t s_known[KNOWN_MAX];
+static int  s_known_count;
+static bool s_known_dirty;              /* needs writing once BLE is down */
+
+static void known_load(void) {
+    nvs_handle_t h;
+    if (nvs_open("wifi", NVS_READONLY, &h) != ESP_OK) return;
+    size_t sz = sizeof(s_known);
+    if (nvs_get_blob(h, "known", s_known, &sz) == ESP_OK) {
+        s_known_count = (int)(sz / sizeof(known_net_t));
+        if (s_known_count > KNOWN_MAX) s_known_count = KNOWN_MAX;
+    }
+    nvs_close(h);
+    ESP_LOGI(TAG, "%d known networks", s_known_count);
+}
+
+/* Deferred: an NVS commit is a flash erase, and §7g forbids that while the BLE
+ * controller is executing from flash. */
+static void known_flush(void) {
+    if (!s_known_dirty || ble_prov_nvs_blocked()) return;
+    nvs_handle_t h;
+    if (nvs_open("wifi", NVS_READWRITE, &h) != ESP_OK) return;
+    esp_err_t e = nvs_set_blob(h, "known", s_known,
+                               (size_t)s_known_count * sizeof(known_net_t));
+    if (e == ESP_OK) e = nvs_commit(h);
+    nvs_close(h);
+    if (e == ESP_OK) {
+        s_known_dirty = false;
+        ESP_LOGI(TAG, "known networks saved (%d)", s_known_count);
+    } else {
+        /* Dirty flag stays up so the next pass retries. Clearing it here would
+         * drop the credential silently, and the user would discover it by being
+         * asked for a password they had already given. */
+        ESP_LOGW(TAG, "known networks NOT saved: %s", esp_err_to_name(e));
+    }
+}
+
+static const char *known_pass(const char *ssid) {
+    for (int i = 0; i < s_known_count; i++) {
+        if (strncmp(s_known[i].ssid, ssid, sizeof(s_known[i].ssid)) == 0) {
+            return s_known[i].pass;
+        }
+    }
+    return NULL;
+}
+
+static void known_remember(const char *ssid, const char *pass) {
+    if (!ssid[0]) return;
+    for (int i = 0; i < s_known_count; i++) {
+        if (strncmp(s_known[i].ssid, ssid, sizeof(s_known[i].ssid)) != 0) continue;
+        /* Move to the end on every join, making eviction least-recently-joined
+         * rather than first-ever-added — otherwise "home", added first and used
+         * daily, is the first casualty of a ninth network joined once. */
+        known_net_t e = s_known[i];
+        bool same = strncmp(e.pass, pass, sizeof(e.pass)) == 0;
+        snprintf(e.pass, sizeof(e.pass), "%.63s", pass);
+        memmove(&s_known[i], &s_known[i + 1],
+                (size_t)(s_known_count - i - 1) * sizeof(known_net_t));
+        s_known[s_known_count - 1] = e;
+        if (!same || i != s_known_count - 1) s_known_dirty = true;
+        return;
+    }
+    if (s_known_count == KNOWN_MAX) {
+        memmove(&s_known[0], &s_known[1], (KNOWN_MAX - 1) * sizeof(known_net_t));
+        s_known_count--;
+    }
+    snprintf(s_known[s_known_count].ssid, sizeof(s_known[0].ssid), "%.32s", ssid);
+    snprintf(s_known[s_known_count].pass, sizeof(s_known[0].pass), "%.63s", pass);
+    s_known_count++;
+    s_known_dirty = true;
+}
+
+void ble_prov_forget(const char *ssid) {
+    for (int i = 0; i < s_known_count; i++) {
+        if (strncmp(s_known[i].ssid, ssid, sizeof(s_known[i].ssid)) == 0) {
+            memmove(&s_known[i], &s_known[i + 1],
+                    (size_t)(s_known_count - i - 1) * sizeof(known_net_t));
+            s_known_count--;
+            s_known_dirty = true;
+            break;
+        }
+    }
+    /* Outside the loop deliberately. Nested inside the table-match branch this
+     * was a silent no-op for a network that was the boot credential but had
+     * never been added — which was every network on a device that had been
+     * working since before the table existed. */
+    if (strncmp(s_ssid, ssid, sizeof(s_ssid)) == 0) {
+        s_ssid[0] = '\0';
+        s_pass[0] = '\0';
+        s_ble_forget = true;
+        /* Nothing is configured now; say so rather than leaving the reconnect
+         * owner hammering an empty SSID forever. */
+        s_wifi_disabled = true;
+    }
+}
+
 void ble_prov_submit(const char *ssid, const char *pass) {
     snprintf(s_ble_ssid, sizeof(s_ble_ssid), "%.32s", ssid);
-    snprintf(s_ble_pass, sizeof(s_ble_pass), "%.63s", pass);
+    if (pass) {
+        snprintf(s_ble_pass, sizeof(s_ble_pass), "%.63s", pass);
+    } else {
+        /* Rejoin with what we already hold for THAT network — any of the
+         * known ones, not merely whichever was joined last. */
+        const char *k = known_pass(s_ble_ssid);
+        if (!k) {
+            /* Joining with an empty password would fail, and worse would
+             * OVERWRITE the stored credential with "" on the way. Refuse. */
+            ESP_LOGW(TAG, "no stored password for \"%s\" — refusing", s_ble_ssid);
+            s_ble_ssid[0] = '\0';
+            s_ble_pass[0] = '\0';
+            s_ble_handoff = true;
+            return;
+        }
+        snprintf(s_ble_pass, sizeof(s_ble_pass), "%.63s", k);
+        ESP_LOGI(TAG, "rejoining \"%s\" with stored credentials", s_ble_ssid);
+    }
     s_ble_handoff = true;
 }
 
@@ -5502,6 +5652,11 @@ void app_main(void) {
     log_mem("boot");
 
     creds_load();
+    known_load();
+    /* Seed from the boot credential. Without this a device that has been on the
+     * same network since before the table existed reports nothing as saved, and
+     * the phone asks for a password the cube is holding. Self-dedupes. */
+    if (s_ssid[0] && s_pass[0]) known_remember(s_ssid, s_pass);
     pet_load();
     pomo_load();
 
@@ -5727,7 +5882,15 @@ void app_main(void) {
             /* Scan while there is still a driver to scan with. This snapshot is
              * the entire list the phone will ever see — Wi-Fi is gone for the
              * whole session, so there is no rescan. */
-            if (!s_wifi_disabled) wifi_scan_now();
+            if (!s_wifi_disabled) {
+                /* A scan is refused while a connect is in flight and
+                 * wifi_scan_now() has already zeroed the list by then, so the
+                 * phone gets an empty one. The reconnect diagnostic elsewhere
+                 * in this loop works around it the same way. */
+                esp_wifi_disconnect();
+                vTaskDelay(pdMS_TO_TICKS(200));
+                wifi_scan_now();
+            }
 
             ble_prov_ap_t snap[16];
             int n = (s_ap_count < 16) ? s_ap_count : 16;
@@ -5737,10 +5900,17 @@ void app_main(void) {
                 snprintf(snap[i].ssid, sizeof(snap[i].ssid), "%.32s", s_aps[i].ssid);
                 snap[i].rssi   = s_aps[i].rssi;
                 snap[i].secure = s_aps[i].secure;
+                snap[i].saved  = known_pass(snap[i].ssid) != NULL;
             }
             char cur[33];
             snprintf(cur, sizeof(cur), "%.32s", s_wifi_up ? s_ssid : "");
-
+            /* The network we hold a password for, whether or not we are on it.
+             * s_ssid is the configured SSID and s_pass its key; being offline
+             * does not mean we have forgotten them. */
+            int nsaved = 0;
+            for (int i = 0; i < n; i++) if (snap[i].saved) nsaved++;
+            ESP_LOGI(TAG, "ble pairing: %d networks (%d known), current=\"%s\"",
+                     n, nsaved, cur);
             log_event("ble pairing (%d networks)", n);
             wifi_driver_down();
 
@@ -5771,6 +5941,22 @@ void app_main(void) {
          * pairing and wandered off, which is the likeliest way this gets used
          * wrong. */
         if (s_wifi_torn_down && !ble_prov_active()) {
+            /* Before any join, so a forget-then-join in one session ends up
+             * with the new credentials rather than nothing. */
+            if (s_ble_forget) {
+                s_ble_forget = false;
+                s_ssid[0] = '\0';
+                s_pass[0] = '\0';
+                nvs_handle_t h;
+                if (nvs_open("wifi", NVS_READWRITE, &h) == ESP_OK) {
+                    nvs_erase_key(h, "ssid");
+                    nvs_erase_key(h, "pass");
+                    nvs_commit(h);
+                    nvs_close(h);
+                }
+                ESP_LOGI(TAG, "stored wifi credentials forgotten");
+                log_event("wifi forgotten");
+            }
             if (s_ble_handoff) {
                 s_ble_handoff = false;
                 if (s_ble_ssid[0]) {
@@ -5795,6 +5981,19 @@ void app_main(void) {
             wifi_driver_up();
             if (!s_wifi_disabled) esp_wifi_connect();
         }
+
+        /* Deferred credential writes land here, on the main task, once the
+         * radio is down. */
+        if (s_req_known_remember && !ble_prov_nvs_blocked()) {
+            s_req_known_remember = false;
+            known_remember(s_ssid, s_pass);
+        }
+        if (s_req_creds_save && !ble_prov_nvs_blocked()) {
+            s_req_creds_save = false;
+            creds_save(s_ssid, s_pass);
+            ESP_LOGI(TAG, "credentials for \"%s\" confirmed and saved", s_ssid);
+        }
+        known_flush();
 
         /* The single owner of reconnection. The event handler only records the
          * reason; everything else happens here, so there is exactly one caller
