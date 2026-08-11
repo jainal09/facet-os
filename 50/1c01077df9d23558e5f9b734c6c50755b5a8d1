@@ -1,0 +1,26 @@
+broker/main_test.go
+  s_57e4cf4a7836a6::t_199d8a303619df 128-184
+broker/main.go
+  s_57e4cf4a7836a6::t_a4c5d6ad90b0b2 137,375-385,391,395,412,415,429-431,473,527-532
+  s_57e4cf4a7836a6::t_aa0e545c99b18c 468-472,474-526
+broker/README.md
+  s_57e4cf4a7836a6::t_00d907125ad484 44,115
+docs/HARDWARE.md
+  s_57e4cf4a7836a6::t_a61e63a86ba375 317-325
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.22",
+  "base_commit_sha": "501c01077df9d23558e5f9b734c6c50755b5a8d1",
+  "prompts": {},
+  "sessions": {
+    "s_57e4cf4a7836a6": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "79540328-5c96-430d-b4c5-de35687f549e",
+        "model": "claude-opus-5"
+      },
+      "human_author": "Jainal Gosaliya <jainal09gosalia@gmail.com>"
+    }
+  }
+}
