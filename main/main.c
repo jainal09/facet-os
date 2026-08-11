@@ -230,6 +230,13 @@ static uint32_t s_tele_rows;
 static bool s_doze;
 static char s_wall_credit[48];      /* Unsplash photographer, shown in CONTROL */
 
+/* Set if any task had to fall back to an internal stack. That silently gives
+ * back the ~8 KB that moving stacks to PSRAM bought, and the only symptom would
+ * be a floor regression with no visible cause — so it is surfaced in the
+ * periodic status line rather than left to be re-derived from a heap
+ * distribution later. */
+static bool s_stack_fallback;
+
 /* Wallpaper pool state. Declared up here rather than beside the fetch code
  * because both the network task and the CONTROL screen are defined long before
  * it, and both need to see it. */
@@ -1864,7 +1871,9 @@ static void sfx_init(void) {
     /* stack in PSRAM: this task does no ISR work and touches no DMA directly */
     if (xTaskCreateWithCaps(sfx_task, "sfx", 5120, NULL, 4, NULL,
                             MALLOC_CAP_SPIRAM) != pdPASS) {
-        ESP_LOGW(TAG, "sfx task (PSRAM stack) failed — falling back to internal");
+        ESP_LOGE(TAG, "!! sfx stack fell back to INTERNAL SRAM — costs ~5 KB of "
+                      "the scarce pool; expect a lower floor");
+        s_stack_fallback = true;
         xTaskCreate(sfx_task, "sfx", 4096, NULL, 4, NULL);
     }
 }
@@ -4072,7 +4081,9 @@ void app_main(void) {
      * polls and downloads. Same trick as the sfx task. */
     if (xTaskCreateWithCaps(net_task, "net", 8192, NULL, 5, NULL,
                             MALLOC_CAP_SPIRAM) != pdPASS) {
-        ESP_LOGW(TAG, "net task (PSRAM stack) failed — falling back to internal");
+        ESP_LOGE(TAG, "!! net stack fell back to INTERNAL SRAM — costs ~8 KB of "
+                      "the scarce pool; expect a lower floor");
+        s_stack_fallback = true;
         xTaskCreate(net_task, "net", 8192, NULL, 5, NULL);
     }
 
@@ -4305,7 +4316,7 @@ void app_main(void) {
                 }
             }
             ESP_LOGI(TAG, "uptime=%llds clock=%s scr=%d idle=%lu/%llds wifi=%s screen=%s batt=%d%% %dmV%s fps=%u.%u "
-                          "rot=%d sd=%lu pet[%d/%d/%d]",
+                          "rot=%d sd=%lu pet[%d/%d/%d]%s",
                      (long long)(t / 1000), clock, (int)s_app,
                      (unsigned long)lv_display_get_inactive_time(NULL),
                      (long long)((t - s_last_btn) / 1000),
@@ -4314,7 +4325,8 @@ void app_main(void) {
                      (int)s_batt_pct, (int)s_batt_mv,
                      s_batt_charging ? " CHG" : "",
                      (unsigned)(s_last_fps_x10 / 10), (unsigned)(s_last_fps_x10 % 10),
-                     s_rot * 90, (unsigned long)s_tele_rows, s_food, s_fun, s_nrg);
+                     s_rot * 90, (unsigned long)s_tele_rows, s_food, s_fun, s_nrg,
+                     s_stack_fallback ? " STACK-FALLBACK!" : "");
             log_mem("periodic");
         }
     }
