@@ -330,6 +330,35 @@ Two independent gates are needed, and the second is easy to miss:
   screen flips back and forth every few seconds while the device sits still on
   a desk at an angle.
 
+### Switching autorotate off
+
+CONTROL carries a switch for it, and three details make it work rather than
+merely stop the panel turning:
+
+- **Gate the commit, never the poll.** `imu_poll()` must keep reading the
+  accelerometer and updating `s_base_rot` even when the panel is pinned, because
+  FOCUS reads orientation as *input* and flat-means-pause reads `s_acc_z`. An
+  early return in `imu_poll()` looks correct — the panel stops rotating, which
+  is what was asked — and silently kills the FOCUS dial, motion-wake and pause
+  together. The failure is invisible at the rotation level, so testing the
+  switch itself will never catch it.
+- **Persist the held orientation, not just the flag.** `s_rot` lives only in
+  RAM and boot calls `rotation_apply()` unconditionally, so without saving it a
+  reboot lands back at native 0° with the switch still reading OFF — and since
+  the calibration button fades out in that state, with no way back at all.
+- **Nothing needs re-arming when it goes back on.** The vote counter keeps
+  running while the switch is off, so an orientation that has already settled
+  commits on the next poll. Zeroing the votes in the callback would turn an
+  instant snap into an 800 ms wait; calling `rotation_apply()` from the callback
+  to force one would bypass the magnitude and margin gates above, which exist
+  precisely because a near-45° pose has no right answer.
+
+The main UX consequence is worth knowing before someone reports it as a bug:
+**gestures are expressed in LVGL directions, which are relative to the panel.**
+Held at 90°, "swipe up for home" becomes a physically sideways swipe on every
+screen — including MUSIC, where the swipe is the only way home because the keys
+are rebound to volume.
+
 ## 7. AXP2101 PMU
 
 - **Charge current powers up at 25 mA** (reg `0x62` = 0x01), which looks exactly
@@ -682,7 +711,7 @@ all stayed unset. It does auto-select `ESP_COEX_SW_COEXIST_ENABLE`.
 ## 9. BSP bugs patched in this fork
 
 `components/esp32_s3_touch_amoled_2_16` is forked from
-`waveshare/esp32_s3_touch_amoled_2_16` v2.0.1 with five changes. Anyone forking
+`waveshare/esp32_s3_touch_amoled_2_16` v2.0.1 with seven changes. Anyone forking
 it independently will need the same ones:
 
 1. `bsp_display_lock()` returns `esp_lv_adapter_lock()`'s `esp_err_t`
@@ -700,6 +729,19 @@ it independently will need the same ones:
    pays ~2.9 KB of internal SRAM for a capture channel it never reads. Added
    `bsp_audio_enable_rx(bool)`; `bsp_audio_codec_microphone_init()` forces it
    back on so the mics still work.
+7. **Brightness is hardcoded to 100% in three places**, which makes a
+   user-settable level impossible to honour at boot. The init-command table
+   writes `0x51 = 0xFF`, and `0x29` (display on) two rows later carries a 600 ms
+   delay — so the panel is lit at maximum for well over half a second before
+   `app_main` gets control. `bsp_display_brightness_init()` then writes 100
+   again, and `bsp_display_backlight_on()` writes 100 on every wake. Changed the
+   table entry to `0x00` (dark is the correct direction to fail in, and
+   `bsp_display_lcd_init` has exactly one caller, which lights the panel
+   immediately afterwards), and added `bsp_display_brightness_set_boot(int)`
+   that both `brightness_init()` and `backlight_on()` now read. Leaving
+   `backlight_on()` at a hardcoded 100 would have left a loaded gun: the
+   invariant "brightness only ever comes from `s_bright`" would have been
+   enforced by nothing but the absence of callers.
 
 ## 10. Pitfalls index
 
@@ -864,6 +906,46 @@ it independently will need the same ones:
     shared working tree. The boot log settles it in one line: the app version
     string and any log line the new code adds. Commit before handing the board
     over, and check `git status` before believing a regression report.
+22. **The display lock IS recursive, and two comments in this file said it was
+    not.** `esp_lv_adapter.c:601` creates it with
+    `xSemaphoreCreateRecursiveMutex()` and `esp_lv_adapter_lock()` takes it with
+    `xSemaphoreTakeRecursive()`; `bsp_display_lock()` is a one-to-one wrapper.
+    So calling `ui_lock()` from an LVGL event callback succeeds immediately by
+    bumping the count rather than deadlocking, and there is exactly one thing to
+    be careful about: **an early `return` between the take and the unlock owns
+    the mutex forever.** The single `unlock` in `lvgl_worker` drops the count to
+    1, never 0, and every other task's `ui_lock()` then times out — the same
+    symptom as #13, from the opposite cause.
+
+    The reason to take the lock was never recursion. It is that two **tasks**
+    must not drive the QSPI device at once: `num_trans_inflight` and
+    `trans_pool[]` in `esp_lcd_panel_io_spi.c` are unlocked plain fields mutated
+    by both `tx_param` and `tx_color`, and a foreign task's `tx_param` also
+    consumes completions the LVGL task is accounting for. An LVGL event callback
+    is exempt only because it *is* the LVGL task. Nothing else is.
+23. **A "what I last wrote" cache needs exactly one writer, or the next wake is
+    a black screen.** Brightness writes are change-gated against
+    `s_bright_applied` so a drag does not issue a 0x51 per touch sample. The
+    sleep path used `bsp_display_backlight_off()`, which writes 0 to the panel
+    *without* going through the gate — so the cache read 60 while the panel sat
+    at 0, and the next wake compared 60 against 60, skipped the write, and left
+    the display dark with every flag saying the screen was on. Route every
+    writer through the one function that owns the cache, including the ones that
+    look too trivial to bother with.
+24. **A 44 px control does not reliably register on this touchscreen.** The
+    glass is curved and the controller is noisy near the edges; sliders read
+    drags as taps and taps as nothing. 76 px works. This is the second time the
+    lesson was learned here — the first MUSIC layout shipped 46 px transport
+    buttons that ghost-touched and were rebuilt at 76/88/76.
+
+    Two things that are *not* the fix: padding a slider knob proud of its track
+    (a 66 px ball on a 46 px bar reads as a rendering bug, and buys nothing
+    because an `lv_slider` already jumps to wherever you press on the track),
+    and scaling controls without scaling type — 14 px labels beside 76 px
+    controls look like a desktop dialog enlarged wrong. `lv_font_montserrat_20`
+    is already compiled in and carries the same `LV_SYMBOL_*` glyphs as the
+    14 px default, so it costs no flash. Use `lv_obj_set_ext_click_area()` to
+    widen the hit test without disturbing the layout.
 
 ## 11. Debugging method that worked
 

@@ -484,6 +484,65 @@ requires a secure context and that service already has a real certificate behind
 Tailscale Funnel. It is inert markup holding no secret, so it is deliberately
 unauthenticated: reaching a cube needs radio range *and* the code on its screen.
 
+## CONTROL: sized for a fingertip
+
+CONTROL is an unbounded scrolling column of cards, each pairing a live readout
+with the control that acts on it. Height is therefore free, and that turns out to
+be the whole design constraint: **every control is sized for a fingertip, not for
+a cursor.** 44 px sliders and switches did not reliably register on this panel —
+curved glass, a noisy controller near the edges, drags read as taps and taps read
+as nothing. `CFG_TOUCH_H` is 76 px, the same number the MUSIC transport arrived at
+after its 46 px buttons ghost-touched, and `lv_obj_set_ext_click_area()` widens
+the hit test further without disturbing the layout.
+
+Scaling controls without scaling type looks wrong — 14 px labels beside 76 px
+controls read as a desktop dialog enlarged badly — so readouts and button labels
+use `lv_font_montserrat_20`, which is already compiled in and carries the same
+`LV_SYMBOL_*` glyphs as the default.
+
+**Three settings live here, and all three share one shape:** the LVGL callback
+records a value and raises a flag, and the main loop does the work. That is not
+ceremony. Writing NVS from a `LV_EVENT_VALUE_CHANGED` handler erases flash on
+every pixel of a drag, and rewriting a value label mid-drag re-lays out the
+`LV_SIZE_CONTENT` card, which moves the slider out from under the finger — a
+crash the volume slider found first, which is why labels only update on
+`LV_EVENT_RELEASED`.
+
+**Brightness** has one writer, `bright_apply()`, and it is the only thing in the
+firmware that issues panel command `0x51`. Everything routes through it: boot,
+wake, the FOCUS dim and its restore, and the sleep path — including the sleep
+path, because it change-gates against a cached level and a second writer would
+desynchronise the cache and leave the next wake black (HARDWARE.md pitfall #23).
+It returns `false` on a lock timeout so the wake path can retry rather than
+strand the panel dark with every flag claiming the screen is on.
+
+The floor matters more than the ceiling. `bsp_display_brightness_set(0)` blanks
+the panel, and the only control that could undo that is a slider you can no
+longer see — there is no other way into this device. Hence `BRIGHT_MIN`. The dim
+that FOCUS applies is a *percentage* of the user's level rather than a flat 12%:
+flat would make "dimming" brighter for anyone below it, and clamping instead
+would dim by nothing at all at the floor, quietly retiring the feature for
+exactly the people who chose a dark panel.
+
+Honouring a chosen level at boot needed a BSP change, not an app one — the panel
+is lit and holding a 600 ms delay partway through `bsp_display_start_with_config()`,
+so `app_main` never gets a say in time. See HARDWARE.md §9 change 7.
+
+**Autorotate** gates the commit in `imu_poll()`, never the poll, because FOCUS
+reads orientation as input and would die silently otherwise; the held orientation
+is persisted, or a reboot strands you at native with the switch still off. Both
+traps are written up in HARDWARE.md §6.
+
+**Controls that cannot act are faded, not hidden** — dimmed and non-clickable,
+the same treatment MUSIC gives a transport control the endpoint refuses. A
+control that vanishes makes people think something broke and go looking for it.
+That covers the rotation-calibration button while autorotate is off (it applies a
+rotation immediately, which would contradict the switch) and the autorotate
+switch itself on a board with no IMU. `LV_STATE_DISABLED` alone is not enough:
+LVGL's indev does honour it, but local styles beat the theme's grey, so the fade
+has to be explicit. `IMU_FORCE_ABSENT` exists to make that branch testable in one
+build cycle rather than never.
+
 ## Sound
 
 Clips are authored offline and embedded in flash via `EMBED_FILES` (~99 KB),
