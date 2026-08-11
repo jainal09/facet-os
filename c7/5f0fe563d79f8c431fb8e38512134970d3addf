@@ -1,0 +1,45 @@
+main/ble_prov.h
+  s_69fa2eb4e2987f::t_fbf3600c2871e2 82-87
+  s_69fa2eb4e2987f::t_98ff785d322e56 1-81,88-113
+main/CMakeLists.txt
+  s_57e4cf4a7836a6::t_ec233de23f4d03 76
+main/ble_prov.c
+  s_69fa2eb4e2987f::t_4a67a5f6e36dd2 1-33,36-818,866-883
+  s_69fa2eb4e2987f::t_64c3c9b9155fa2 34-35
+  s_69fa2eb4e2987f::t_fd7c455679b2d0 819-865
+main/main.c
+  s_57e4cf4a7836a6::t_a2763c3d1fe8d0 263-273,277-293,320,3462-3463,3518-3519,3529-3530,3991
+  s_57e4cf4a7836a6::t_8c967c32bb1d02 274-276,321,622,1761,1775,2111-2112,3219,3533,3957,3962-3974,4096
+  s_57e4cf4a7836a6::t_6cf9c9d9094204 425-434
+  s_57e4cf4a7836a6::t_8fe3520b2d2e5f 3479-3504,3979,4064-4066
+  s_57e4cf4a7836a6::t_ec233de23f4d03 50
+  s_57e4cf4a7836a6::t_4c7a2436488c78 4-5,626-637,641-642,645-646,648,2095,2099,4071-4077,4308,4317
+  s_57e4cf4a7836a6::t_af25ae237ada28 195-196,4237-4256
+  s_57e4cf4a7836a6::t_a7c5cae2f4c019 7,3975-3978,3980-3990,3992-4000,4093-4095
+docs/HARDWARE.md
+  s_57e4cf4a7836a6::t_cf4513264277c1 124-125,134-149
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.22",
+  "base_commit_sha": "c75f0fe563d79f8c431fb8e38512134970d3addf",
+  "prompts": {},
+  "sessions": {
+    "s_57e4cf4a7836a6": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "79540328-5c96-430d-b4c5-de35687f549e",
+        "model": "claude-opus-5"
+      },
+      "human_author": "Jainal Gosaliya <jainal09gosalia@gmail.com>"
+    },
+    "s_69fa2eb4e2987f": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "ab961f6a-cc54-4961-a6f3-991f7a281329",
+        "model": "claude-opus-5"
+      },
+      "human_author": "Jainal Gosaliya <jainal09gosalia@gmail.com>"
+    }
+  }
+}
