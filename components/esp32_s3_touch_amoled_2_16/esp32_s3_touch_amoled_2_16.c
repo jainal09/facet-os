@@ -69,7 +69,13 @@ static const co5300_lcd_init_cmd_t lcd_init_cmds[] = {
     {0x3A, (uint8_t[]){0x55}, 1, 0},
     {0x35, (uint8_t[]){0x00}, 1, 0},
     {0x53, (uint8_t[]){0x20}, 1, 0},
-    {0x51, (uint8_t[]){0xFF}, 1, 0},
+    /* Dark, not full. 0x29 two rows down turns the panel on and holds for 600 ms,
+     * so 0xFF here meant every boot lit the display at maximum for well over half
+     * a second before anything could correct it. bsp_display_brightness_init() is
+     * the only consumer of this path (bsp_display_lcd_init has exactly one
+     * caller) and it runs immediately after, setting the real level — so coming
+     * up dark is both safe and the correct direction to fail in. */
+    {0x51, (uint8_t[]){0x00}, 1, 0},
     {0x63, (uint8_t[]){0xFF}, 1, 0},
     {0x2A, (uint8_t[]){0x00, 0x00, 0x01, 0xDF}, 4, 0},
     {0x2B, (uint8_t[]){0x00, 0x00, 0x01, 0xDF}, 4, 0},
@@ -362,9 +368,21 @@ esp_codec_dev_handle_t bsp_audio_codec_microphone_init(void)
     return esp_codec_dev_new(&codec_es7210_dev_cfg);
 }
 
+/* Fork change #6 (HARDWARE.md §9). Both of the "turn it on" paths used to
+ * hardcode 100%, which made a user-chosen brightness impossible to honour at
+ * boot and left backlight_on() as a trap for any future caller — it would have
+ * silently undone the setting. One stored level now serves both. */
+static int s_boot_brightness = 100;
+
+void bsp_display_brightness_set_boot(int brightness_percent)
+{
+    if (brightness_percent < 0 || brightness_percent > 100) return;
+    s_boot_brightness = brightness_percent;
+}
+
 esp_err_t bsp_display_brightness_init(void)
 {
-    bsp_display_brightness_set(100);
+    bsp_display_brightness_set(s_boot_brightness);
     return ESP_OK;
 }
 
@@ -414,7 +432,7 @@ esp_err_t bsp_display_backlight_off(void)
 esp_err_t bsp_display_backlight_on(void)
 {
     ESP_LOGI(TAG, "Backlight on");
-    return bsp_display_brightness_set(100);
+    return bsp_display_brightness_set(s_boot_brightness);
 }
 
 #if LVGL_VERSION_MAJOR >= 9

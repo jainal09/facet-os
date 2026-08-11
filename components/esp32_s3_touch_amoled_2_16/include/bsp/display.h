@@ -75,6 +75,19 @@ esp_err_t bsp_display_new(const bsp_display_config_t *config, esp_lcd_panel_hand
  */
 esp_err_t bsp_display_brightness_init(void);
 
+/**
+ * @brief Set the level the panel comes up at, and returns to on backlight_on
+ *
+ * Fork addition (HARDWARE.md §9). Stock, brightness_init() and backlight_on()
+ * both hardcode 100%, so a user-chosen level could only ever be applied *after*
+ * bsp_display_start_with_config() returned — a full-brightness panel for the
+ * ~1.2 s of sleep-out and display-on delays in the init table, on every boot.
+ * Call this before bringing the display up. Has no immediate effect on its own.
+ *
+ * @param[in] brightness_percent Brightness in [%]; out-of-range values ignored
+ */
+void bsp_display_brightness_set_boot(int brightness_percent);
+
 esp_err_t bsp_display_rotation_set(bsp_display_rotation_t rotation);
 
 /**
