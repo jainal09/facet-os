@@ -1579,8 +1579,7 @@ static void vol_save(void) {
 }
 
 typedef enum {
-    SFX_TONE = 1,                   /* diagnostic: one tone from s_tone_hz[] */
-    SFX_TICK,                       /* rotation detent          */
+    SFX_TICK = 1,                       /* rotation detent          */
     SFX_START,                      /* session begins           */
     SFX_PAUSE,                      /* laid flat                */
     SFX_RESUME,                     /* stood back up            */
@@ -1613,17 +1612,6 @@ static const sfx_clip_t s_clips[] = {
 };
 #define CLIP_COUNT ((int)(sizeof(s_clips) / sizeof(s_clips[0])))
 #define CLIP_OF(id) (&s_clips[(id) - SFX_TICK])
-
-/* Roughly third-octave steps across everything a small driver might manage.
- * Stepped and manually advanced rather than a continuous sweep: a sweep gives
- * you nothing to name when it sounds wrong, so the number has to be on screen
- * and the pace has to be yours. */
-static const uint16_t s_tone_hz[] = {
-    200, 300, 400, 500, 650, 800, 1000, 1250,
-    1600, 2000, 2500, 3150, 4000, 5000, 6300, 8000,
-};
-#define TONE_COUNT ((int)(sizeof(s_tone_hz) / sizeof(s_tone_hz[0])))
-static volatile int s_tone_idx = -1;    /* -1 = nothing played yet */
 
 static esp_codec_dev_handle_t s_spk;
 static QueueHandle_t s_sfx_q;
@@ -1680,32 +1668,6 @@ static bool sfx_codec_ready(void) {
              (unsigned)before, (unsigned)esp_get_free_internal_heap_size(),
              (int)(before - esp_get_free_internal_heap_size()));
     return true;
-}
-
-/* One steady tone, generated a chunk at a time so no big buffer is needed.
- * Faded in and out to avoid a click, and kept well below full scale — this
- * driver distorts when pushed, and a clipped tone would tell us nothing about
- * its real response. */
-static void sfx_render_tone(int hz, float secs) {
-    const int total = (int)(SFX_RATE * secs);
-    static int16_t buf[SFX_CHUNK];
-    float phase = 0.0f;
-    const float step = 2.0f * (float)M_PI * (float)hz / (float)SFX_RATE;
-    const int fade = SFX_RATE / 40;                  /* 25 ms */
-
-    for (int n = 0; n < total; n += SFX_CHUNK) {
-        int count = (total - n < SFX_CHUNK) ? (total - n) : SFX_CHUNK;
-        for (int i = 0; i < count; i++) {
-            int k = n + i;
-            float env = 1.0f;
-            if (k < fade)                 env = (float)k / (float)fade;
-            else if (k > total - fade)    env = (float)(total - k) / (float)fade;
-            buf[i] = (int16_t)(sinf(phase) * env * 7000.0f);   /* ~-13 dBFS */
-            phase += step;
-            if (phase > 2.0f * (float)M_PI) phase -= 2.0f * (float)M_PI;
-        }
-        esp_codec_dev_write(s_spk, buf, count * sizeof(int16_t));
-    }
 }
 
 /* Walk the RIFF chunks to the PCM payload rather than assuming a 44-byte
@@ -1776,14 +1738,6 @@ static void sfx_task(void *arg) {
             open = true;
             esp_codec_dev_set_out_vol(s_spk, s_vol);
             switch (id) {
-            case SFX_TONE: {
-                int idx = s_tone_idx;
-                if (idx < 0 || idx >= TONE_COUNT) idx = 0;
-                ESP_LOGI(TAG, "tone %d/%d: %u Hz", idx + 1, TONE_COUNT,
-                         (unsigned)s_tone_hz[idx]);
-                sfx_render_tone(s_tone_hz[idx], 1.2f);
-                break;
-            }
             case SFX_TICK: case SFX_START: case SFX_PAUSE:
             case SFX_RESUME: case SFX_DONE:
                 sfx_render_clip(CLIP_OF(id));
@@ -1832,7 +1786,7 @@ static void refr_ready_cb(lv_event_t *e) {
 
 static lv_obj_t *s_cfg_wall_pool, *s_cfg_wall_state, *s_cfg_wall_bar, *s_cfg_wall_sub;
 static lv_obj_t *s_cfg_rot_val;
-static lv_obj_t *s_cfg_snd_val, *s_cfg_snd_hz, *s_cfg_vol_val;
+static lv_obj_t *s_cfg_vol_val;
 static lv_obj_t *s_cfg_batt_bar, *s_cfg_batt_val, *s_cfg_batt_sub;
 static lv_obj_t *s_cfg_net_val;
 static lv_obj_t *s_cfg_sys_val;
@@ -1906,43 +1860,6 @@ static void cfg_rotate_cb(lv_event_t *e) {
     rotation_bump();
 }
 
-/* Advance one step and show the frequency BEFORE it sounds, so there is never
- * any doubt which number the tone you just heard belongs to. Updated here on
- * the LVGL task rather than waiting for the 400 ms refresh. */
-static sfx_id_t s_sfx_last;
-
-static void cfg_tone_next_cb(lv_event_t *e) {
-    s_tone_idx = (s_tone_idx + 1) % TONE_COUNT;
-    if (s_cfg_snd_hz) {
-        lv_label_set_text_fmt(s_cfg_snd_hz, "%u", (unsigned)s_tone_hz[s_tone_idx]);
-    }
-    if (s_cfg_snd_val) {
-        lv_label_set_text_fmt(s_cfg_snd_val, "hertz   /   step %d of %d",
-                              s_tone_idx + 1, TONE_COUNT);
-    }
-    s_sfx_last = SFX_TONE;
-    sfx_play(SFX_TONE);
-}
-
-/* Audition bench for the UI sounds. These are judged by ear on this speaker,
- * not by a passing build, so stepping through them has to be one tap. */
-static int s_clip_idx = -1;
-
-static void cfg_clip_next_cb(lv_event_t *e) {
-    s_clip_idx = (s_clip_idx + 1) % CLIP_COUNT;
-    s_sfx_last = (sfx_id_t)(SFX_TICK + s_clip_idx);
-    if (s_cfg_snd_hz) lv_label_set_text(s_cfg_snd_hz, "");
-    if (s_cfg_snd_val) {
-        lv_label_set_text_fmt(s_cfg_snd_val, "%s   /   sound %d of %d",
-                              s_clips[s_clip_idx].name, s_clip_idx + 1, CLIP_COUNT);
-    }
-    sfx_play(s_sfx_last);
-}
-
-static void cfg_again_cb(lv_event_t *e) {
-    sfx_play(s_sfx_last ? s_sfx_last : SFX_TONE);
-}
-
 /* Deliberately does almost nothing while the knob is moving.
  *
  * Rewriting the label on every LV_EVENT_VALUE_CHANGED was a crash: the text
@@ -1965,7 +1882,7 @@ static void cfg_vol_cb(lv_event_t *e) {
                               s_vol, (int)vol_db(s_vol));
     }
     s_req_vol_save = true;
-    sfx_play(s_sfx_last ? s_sfx_last : SFX_DONE);
+    sfx_play(SFX_DONE);      /* the loudest clip: the one to judge a level by */
 }
 
 static void cfg_timer_cb(lv_timer_t *t) {
@@ -2042,14 +1959,6 @@ static void cfg_timer_cb(lv_timer_t *t) {
                           s_rot * 90, s_rot_cfg + 1, ROT_CFG_COUNT,
                           (s_rot_cfg & 4) ? "reversed" : "normal",
                           s_acc_x / 100, s_acc_y / 100, s_acc_z / 100);
-
-    /* ---- audio ---- */
-    /* Only owned by the timer before the first tone; after that the button
-     * callback writes it and this must not stomp the frequency on screen. */
-    if (s_tone_idx < 0) {
-        lv_label_set_text_fmt(s_cfg_snd_val, "%s   /   tap to start",
-                              s_spk ? "codec up" : "codec idle");
-    }
 
     /* ---- battery ---- */
     int pct = s_batt_pct;
@@ -2156,24 +2065,12 @@ static void build_control_app(lv_obj_t *scr) {
 
     /* ---- audio ---- */
     c = cfg_card(col, "AUDIO", CFG_ACCENT_SND);
-
-    /* hud_clock_76 is digits-only, which is exactly what a frequency needs */
-    s_cfg_snd_hz = lv_label_create(c);
-    lv_obj_set_width(s_cfg_snd_hz, lv_pct(100));
-    lv_obj_set_style_text_font(s_cfg_snd_hz, &hud_clock_76, 0);
-    lv_obj_set_style_text_color(s_cfg_snd_hz, lv_color_hex(CFG_ACCENT_SND), 0);
-    lv_obj_set_style_text_align(s_cfg_snd_hz, LV_TEXT_ALIGN_CENTER, 0);
-    lv_label_set_text(s_cfg_snd_hz, "0");
-
-    s_cfg_snd_val = cfg_text(c, 0x94A3B8);
-    lv_obj_set_style_text_align(s_cfg_snd_val, LV_TEXT_ALIGN_CENTER, 0);
-
     s_cfg_vol_val = cfg_text(c, 0xC7D2E0);
-    /* fixed height: a growing/shrinking label here would resize the card and
-     * shift the slider under the finger */
+    /* fixed height: a growing label here would resize the card and shift the
+     * slider under the finger mid-drag */
     lv_obj_set_height(s_cfg_vol_val, 20);
-    lv_label_set_text_fmt(s_cfg_vol_val, "volume  %d%%   /   %+.0f dB",
-                              s_vol, vol_db(s_vol));
+    lv_label_set_text_fmt(s_cfg_vol_val, "volume  %d%%   /   %+d dB",
+                          s_vol, (int)vol_db(s_vol));
 
     lv_obj_t *vs = lv_slider_create(c);
     lv_obj_set_size(vs, lv_pct(100), 16);
@@ -2184,10 +2081,6 @@ static void build_control_app(lv_obj_t *scr) {
     lv_obj_set_style_bg_color(vs, lv_color_hex(0xFFD9A8), LV_PART_KNOB);
     lv_obj_add_event_cb(vs, cfg_vol_cb, LV_EVENT_VALUE_CHANGED, NULL);
     lv_obj_add_event_cb(vs, cfg_vol_cb, LV_EVENT_RELEASED, NULL);
-
-    cfg_button(c, LV_SYMBOL_AUDIO "  Next sound", CFG_ACCENT_SND, cfg_clip_next_cb);
-    cfg_button(c, LV_SYMBOL_REFRESH "  Hear it again", CFG_ACCENT_SND, cfg_again_cb);
-    cfg_button(c, LV_SYMBOL_RIGHT "  Tone test", CFG_ACCENT_SND, cfg_tone_next_cb);
 
     /* ---- battery ---- */
     c = cfg_card(col, "BATTERY", CFG_ACCENT_BATT);
@@ -2541,7 +2434,7 @@ static int      s_acc_ref_x, s_acc_ref_y, s_acc_ref_z;
 
 /* widgets */
 static lv_obj_t *s_pomo_dial[POMO_SLOTS];
-static lv_obj_t *s_pomo_clock, *s_pomo_word, *s_pomo_ring, *s_pomo_arc;
+static lv_obj_t *s_pomo_clock, *s_pomo_word, *s_pomo_ring, *s_pomo_arc, *s_pomo_fill;
 static int s_pomo_drawn_rot = -1;
 
 typedef struct {
@@ -2677,7 +2570,8 @@ static void pomo_refresh(void) {
         lv_obj_align(s_pomo_word,  LV_ALIGN_CENTER, wx[wr], wy[wr]);
 
         /* keep the depleting ring starting from world-up, not screen-up */
-        lv_arc_set_rotation(s_pomo_arc, (270 - 90 * wr + 360) % 360);
+        lv_arc_set_rotation(s_pomo_arc,  (270 - 90 * wr + 360) % 360);
+        lv_arc_set_rotation(s_pomo_fill, (270 - 90 * wr + 360) % 360);
     }
 
     int left = s_pomo_left_s < 0 ? 0 : s_pomo_left_s;
@@ -2685,6 +2579,9 @@ static void pomo_refresh(void) {
 
     int pct = (s_pomo_total_s > 0)
             ? (int)(((int64_t)left * 360) / s_pomo_total_s) : 360;
+    int elapsed = 360 - pct;
+    int done_mille = (s_pomo_total_s > 0)
+            ? (int)((((int64_t)s_pomo_total_s - left) * 1000) / s_pomo_total_s) : 0;
 
     uint32_t col;
     const char *word;
@@ -2705,12 +2602,35 @@ static void pomo_refresh(void) {
         int64_t age = now_ms() - s_pomo_done_at;
         int k = (int)((age / 40) % 50);
         int w = 8 + (k < 25 ? k : 50 - k) / 2;
+        lv_obj_add_flag(s_pomo_fill, LV_OBJ_FLAG_HIDDEN);
         lv_obj_set_style_arc_width(s_pomo_arc, w, LV_PART_MAIN);
         lv_arc_set_bg_angles(s_pomo_arc, 0, 360);
         lv_obj_set_style_arc_color(s_pomo_arc, lv_color_hex(0x35C759), LV_PART_MAIN);
     } else {
+        /* Elapsed time fills clockwise from the top in green, deepening from
+         * near-black to vivid as the session runs out. Green is the AMOLED's
+         * strongest primary and it has 6 bits in RGB565 against 5 for the
+         * others, so this ramps smoothly and genuinely glows at the end —
+         * arriving at the same green the completion pulse uses. */
+        int g_r = 0x0C + (0x3A - 0x0C) * done_mille / 1000;
+        int g_g = 0x30 + (0xFF - 0x30) * done_mille / 1000;
+        int g_b = 0x1C + (0x78 - 0x1C) * done_mille / 1000;
+
+        if (elapsed > 0) {
+            lv_obj_remove_flag(s_pomo_fill, LV_OBJ_FLAG_HIDDEN);
+            lv_arc_set_bg_angles(s_pomo_fill, 0, elapsed);
+            lv_obj_set_style_arc_color(s_pomo_fill,
+                lv_color_make(g_r, g_g, g_b), LV_PART_MAIN);
+            /* swells very slightly as it completes */
+            lv_obj_set_style_arc_width(s_pomo_fill,
+                10 + 3 * done_mille / 1000, LV_PART_MAIN);
+        } else {
+            lv_obj_add_flag(s_pomo_fill, LV_OBJ_FLAG_HIDDEN);
+        }
+
+        /* what is left, running ahead of the green */
         lv_obj_set_style_arc_width(s_pomo_arc, 10, LV_PART_MAIN);
-        lv_arc_set_bg_angles(s_pomo_arc, 0, pct ? pct : 1);
+        lv_arc_set_bg_angles(s_pomo_arc, elapsed, 360);
         lv_obj_set_style_arc_color(s_pomo_arc, lv_color_hex(col), LV_PART_MAIN);
     }
 }
@@ -2734,6 +2654,17 @@ static void build_pomo_app(lv_obj_t *scr) {
     lv_obj_set_style_arc_width(s_pomo_ring, 0, LV_PART_INDICATOR);
     lv_obj_set_style_arc_color(s_pomo_ring, lv_color_hex(0x1A2230), LV_PART_MAIN);
     lv_arc_set_bg_angles(s_pomo_ring, 0, 360);
+
+    s_pomo_fill = lv_arc_create(scr);
+    lv_obj_set_size(s_pomo_fill, 404, 404);
+    lv_obj_center(s_pomo_fill);
+    lv_obj_remove_style(s_pomo_fill, NULL, LV_PART_KNOB);
+    lv_obj_remove_flag(s_pomo_fill, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_set_style_arc_width(s_pomo_fill, 10, LV_PART_MAIN);
+    lv_obj_set_style_arc_width(s_pomo_fill, 0, LV_PART_INDICATOR);
+    lv_obj_set_style_arc_color(s_pomo_fill, lv_color_hex(0x0C301C), LV_PART_MAIN);
+    lv_arc_set_bg_angles(s_pomo_fill, 0, 1);
+    lv_obj_add_flag(s_pomo_fill, LV_OBJ_FLAG_HIDDEN);
 
     s_pomo_arc = lv_arc_create(scr);
     lv_obj_set_size(s_pomo_arc, 404, 404);
@@ -3834,13 +3765,12 @@ static void app_open(int idx) {
     s_ch_wrap = NULL;
     s_cfg_wall_pool = NULL; s_cfg_wall_state = NULL;
     s_cfg_wall_bar = NULL; s_cfg_wall_sub = NULL;
-    s_cfg_rot_val = NULL; s_cfg_snd_val = NULL; s_cfg_snd_hz = NULL;
-    s_cfg_vol_val = NULL;
+    s_cfg_rot_val = NULL; s_cfg_vol_val = NULL;
     s_cfg_batt_bar = NULL;
     s_cfg_batt_val = NULL; s_cfg_batt_sub = NULL;
     s_cfg_net_val = NULL; s_cfg_sys_val = NULL; s_cfg_log = NULL;
     s_pomo_clock = NULL; s_pomo_word = NULL;
-    s_pomo_ring = NULL; s_pomo_arc = NULL;
+    s_pomo_ring = NULL; s_pomo_arc = NULL; s_pomo_fill = NULL;
     for (int i = 0; i < POMO_SLOTS; i++) s_pomo_dial[i] = NULL;
     s_lock_time = NULL; s_lock_date = NULL; s_lock_batt = NULL;
     s_lock_sweep = NULL; s_lock_batt_arc = NULL;
