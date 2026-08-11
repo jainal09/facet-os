@@ -152,6 +152,12 @@ what kills you, not the current free.
 - **RGB565 cannot render a smooth dark gradient.** A dark blue vertical ramp
   shows as hard bands. Use flat black — which on an AMOLED also means those
   pixels are simply off.
+- **`lv_obj_fade_out()` does not delete anything.** It animates opacity to
+  transparent and stops (`lv_obj_style.c`), so a "transient" toast built this
+  way silently accumulates invisible objects on the screen. Pair it with
+  `lv_obj_delete_delayed()`. That is safe even if the screen is torn down first:
+  `lv_obj_destructor` calls `lv_anim_delete(obj, NULL)`, which cancels the
+  pending delete along with the object.
 - The panel has heavily rounded corners and curved cover glass. Content within
   ~55 px of an edge is clipped or unreadable at an angle; keep circles ≤ 430 px.
 

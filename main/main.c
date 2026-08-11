@@ -2474,7 +2474,12 @@ static void always_on_toggle(void) {
     lv_label_set_text(toast, s_always_on ? "ALWAYS ON SCREEN  ON"
                                          : "ALWAYS ON SCREEN  OFF");
     lv_obj_align(toast, LV_ALIGN_CENTER, 0, 118);
+    /* fade_out only animates opacity — it does NOT delete, so without the
+     * delayed delete every toggle would leave an invisible label behind.
+     * Deleting an object cancels animations bound to it, so this is still safe
+     * if the lock screen is torn down before the timer elapses. */
     lv_obj_fade_out(toast, 900, 900);
+    lv_obj_delete_delayed(toast, 1900);
     bsp_display_unlock();
 }
 
@@ -2683,7 +2688,17 @@ void app_main(void) {
         if (kleft == BTN_SHORT || kleft == BTN_LONG) {
             ESP_LOGI(TAG, "LEFT -> lock");
             lock_engage();
-        } else if (s_app != APP_LOCK) {                /* locked: keys only wake */
+        } else if (s_app == APP_LOCK) {
+            /* Locked. Home and tap-back stay disabled — the touchscreen is how
+             * you unlock, and a key press must not bypass that. The action key
+             * is the one exception: it toggles desk-clock mode, which is only
+             * reachable from here. Gating the whole block on "not locked" is
+             * what made that toggle dead code. */
+            if (kright == BTN_LONG) {
+                ESP_LOGI(TAG, "RIGHT hold on lock -> desk clock toggle");
+                app_action();
+            }
+        } else {
             if (pwr) {
                 ESP_LOGI(TAG, "MID -> home");
                 app_request(APP_DRAWER);

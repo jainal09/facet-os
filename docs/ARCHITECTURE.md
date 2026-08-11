@@ -110,6 +110,18 @@ action. That has to test the pin *level* rather than a debounced edge: the main
 loop runs at 120 ms while dozing and cannot see two consistent samples of a
 ~160 ms tap. After waking, the release is swallowed.
 
+The lock screen is a deliberate partial exception, and the shape of it is worth
+copying rather than re-deriving. Home and tap-back are disabled there — the
+touchscreen is how you unlock, and a key must not bypass that — but the **hold**
+still reaches `app_action()`, where `case APP_LOCK` toggles desk-clock mode.
+
+Getting that wrong is easy: the dispatch was originally one
+`else if (s_app != APP_LOCK)` around the whole key block, which silently made
+the `APP_LOCK` branch of `app_action()` unreachable. The handler existed, the
+enum matched, it compiled clean, and nothing happened when the key was pressed.
+If a key action does nothing, check that the dispatcher can *reach* the handler
+before debugging the handler.
+
 Waking from sleep always lands on the lock screen, never straight into an app.
 Tapping the lock screen goes **Home**, not back to wherever you locked from.
 
