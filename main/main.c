@@ -240,6 +240,7 @@ static char s_sp_art_shown[160];  /* which art the widgets are showing */
 static uint8_t *s_sp_art_buf;            /* PSRAM, SP_ART_BYTES */
 static lv_image_dsc_t s_sp_art_dsc;      /* points into s_sp_art_buf + header */
 static bool asset_fetch_mem(const char *url, const char *bearer,
+                            const char *xname, const char *xval,
                             uint8_t *buf, size_t cap, size_t *out_len);
 
 static lv_obj_t *s_lock_time, *s_lock_date, *s_lock_batt;
@@ -1081,10 +1082,44 @@ static void battery_poll(void) {
         axp_read(AXP_REG_ADC_DATA_L, &lo) == ESP_OK) {
         s_batt_mv = ((hi & 0x1F) << 8) | lo;
     }
+    /* Voltage first, because it is the number that can be checked. 3.30 V ~ 0%,
+     * 4.20 V ~ 100%. */
+    int vpct = (s_batt_mv > 2500)
+             ? clampi((s_batt_mv - 3300) * 100 / 900, 0, 100) : -1;
+
     if (axp_read(AXP_REG_BAT_PERCENT, &pct) == ESP_OK && pct > 0 && pct <= 100) {
         s_batt_pct = pct;
-    } else if (s_batt_mv > 2500) {
-        s_batt_pct = clampi((s_batt_mv - 3300) * 100 / 900, 0, 100);
+
+        /* The AXP2101's gauge is a coulomb counter and it can latch — observed
+         * reading a confident 100% during a 5 h soak while the ADC said 3964 mV,
+         * which is nearer 60%. It only self-corrects across a full charge and
+         * discharge, so believing it unconditionally means the reading is wrong for
+         * as long as the device stays plugged in.
+         *
+         * Charge raises terminal voltage and load sags it, so small disagreements
+         * are expected and the gauge is the better number for those. A gap this
+         * wide is not a load offset, it is a broken integrator — so past 25 points
+         * the direct measurement wins. Logged once per crossing rather than every
+         * minute; this is a condition, not an event. */
+        /* Two independent tests, because the wide-gap one alone missed the case
+         * that prompted this: a gauge reading 100% at 4013 mV is only 22 points out
+         * and slips through, yet it is still plainly wrong. A lithium cell at full
+         * charge sits near 4.20 V and does not read below ~4.10 V even *while*
+         * charging, when terminal voltage is at its most flattering. So "claims
+         * full, measures under 4.10 V" is a contradiction no load condition
+         * explains. */
+        bool implausible_full = (s_batt_pct >= 95 && s_batt_mv > 0 && s_batt_mv < 4100);
+        if (vpct >= 0 && (implausible_full || abs(s_batt_pct - vpct) > 25)) {
+            static bool warned;
+            if (!warned) {
+                warned = true;
+                ESP_LOGW(TAG, "battery gauge says %d%% but %d mV is ~%d%% — "
+                              "using voltage", pct, s_batt_mv, vpct);
+            }
+            s_batt_pct = vpct;
+        }
+    } else if (vpct >= 0) {
+        s_batt_pct = vpct;
     } else {
         s_batt_pct = 0;
     }
@@ -3431,7 +3466,12 @@ static void pomo_poll(int64_t t) {
  * the artist and the top of the play button straight over the artwork. The fetch
  * uses the same number: asking the broker for exactly the drawn size means no
  * scaling and a 43 KB file instead of 115 KB. */
-#define SP_ART_PX     148
+#define SP_ART_PX     264
+/* The cover sits centred between the left button column and the volume slider,
+ * not on the screen. Those two are not symmetric about x240, so screen-centring
+ * gave a 6 px gutter on one side and 38 px on the other. Midpoint of x102..410 is
+ * x256, hence +16. Everything that sits on the cover carries the same offset. */
+#define SP_ART_DX     16
 /* The cover lives in PSRAM, not on the card. LVGL's bin decoder can stream rows
  * off FATFS per draw chunk, which is what made a file cheap — but that is ~15 card
  * reads per frame, and it collapses the moment the image has to be scaled (the
@@ -3498,6 +3538,25 @@ static volatile bool s_sp_liked_known;
  * actually supplied one — a default-tinted screen while the app is still waiting
  * for /me/player reads as a colour chosen on purpose, which is worse than black. */
 static volatile uint32_t s_sp_accent;
+/* Set whenever what-comes-next may have changed: a new track, or shuffle being
+ * toggled (which reorders the queue without changing the current track). The
+ * queue is re-asked once per such event rather than on every 3 s poll — asking
+ * every poll would be a broker round trip per poll for an answer that almost
+ * never moves. */
+static volatile bool s_sp_queue_dirty = true;
+
+/* Raised by anything the user did — play, skip, volume, shuffle, transfer, like —
+ * and lowered once the worker picks that command up. The prefetcher yields to
+ * this rather than to "is the queue non-empty", which was the previous test and
+ * was wrong: a POLL is enqueued every 3 s and the work takes longer than that, so
+ * the queue is essentially never empty and the lookahead never ran at all. */
+static volatile bool s_sp_urgent;
+
+/* Distinct from s_sp_queue_dirty on purpose. dirty means "what comes next may
+ * have changed, re-ask the broker"; pending means "the list is current, some
+ * slots still have no cover". Conflating them made every single-cover pass also
+ * re-fetch the list: four broker round trips to fill three slots. */
+static volatile bool s_sp_pf_pending;
 
 /* The accent is a full-strength colour, fit for a glyph but not for 480x480 of
  * backdrop: at full value it fights white text and, on an AMOLED, every lit pixel
@@ -3755,10 +3814,17 @@ static void sp_poll_state(void) {
         s_sp_have_state = false;        /* nothing playing anywhere */
         return;
     }
-    if (code != 200 || s_sp_len == 0) return;
+    if (code != 200 || s_sp_len == 0) {
+        ESP_LOGW(TAG, "spotify: poll HTTP %d, %d bytes", code, s_sp_len);
+        return;
+    }
 
     cJSON *j = cJSON_Parse(s_sp_body);
-    if (!j) return;
+    if (!j) {
+        /* A body larger than SP_BODY_MAX truncates and lands here, silently. */
+        ESP_LOGW(TAG, "spotify: poll body unparseable (%d bytes)", s_sp_len);
+        return;
+    }
 
     cJSON *item = cJSON_GetObjectItem(j, "item");
     cJSON *dev  = cJSON_GetObjectItem(j, "device");
@@ -3795,12 +3861,19 @@ static void sp_poll_state(void) {
         cJSON *n = cJSON_GetObjectItem(item, "name");
         if (cJSON_IsString(n)) ascii_fold(n->valuestring, s_sp_track, sizeof(s_sp_track));
 
+        char prev_id[26];
+        snprintf(prev_id, sizeof(prev_id), "%s", s_sp_track_id);
+
         cJSON *tid = cJSON_GetObjectItem(item, "id");
         if (cJSON_IsString(tid)) {
             snprintf(s_sp_track_id, sizeof(s_sp_track_id), "%s", tid->valuestring);
             /* A stale heart is worse than no heart: it invites a tap that
              * un-likes something. Drop it until this track is checked. */
             if (strcmp(s_sp_track_id, s_sp_liked_id) != 0) s_sp_liked_known = false;
+            /* Any change of track invalidates the lookahead — including the user
+             * starting a different playlist from their phone, which arrives here
+             * as nothing more than a new id. */
+            if (strcmp(s_sp_track_id, prev_id) != 0) s_sp_queue_dirty = true;
         }
 
         cJSON *arts = cJSON_GetObjectItem(item, "artists");
@@ -3935,26 +4008,70 @@ static void sp_push_volume(void) {
 static int64_t s_sp_art_failed_at;
 static char s_sp_art_failed[160];
 
-static void sp_fetch_art(void) {
-    if (!s_sd_ok || !s_sp_art_url[0] || BROKER_URL[0] == '\0') return;
+/* ---- lookahead ----
+ *
+ * The next few tracks' covers, names and accents, fetched before they are asked
+ * for, so a swipe draws instantly instead of nudging and waiting ~1 s for a poll
+ * plus a 139 KB download.
+ *
+ * The queue itself comes from the broker rather than Spotify: /me/player/queue
+ * answers with the next twenty tracks in full, 55,569 bytes on a real account,
+ * and cJSON would put ~800 small nodes of that in INTERNAL SRAM (allocations under
+ * SPIRAM_MALLOC_ALWAYSINTERNAL=128 do not go to PSRAM). The broker returns 408
+ * bytes of exactly what gets drawn — see broker/queue.go.
+ *
+ * Buffers live in PSRAM, not on the card. The card would be free to hold them,
+ * but reading 139 KB back off FATFS during the swipe puts the latency straight
+ * back into the moment this exists to make instant. */
+#define SP_PF_N   3
+#define SP_QUEUE_MAX 1024
 
-    /* Same art as the file already on the card — the next track off the same
-     * album, usually. Re-assert ready rather than returning silently: sp_art_clear()
-     * lowers the flag on every track change, and without this the placeholder
-     * would stay up forever for anything that does not need a new download. */
-    if (strcmp(s_sp_art_url, s_sp_art_have) == 0) {
-        s_sp_art_ready = true;
-        return;
+typedef struct {
+    char id[26];
+    char name[64];
+    char artist[64];
+    char url[160];
+    uint32_t accent;
+    uint8_t *buf;          /* PSRAM, SP_ART_BYTES; allocated on first use */
+    bool ready;            /* buf holds this entry's cover */
+} sp_pf_t;
+
+static sp_pf_t s_sp_pf[SP_PF_N];
+
+
+static void sp_art_show(void);   /* defined below; the promoter needs it */
+
+/* Hand a prefetched cover to the display by swapping buffer pointers — O(1),
+ * against a 139 KB copy. The slot keeps the old buffer to refill later. */
+static bool sp_pf_promote(const char *art_url) {
+    for (int i = 0; i < SP_PF_N; i++) {
+        sp_pf_t *e = &s_sp_pf[i];
+        if (!e->ready || strcmp(e->url, art_url) != 0) continue;
+
+        uint8_t *tmp = s_sp_art_buf;
+        s_sp_art_buf = e->buf;
+        e->buf = tmp;
+        e->ready = false;                 /* its bytes are on screen now */
+
+        snprintf(s_sp_art_have, sizeof(s_sp_art_have), "%s", art_url);
+        s_sp_accent = e->accent;
+        s_sp_art_failed[0] = '\0';
+        sp_art_show();
+        ESP_LOGI(TAG, "spotify: art from lookahead (slot %d)", i);
+        return true;
     }
+    return false;
+}
 
-    if (strcmp(s_sp_art_url, s_sp_art_failed) == 0 &&
-        (now_ms() - s_sp_art_failed_at) < SP_ART_RETRY_MS) return;
-
+/* Download one cover into a caller-supplied PSRAM buffer and report the accent
+ * the broker derived from it. Split out of sp_fetch_art() so the prefetcher can
+ * use the identical path — same URL encoding, same header validation, same
+ * failure handling — rather than a parallel copy that drifts. */
+static bool sp_art_get(const char *art_url, uint8_t *buf, uint32_t *accent_out) {
     char url[512];
     int n = snprintf(url, sizeof(url), "%s/art.bin?s=%d&u=", BROKER_URL, SP_ART_PX);
-    /* percent-encode the Spotify URL into the query */
     static const char hex[] = "0123456789ABCDEF";
-    for (const unsigned char *p = (const unsigned char *)s_sp_art_url;
+    for (const unsigned char *p = (const unsigned char *)art_url;
          *p && n < (int)sizeof(url) - 4; p++) {
         if (isalnum(*p) || *p == '-' || *p == '_' || *p == '.' || *p == '~') {
             url[n++] = (char)*p;
@@ -3964,63 +4081,202 @@ static void sp_fetch_art(void) {
     }
     url[n] = '\0';
 
+    size_t got = 0;
+    if (!asset_fetch_mem(url, BROKER_TOKEN, NULL, NULL, buf, SP_ART_BYTES, &got))
+        return false;
+
+    /* Nothing decodes these bytes on the way through, so a short body or a broker
+     * answering with something else would be blitted to the panel as garbage.
+     * There is no decoder in this path to reject it — the check has to be here. */
+    if (got != SP_ART_BYTES) {
+        ESP_LOGW(TAG, "spotify: art short (%u of %u)", (unsigned)got, SP_ART_BYTES);
+        return false;
+    }
+    uint16_t w = (uint16_t)(buf[4] | (buf[5] << 8));
+    uint16_t h = (uint16_t)(buf[6] | (buf[7] << 8));
+    if (buf[0] != 0x19 || buf[1] != 0x12 || w != SP_ART_PX || h != SP_ART_PX) {
+        ESP_LOGW(TAG, "spotify: art header wrong (%02x %02x %ux%u)", buf[0], buf[1], w, h);
+        return false;
+    }
+    if (accent_out) *accent_out = s_dl_accent;   /* 0 when the cover has no usable hue */
+    return true;
+}
+
+/* Point the on-screen image at whatever s_sp_art_buf currently holds. */
+static void sp_art_show(void) {
+    s_sp_art_dsc.header.magic  = LV_IMAGE_HEADER_MAGIC;
+    s_sp_art_dsc.header.cf     = LV_COLOR_FORMAT_RGB565;
+    s_sp_art_dsc.header.w      = SP_ART_PX;
+    s_sp_art_dsc.header.h      = SP_ART_PX;
+    s_sp_art_dsc.header.stride = SP_ART_PX * 2;
+    s_sp_art_dsc.data          = s_sp_art_buf + SP_ART_HDR;
+    s_sp_art_dsc.data_size     = SP_ART_PX * SP_ART_PX * 2;
+
+    if (ui_lock()) {
+        lv_image_cache_drop(&s_sp_art_dsc);      /* same pointer, new bytes */
+        if (s_sp_art) {
+            lv_image_set_src(s_sp_art, &s_sp_art_dsc);
+            lv_obj_remove_flag(s_sp_art, LV_OBJ_FLAG_HIDDEN);
+            if (s_sp_art_ph) lv_obj_add_flag(s_sp_art_ph, LV_OBJ_FLAG_HIDDEN);
+        }
+        if (s_lock_np_art) {
+            lv_image_set_src(s_lock_np_art, &s_sp_art_dsc);
+            lv_obj_remove_flag(s_lock_np_art, LV_OBJ_FLAG_HIDDEN);
+        }
+        bsp_display_unlock();
+    }
+    snprintf(s_sp_art_shown, sizeof(s_sp_art_shown), "%s", s_sp_art_have);
+    s_sp_art_ready = true;
+}
+
+/* Fill at most one slot, then hand the worker back.
+ *
+ * The first version fetched all three synchronously on the task that also serves
+ * play/next/volume — each a fresh TLS handshake plus 139 KB — so a swipe queued
+ * behind three to five seconds of background work and the app felt broken.
+ * Background work does not get to hold the worker interactive commands run on. */
+static void sp_pf_fill_one(void) {
+    if (s_sp_urgent) return;                  /* the user is waiting; try later */
+
+    for (int i = 0; i < SP_PF_N; i++) {
+        sp_pf_t *e = &s_sp_pf[i];
+        if (e->ready || !e->url[0]) continue;
+        if (!e->buf) {
+            e->buf = heap_caps_malloc(SP_ART_BYTES, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+            if (!e->buf) { s_sp_pf_pending = false; return; }   /* out of PSRAM */
+        }
+        if (sp_art_get(e->url, e->buf, &e->accent)) {
+            e->ready = true;
+            ESP_LOGI(TAG, "spotify: prefetched %d \"%.20s\"", i + 1, e->name);
+        }
+        return;                               /* one per pass, by design */
+    }
+    s_sp_pf_pending = false;                  /* nothing left to fill */
+}
+
+/* Refresh the lookahead: ask the broker what is coming, keep anything already
+ * held, then fill the gaps. After the first pass a track change slides the window
+ * by one, so the steady-state cost is a single download per track — the same as
+ * having no lookahead at all. */
+static void sp_fetch_queue(void) {
+    if (!s_sp_access[0] || BROKER_URL[0] == '\0' || !s_sp_body) {
+        ESP_LOGW(TAG, "queue: skipped (tok=%d broker=%d buf=%d)",
+                 s_sp_access[0] ? 1 : 0, BROKER_URL[0] ? 1 : 0, s_sp_body ? 1 : 0);
+        return;
+    }
+
+    char url[160];
+    snprintf(url, sizeof(url), "%s/queue?n=%d&s=%d", BROKER_URL, SP_PF_N, SP_ART_PX);
+
+    size_t got = 0;
+    if (!asset_fetch_mem(url, BROKER_TOKEN, "X-Spotify-Token", s_sp_access,
+                         (uint8_t *)s_sp_body, SP_QUEUE_MAX - 1, &got) || got == 0) {
+        ESP_LOGW(TAG, "queue: fetch failed (%u B)", (unsigned)got);
+        return;
+    }
+    ESP_LOGI(TAG, "queue: %u B", (unsigned)got);
+    s_sp_body[got] = '\0';
+
+    cJSON *j = cJSON_Parse(s_sp_body);
+    if (!j) { ESP_LOGW(TAG, "spotify: queue unparseable (%u B)", (unsigned)got); return; }
+    cJSON *arr = cJSON_GetObjectItem(j, "q");
+
+    sp_pf_t next[SP_PF_N] = {0};
+    int n = 0;
+    if (cJSON_IsArray(arr)) {
+        for (int i = 0; i < cJSON_GetArraySize(arr) && n < SP_PF_N; i++) {
+            cJSON *e = cJSON_GetArrayItem(arr, i);
+            cJSON *id = cJSON_GetObjectItem(e, "i"), *nm = cJSON_GetObjectItem(e, "n");
+            cJSON *ar = cJSON_GetObjectItem(e, "a"), *u  = cJSON_GetObjectItem(e, "u");
+            if (!cJSON_IsString(id) || !cJSON_IsString(u)) continue;
+            snprintf(next[n].id, sizeof(next[n].id), "%s", id->valuestring);
+            snprintf(next[n].url, sizeof(next[n].url), "%s", u->valuestring);
+            if (cJSON_IsString(nm)) ascii_fold(nm->valuestring, next[n].name, sizeof(next[n].name));
+            if (cJSON_IsString(ar)) ascii_fold(ar->valuestring, next[n].artist, sizeof(next[n].artist));
+            n++;
+        }
+    }
+    cJSON_Delete(j);
+    ESP_LOGI(TAG, "queue: %d upcoming", n);
+    if (n == 0) return;
+
+    /* Carry over any cover we already hold, matching on URL rather than track id:
+     * two tracks off one album share art, and re-downloading it would be waste. */
+    for (int i = 0; i < n; i++) {
+        for (int k = 0; k < SP_PF_N; k++) {
+            if (s_sp_pf[k].ready && strcmp(s_sp_pf[k].url, next[i].url) == 0) {
+                next[i].buf = s_sp_pf[k].buf; next[i].accent = s_sp_pf[k].accent;
+                next[i].ready = true;
+                s_sp_pf[k].buf = NULL; s_sp_pf[k].ready = false;
+                break;
+            }
+        }
+    }
+    /* Whatever is left over keeps its buffer for reuse rather than being freed. */
+    for (int i = 0, k = 0; i < SP_PF_N; i++) {
+        if (!s_sp_pf[i].buf) continue;
+        while (k < SP_PF_N && next[k].buf) k++;
+        if (k < SP_PF_N) next[k].buf = s_sp_pf[i].buf;
+        else             heap_caps_free(s_sp_pf[i].buf);
+        s_sp_pf[i].buf = NULL;
+    }
+    memcpy(s_sp_pf, next, sizeof(s_sp_pf));
+
+    /* ONE cover per pass, and only when nothing is waiting.
+     *
+     * The first version fetched all three here, synchronously, on the same task
+     * that serves play/next/volume — each one a fresh TLS handshake plus 139 KB.
+     * A swipe then queued behind three to five seconds of background downloading
+     * and the whole app felt broken. Background work does not get to hold the
+     * worker that interactive commands run on.
+     *
+     * Re-arming the dirty flag spreads the remaining covers across later polls, so
+     * the lookahead fills over ~9 s of listening instead of stalling one moment. */
+    s_sp_pf_pending = true;
+    sp_pf_fill_one();
+}
+
+static void sp_fetch_art(void) {
+    static int lastskip;
+    int skip = !s_sd_ok ? 1 : !s_sp_art_url[0] ? 2 : BROKER_URL[0] == '\0' ? 3 : 0;
+    if (skip) {
+        if (skip != lastskip) {
+            lastskip = skip;
+            ESP_LOGW(TAG, "spotify: no art — %s", skip == 1 ? "no SD card" :
+                     skip == 2 ? "poll gave no art URL" : "no broker configured");
+        }
+        return;
+    }
+    lastskip = 0;
+
+    /* Already on hand. sp_art_clear() lowers the ready flag on every track change,
+     * so this has to re-assert it or the placeholder stays up forever for anything
+     * that does not need a new download — the next track off the same album. */
+    if (strcmp(s_sp_art_url, s_sp_art_have) == 0) {
+        s_sp_art_ready = true;
+        return;
+    }
+
+    /* Already prefetched? Then this is free: swap the buffers rather than copying
+     * 139 KB, and skip the download entirely. This is the whole point of the
+     * prefetcher — by the time the poll confirms a swipe, the cover is in hand. */
+    if (sp_pf_promote(s_sp_art_url)) return;
+
+    if (strcmp(s_sp_art_url, s_sp_art_failed) == 0 &&
+        (now_ms() - s_sp_art_failed_at) < SP_ART_RETRY_MS) return;
+
     if (!s_sp_art_buf) {
         s_sp_art_buf = heap_caps_malloc(SP_ART_BYTES, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
         if (!s_sp_art_buf) { ESP_LOGE(TAG, "spotify: no PSRAM for art"); return; }
     }
 
-    size_t got = 0;
-    bool ok = asset_fetch_mem(url, BROKER_TOKEN, s_sp_art_buf, SP_ART_BYTES, &got);
-
-    /* Trust the bytes only if they are the shape that was asked for. A short body
-     * or a broker that answered with something else would otherwise be blitted
-     * straight to the panel as garbage — there is no decoder in this path to
-     * reject it on the way through. */
-    if (ok && got == SP_ART_BYTES) {
-        uint16_t w = (uint16_t)(s_sp_art_buf[4] | (s_sp_art_buf[5] << 8));
-        uint16_t h = (uint16_t)(s_sp_art_buf[6] | (s_sp_art_buf[7] << 8));
-        if (s_sp_art_buf[0] != 0x19 || s_sp_art_buf[1] != 0x12 ||
-            w != SP_ART_PX || h != SP_ART_PX) {
-            ESP_LOGW(TAG, "spotify: art header wrong (%02x %02x %ux%u)",
-                     s_sp_art_buf[0], s_sp_art_buf[1], w, h);
-            ok = false;
-        }
-    } else if (ok) {
-        ESP_LOGW(TAG, "spotify: art short (%u of %u)", (unsigned)got, SP_ART_BYTES);
-        ok = false;
-    }
-
-    if (ok) {
+    uint32_t accent = 0;
+    if (sp_art_get(s_sp_art_url, s_sp_art_buf, &accent)) {
         snprintf(s_sp_art_have, sizeof(s_sp_art_have), "%s", s_sp_art_url);
-        s_sp_art_dsc.header.magic = LV_IMAGE_HEADER_MAGIC;
-        s_sp_art_dsc.header.cf    = LV_COLOR_FORMAT_RGB565;
-        s_sp_art_dsc.header.w     = SP_ART_PX;
-        s_sp_art_dsc.header.h     = SP_ART_PX;
-        s_sp_art_dsc.header.stride = SP_ART_PX * 2;
-        s_sp_art_dsc.data      = s_sp_art_buf + SP_ART_HDR;
-        s_sp_art_dsc.data_size = SP_ART_PX * SP_ART_PX * 2;
-
-        /* Swap it in here. This function already holds the lock to drop the cache,
-         * and the alternative was leaving the image ready on this task while the
-         * 400 ms UI timer got round to it — up to 400 ms of dead wait for nothing. */
-        if (ui_lock()) {
-            lv_image_cache_drop(&s_sp_art_dsc);   /* same pointer, new bytes */
-            if (s_sp_art) {
-                lv_image_set_src(s_sp_art, &s_sp_art_dsc);
-                lv_obj_remove_flag(s_sp_art, LV_OBJ_FLAG_HIDDEN);
-                if (s_sp_art_ph) lv_obj_add_flag(s_sp_art_ph, LV_OBJ_FLAG_HIDDEN);
-            }
-            if (s_lock_np_art) {
-                lv_image_set_src(s_lock_np_art, &s_sp_art_dsc);
-                lv_obj_remove_flag(s_lock_np_art, LV_OBJ_FLAG_HIDDEN);
-            }
-            bsp_display_unlock();
-        }
-        snprintf(s_sp_art_shown, sizeof(s_sp_art_shown), "%s", s_sp_art_have);
-        s_sp_art_ready = true;
+        s_sp_accent = accent;
         s_sp_art_failed[0] = '\0';
-        if (s_dl_accent) s_sp_accent = s_dl_accent;
-        ESP_LOGI(TAG, "spotify: art updated (%u B, psram)", (unsigned)got);
+        sp_art_show();
+        ESP_LOGI(TAG, "spotify: art updated (%u B, psram)", (unsigned)SP_ART_BYTES);
     } else {
         snprintf(s_sp_art_failed, sizeof(s_sp_art_failed), "%s", s_sp_art_url);
         s_sp_art_failed_at = now_ms();
@@ -4028,7 +4284,6 @@ static void sp_fetch_art(void) {
                  SP_ART_RETRY_MS / 1000);
     }
 }
-
 static void sp_task(void *arg) {
     s_sp_body = heap_caps_malloc(SP_BODY_MAX, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (!s_sp_body) {
@@ -4040,13 +4295,29 @@ static void sp_task(void *arg) {
     sp_cmd_t cmd;
     while (1) {
         if (xQueueReceive(s_sp_q, &cmd, portMAX_DELAY) != pdTRUE) continue;
+        if (cmd != SP_CMD_POLL) s_sp_urgent = false;   /* it is being served now */
         if (!s_wifi_up) continue;
 
         switch (cmd) {
         /* sp_push_volume() is a no-op unless a level is owed, so putting it on the
          * poll costs nothing and guarantees a dropped command is picked up. */
-        case SP_CMD_POLL:    sp_poll_state(); sp_push_volume();
-                             sp_check_liked(); sp_fetch_art(); break;
+        case SP_CMD_POLL:
+            sp_poll_state();
+            sp_push_volume();
+            sp_check_liked();
+            sp_fetch_art();
+            /* Last, and only when something actually changed: this is the one
+             * place that pays a broker round trip plus up to SP_PF_N downloads,
+             * and it must never delay drawing the track the user is on now. */
+            if (s_sp_urgent) {
+                /* leave both flags standing; the user is mid-action */
+            } else if (s_sp_queue_dirty) {
+                s_sp_queue_dirty = false;
+                sp_fetch_queue();             /* re-ask, then fill one */
+            } else if (s_sp_pf_pending) {
+                sp_pf_fill_one();             /* list is current, just keep filling */
+            }
+            break;
         case SP_CMD_DEVICES: sp_poll_devices(); break;
         case SP_CMD_LIKE:    sp_toggle_like(); break;
         /* No confirm poll: the bar is already showing the value we just sent,
@@ -4063,6 +4334,7 @@ static void sp_task(void *arg) {
             char p[64];
             snprintf(p, sizeof(p), "/me/player/shuffle?state=%s",
                      s_sp_shuffle ? "true" : "false");
+            s_sp_queue_dirty = true;      /* shuffle reorders what comes next */
             sp_call(HTTP_METHOD_PUT, p, NULL);
             goto confirm;
         }
@@ -4094,7 +4366,9 @@ static void sp_task(void *arg) {
 }
 
 static void sp_send(sp_cmd_t c) {
-    if (s_sp_q) xQueueSend(s_sp_q, &c, 0);
+    if (!s_sp_q) return;
+    if (c != SP_CMD_POLL) s_sp_urgent = true;
+    xQueueSend(s_sp_q, &c, 0);
 }
 
 static void sp_init(void) {
@@ -4120,6 +4394,7 @@ static lv_obj_t *s_sp_btn_prev, *s_sp_btn_next, *s_sp_btn_like;
 static lv_obj_t *s_sp_vol_bar, *s_sp_vol_icon;
 static int s_sp_devdrawn = -1;   /* signature of the drawn device list */
 static int s_sp_devlit = -1;     /* last device-button tint, -1 = unset */
+static int s_sp_vol_painted = -1; /* last level drawn on the gauge */
 static lv_obj_t *s_sp_devpanel, *s_sp_devlist;
 static lv_obj_t *s_sp_scr;      /* the MUSIC screen, for the accent backdrop */
 static uint32_t s_sp_bg_drawn;  /* last backdrop colour, 0 = unset */
@@ -4271,6 +4546,7 @@ static void sp_devtap_cb(lv_event_t *e) {
 }
 
 static void sp_devbtn_cb(lv_event_t *e) { sp_show_devices(true); }
+static void sp_devclose_cb(lv_event_t *e) { sp_show_devices(false); }
 
 /* A swipe is invisible until Spotify answers, and that is a poll plus a 350 ms
  * settle away — long enough to read as "nothing happened" and swipe again. So the
@@ -4309,12 +4585,37 @@ static void sp_nudge(int dir, int32_t dist) {
  * that grey out the transport buttons.
  *
  * Runs in the LVGL task as a touch event, so the lock is already held. */
-static void sp_gesture_cb(lv_event_t *e) {
-    lv_dir_t d = lv_indev_get_gesture_dir(lv_indev_active());
+/* LVGL re-sends LV_EVENT_GESTURE for as long as the finger stays down, so a
+ * single flick arrives several times and skipped two or three tracks.
+ *
+ * Two guards, because they catch different things. lv_indev_wait_release() stops
+ * the repeats inside one touch — that is the actual defect. The cooldown then
+ * stops a fast second flick from landing before the first has been confirmed by a
+ * poll, which is a real gesture but almost never an intended one. */
+#define SP_SWIPE_MS 550
+static int64_t s_sp_swipe_at;
 
-    if (d == LV_DIR_TOP) { app_request(APP_DRAWER); return; }
-    if (!s_sp_devpanel || !lv_obj_has_flag(s_sp_devpanel, LV_OBJ_FLAG_HIDDEN)) return;
+static void sp_gesture_cb(lv_event_t *e) {
+    lv_indev_t *indev = lv_indev_active();
+    lv_dir_t d = lv_indev_get_gesture_dir(indev);
+
+    bool picker = s_sp_devpanel && !lv_obj_has_flag(s_sp_devpanel, LV_OBJ_FLAG_HIDDEN);
+    /* Every direction below acts once per touch. */
+    lv_indev_wait_release(indev);
+
+    if (d == LV_DIR_TOP) {
+        /* Back before home, matching what the right key does through app_back():
+         * from a sub-scene the swipe pops it rather than leaving the app. */
+        if (picker) sp_show_devices(false);
+        else        app_request(APP_DRAWER);
+        return;
+    }
+    if (picker) return;          /* a flick here belongs to the list */
     if (d != LV_DIR_LEFT && d != LV_DIR_RIGHT) return;
+
+    int64_t now = now_ms();
+    if (now - s_sp_swipe_at < SP_SWIPE_MS) return;
+    s_sp_swipe_at = now;
 
     int dir = (d == LV_DIR_LEFT) ? -1 : 1;      /* the card follows the finger */
     bool ok = s_sp_have_state &&
@@ -4352,25 +4653,25 @@ static void sp_like_cb(lv_event_t *e) {
  * song name, and the title is the only place on this layout with room for a
  * figure big enough to read at arm's length. The title comes back on its own,
  * because sp_timer_cb rewrites it every tick once the HUD retires. */
-static void sp_vol_hud_paint(void) {
+static void sp_vol_hud_paint(bool with_title) {
     if (!s_sp_vol_bar) return;
 
     int v = s_sp_vol < 0 ? 0 : s_sp_vol;
-    lv_bar_set_value(s_sp_vol_bar, v, LV_ANIM_OFF);
+    lv_slider_set_value(s_sp_vol_bar, v, LV_ANIM_OFF);
 
     uint32_t c;
     if (!s_sp_vol_ok) {
         c = 0x64748B;
         label_set_changed(s_sp_vol_icon, ICON_VOL_MUTE);
-        if (s_sp_lbl_track) label_set_changed(s_sp_lbl_track, "no volume control");
+        if (with_title && s_sp_lbl_track) label_set_changed(s_sp_lbl_track, "no volume control");
     } else if (v == 0) {
         c = 0xF43F5E;                               /* muted reads as a warning */
         label_set_changed(s_sp_vol_icon, ICON_VOL_MUTE);
-        if (s_sp_lbl_track) label_set_changed(s_sp_lbl_track, "MUTED");
+        if (with_title && s_sp_lbl_track) label_set_changed(s_sp_lbl_track, "MUTED");
     } else {
         c = 0x1DB954;
         label_set_changed(s_sp_vol_icon, ICON_VOL_UP);
-        if (s_sp_lbl_track) {
+        if (with_title && s_sp_lbl_track) {
             char t[20];
             snprintf(t, sizeof(t), "VOLUME %d", v);
             label_set_changed(s_sp_lbl_track, t);   /* the HUD repaints every tick */
@@ -4380,12 +4681,23 @@ static void sp_vol_hud_paint(void) {
     lv_obj_set_style_bg_color(s_sp_vol_bar, lv_color_hex(c), LV_PART_INDICATOR);
 }
 
+/* Dragging the gauge sets the level directly. Guarded on s_sp_vol_ok because a
+ * device that refuses remote volume must not appear to accept a drag. */
+static void sp_vol_slider_cb(lv_event_t *e) {
+    if (!s_sp_vol_ok) return;
+    int v = lv_slider_get_value(s_sp_vol_bar);
+    if (v == s_sp_vol) return;
+    s_sp_vol = v;
+    s_sp_vol_painted = v;
+    sp_send(SP_CMD_VOLUME);
+    s_sp_vol_shown = now_ms();
+    sp_vol_hud_paint(true);
+}
+
 static void sp_vol_hud_show(void) {
     s_sp_vol_shown = now_ms();
     if (!s_sp_vol_bar) return;
-    sp_vol_hud_paint();
-    lv_obj_remove_flag(s_sp_vol_bar,  LV_OBJ_FLAG_HIDDEN);
-    lv_obj_remove_flag(s_sp_vol_icon, LV_OBJ_FLAG_HIDDEN);
+    sp_vol_hud_paint(true);
 }
 
 /* Step the level. Local first so the bar answers the key immediately, then the
@@ -4486,11 +4798,15 @@ static void sp_timer_cb(lv_timer_t *t) {
      * retires itself, so the cover keeps the space the rest of the time. */
     if (s_sp_vol_bar) {
         bool up = s_sp_vol_shown && (now_ms() - s_sp_vol_shown) < SP_VOL_HUD_MS;
-        if (up) {
-            sp_vol_hud_paint();           /* after the title write above, so it wins */
-        } else {
-            lv_obj_add_flag(s_sp_vol_bar,  LV_OBJ_FLAG_HIDDEN);
-            lv_obj_add_flag(s_sp_vol_icon, LV_OBJ_FLAG_HIDDEN);
+        /* The gauge itself never hides now — only the borrowed title expires. It is
+         * repainted on change, or while a key is still being pressed; unconditionally
+         * every tick would invalidate the bar forever for nothing. */
+        /* Never repaint while a thumb is on it — the poll would yank the knob back
+         * to the server's value mid-drag. */
+        if (lv_obj_has_state(s_sp_vol_bar, LV_STATE_PRESSED)) { /* leave it alone */ }
+        else if (up || s_sp_vol != s_sp_vol_painted) {
+            s_sp_vol_painted = s_sp_vol;
+            sp_vol_hud_paint(up);
         }
     }
     /* Which device is playing lives on the corner button's colour, not on a
@@ -4603,26 +4919,30 @@ static void build_music_app(lv_obj_t *scr) {
      * panel's corners are r=110 arcs, and a circle is safe when its distance from
      * the arc centre plus its own radius stays under 110. */
 
-    /* top corners: shuffle left, device picker right */
-    s_sp_btn_shuf = sp_round_btn(scr, LV_SYMBOL_SHUFFLE, NULL, 80, 68, 64,
+    /* Shuffle, like and devices stack down the left edge instead of straddling the
+     * top. The cover was never limited by width — it was limited by the band
+     * between that top row and the track title, so vacating y36..100 takes the art
+     * from 148 to 230 px, which is 2.4x the area. Volume becomes a permanent gauge
+     * down the right edge rather than an overlay that comes and goes.
+     *
+     * Every position here was checked against the panel's r=110 corner arcs; the
+     * tightest is the play button, 44 px from the bottom edge. */
+    s_sp_btn_shuf = sp_round_btn(scr, LV_SYMBOL_SHUFFLE, NULL, 64, 90, 76,
                                  sp_shuf_cb, 0x1DB954, 0x10161F);
     /* Matches the glyph Spotify itself uses for Connect — see ICON_DEVICES. */
-    s_sp_btn_dev = sp_round_btn(scr, ICON_DEVICES, &hud_icons_30, 400, 68, 64,
+    s_sp_btn_dev = sp_round_btn(scr, ICON_DEVICES, &hud_icons_30, 64, 282, 76,
                                 sp_devbtn_cb, 0x1DB954, 0x10161F);
-    /* Top middle, between shuffle and the device picker. Smaller than the
-     * transport on purpose — liking is a deliberate act, not something you want
-     * to hit by accident while reaching for pause. */
-    s_sp_btn_like = sp_round_btn(scr, ICON_HEART_OPEN, &hud_icons_30, 240, 58, 56,
+    s_sp_btn_like = sp_round_btn(scr, ICON_HEART_OPEN, &hud_icons_30, 64, 186, 76,
                                  sp_like_cb, 0xF43F5E, 0x10161F);
 
     /* cover, smaller than before on purpose */
     s_sp_art_ph = lv_obj_create(scr);
     lv_obj_remove_style_all(s_sp_art_ph);
     lv_obj_set_size(s_sp_art_ph, SP_ART_PX, SP_ART_PX);
-    lv_obj_align(s_sp_art_ph, LV_ALIGN_TOP_MID, 0, 110);
+    lv_obj_align(s_sp_art_ph, LV_ALIGN_TOP_MID, SP_ART_DX, 40);
     lv_obj_set_style_bg_color(s_sp_art_ph, lv_color_hex(0x11161F), 0);
     lv_obj_set_style_bg_opa(s_sp_art_ph, LV_OPA_COVER, 0);
-    lv_obj_set_style_radius(s_sp_art_ph, 14, 0);
+    lv_obj_set_style_radius(s_sp_art_ph, 20, 0);
     lv_obj_remove_flag(s_sp_art_ph, LV_OBJ_FLAG_CLICKABLE);
     lv_obj_t *ph = lv_label_create(s_sp_art_ph);
     lv_obj_set_style_text_font(ph, &app_icons_64, 0);
@@ -4632,7 +4952,7 @@ static void build_music_app(lv_obj_t *scr) {
 
     s_sp_art = lv_image_create(scr);
     lv_obj_set_size(s_sp_art, SP_ART_PX, SP_ART_PX);
-    lv_obj_align(s_sp_art, LV_ALIGN_TOP_MID, 0, 110);
+    lv_obj_align(s_sp_art, LV_ALIGN_TOP_MID, SP_ART_DX, 40);
     lv_image_set_inner_align(s_sp_art, LV_IMAGE_ALIGN_COVER);
     lv_obj_add_flag(s_sp_art, LV_OBJ_FLAG_HIDDEN);
     lv_obj_remove_flag(s_sp_art, LV_OBJ_FLAG_CLICKABLE);
@@ -4642,41 +4962,64 @@ static void build_music_app(lv_obj_t *scr) {
      * space and still clears the r=110 corner arcs, which only cut x<110. The
      * readout goes top-middle, in the slot the like button vacated, where it is
      * big enough to read at a glance without crowding the corner buttons. */
-    s_sp_vol_bar = lv_bar_create(scr);
-    lv_obj_set_size(s_sp_vol_bar, 18, SP_ART_PX);
-    lv_obj_set_pos(s_sp_vol_bar, 128, 110);
-    lv_bar_set_range(s_sp_vol_bar, 0, 100);
-    lv_obj_set_style_radius(s_sp_vol_bar, 9, 0);
-    lv_obj_set_style_radius(s_sp_vol_bar, 9, LV_PART_INDICATOR);
+    /* 34 px wide, not 18: this is a drag target on a resistive-feeling panel, and
+     * a thin one is unusable. The knob is drawn deliberately oversized for the same
+     * reason — it is the part a thumb aims at. */
+    s_sp_vol_bar = lv_slider_create(scr);
+    lv_obj_set_size(s_sp_vol_bar, 34, 240);
+    lv_obj_set_pos(s_sp_vol_bar, 410, 90);
+    lv_slider_set_range(s_sp_vol_bar, 0, 100);
+    lv_obj_set_style_radius(s_sp_vol_bar, 17, 0);
+    lv_obj_set_style_radius(s_sp_vol_bar, 17, LV_PART_INDICATOR);
     lv_obj_set_style_bg_color(s_sp_vol_bar, lv_color_hex(0x18202C), 0);
     lv_obj_set_style_bg_opa(s_sp_vol_bar, LV_OPA_COVER, 0);
-    lv_obj_remove_flag(s_sp_vol_bar, LV_OBJ_FLAG_CLICKABLE);
-    lv_obj_add_flag(s_sp_vol_bar, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_set_style_pad_all(s_sp_vol_bar, 10, LV_PART_KNOB);
+    lv_obj_set_style_bg_color(s_sp_vol_bar, lv_color_hex(0xF2E9DC), LV_PART_KNOB);
+    /* Commit on RELEASED only. A VALUE_CHANGED handler fires on every pixel of
+     * drag, which would be one Spotify PUT per pixel — and the volume slider in
+     * CONTROL hard-crashed this board for the sibling reason. */
+    lv_obj_add_event_cb(s_sp_vol_bar, sp_vol_slider_cb, LV_EVENT_RELEASED, NULL);
+    /* LVGL sets LV_OBJ_FLAG_GESTURE_BUBBLE on every child that has a parent
+     * (lv_obj.c:593), so a drag here reached the screen's gesture handler and
+     * swipe-up-for-home fired: dragging the volume threw you out of the app. Any
+     * widget that owns a drag has to stop gestures escaping to the screen. */
+    lv_obj_remove_flag(s_sp_vol_bar, LV_OBJ_FLAG_GESTURE_BUBBLE);
 
     s_sp_vol_icon = lv_label_create(scr);
     lv_obj_set_style_text_font(s_sp_vol_icon, &hud_icons_30, 0);
     lv_obj_set_style_text_color(s_sp_vol_icon, lv_color_hex(0x1DB954), 0);
     label_set_changed(s_sp_vol_icon, ICON_VOL_UP);
-    lv_obj_set_pos(s_sp_vol_icon, 122, 74);
-    lv_obj_add_flag(s_sp_vol_icon, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_set_pos(s_sp_vol_icon, 415, 52);
+
+    /* Flat, not a gradient — RGB565 bands visibly on a dark ramp (HARDWARE.md 5).
+     * Inset 6 px from the cover so it reads as a chip floating on the artwork
+     * rather than as the cover having been cropped. */
+    lv_obj_t *chip = lv_obj_create(scr);
+    lv_obj_remove_style_all(chip);
+    lv_obj_set_size(chip, SP_ART_PX - 12, 60);
+    lv_obj_align(chip, LV_ALIGN_TOP_MID, SP_ART_DX, 228);
+    lv_obj_set_style_bg_color(chip, lv_color_hex(0x05070B), 0);
+    lv_obj_set_style_bg_opa(chip, 185, 0);
+    lv_obj_set_style_radius(chip, 16, 0);
+    lv_obj_remove_flag(chip, LV_OBJ_FLAG_CLICKABLE);
 
     s_sp_lbl_track = lv_label_create(scr);
-    lv_obj_set_width(s_sp_lbl_track, CONTENT_W);
+    lv_obj_set_width(s_sp_lbl_track, 240);
     lv_obj_set_style_text_font(s_sp_lbl_track, &lv_font_montserrat_20, 0);
     lv_obj_set_style_text_color(s_sp_lbl_track, lv_color_hex(0xF2E9DC), 0);
     lv_obj_set_style_text_align(s_sp_lbl_track, LV_TEXT_ALIGN_CENTER, 0);
     lv_label_set_long_mode(s_sp_lbl_track, LV_LABEL_LONG_SCROLL_CIRCULAR);
     lv_label_set_text(s_sp_lbl_track, "connecting...");
-    lv_obj_align(s_sp_lbl_track, LV_ALIGN_TOP_MID, 0, 262);
+    lv_obj_align(s_sp_lbl_track, LV_ALIGN_TOP_MID, SP_ART_DX, 235);
 
     s_sp_lbl_artist = lv_label_create(scr);
-    lv_obj_set_width(s_sp_lbl_artist, CONTENT_W);
+    lv_obj_set_width(s_sp_lbl_artist, 240);
     lv_obj_set_style_text_font(s_sp_lbl_artist, &hud_text_18, 0);
     lv_obj_set_style_text_color(s_sp_lbl_artist, lv_color_hex(0x1DB954), 0);
     lv_obj_set_style_text_align(s_sp_lbl_artist, LV_TEXT_ALIGN_CENTER, 0);
     lv_label_set_long_mode(s_sp_lbl_artist, LV_LABEL_LONG_DOT);
     lv_label_set_text(s_sp_lbl_artist, "");
-    lv_obj_align(s_sp_lbl_artist, LV_ALIGN_TOP_MID, 0, 292);
+    lv_obj_align(s_sp_lbl_artist, LV_ALIGN_TOP_MID, SP_ART_DX, 262);
 
     /* transport: the things you actually press, sized accordingly */
     /* Glyph sizes are 36 for the skips and 48 for play/pause, against the 14 px
@@ -4686,11 +5029,11 @@ static void build_music_app(lv_obj_t *scr) {
      * bigger glyph, while a matched 48 made all three compete. 36 is enabled in
      * sdkconfig.defaults purely for this; nothing sits between 20 and 48. */
     s_sp_btn_prev = sp_round_btn(scr, LV_SYMBOL_PREV, &lv_font_montserrat_36,
-                                 118, 376, 96, sp_prev_cb, 0x334155, 0x141B26);
+                                 94, 386, 96, sp_prev_cb, 0x334155, 0x141B26);
     s_sp_btn_play_lbl = sp_round_btn(scr, LV_SYMBOL_PLAY, &lv_font_montserrat_48,
-                                     240, 376, 116, sp_play_cb, 0x1DB954, 0x16241C);
+                                     240, 386, 116, sp_play_cb, 0x1DB954, 0x16241C);
     s_sp_btn_next = sp_round_btn(scr, LV_SYMBOL_NEXT, &lv_font_montserrat_36,
-                                 362, 376, 96, sp_next_cb, 0x334155, 0x141B26);
+                                 386, 386, 96, sp_next_cb, 0x334155, 0x141B26);
 
     /* Device picker, full-screen over the top. Same shape as the Wi-Fi app's
      * sub-scene so the right key pops it the same way. */
@@ -4710,19 +5053,34 @@ static void build_music_app(lv_obj_t *scr) {
     lv_label_set_text(dt, "PLAY ON");
     lv_obj_align(dt, LV_ALIGN_TOP_MID, 0, TOP_MARGIN + 18);
 
+    /* A visible way out. The right key already popped this scene and the swipe now
+     * does too, but a full-screen panel whose only exits are undiscoverable is a
+     * panel people feel trapped in — you have to be told, and nobody is.
+     *
+     * Placed where the device button itself sits on the scene underneath, so the
+     * corner you tapped to get in is the corner you tap to get out. The list moved
+     * down to 112 to clear it; at y88 the button's 64 px circle overlapped the
+     * first card and would have stolen touches meant for a device. */
+    sp_round_btn(s_sp_devpanel, LV_SYMBOL_CLOSE, NULL, 400, 68, 64,
+                 sp_devclose_cb, 0x64748B, 0x10161F);
+
     s_sp_devlist = lv_obj_create(s_sp_devpanel);
     lv_obj_remove_style_all(s_sp_devlist);
-    lv_obj_set_size(s_sp_devlist, CONTENT_W, 312);
-    lv_obj_align(s_sp_devlist, LV_ALIGN_TOP_MID, 0, 88);
+    lv_obj_set_size(s_sp_devlist, CONTENT_W, 288);
+    lv_obj_align(s_sp_devlist, LV_ALIGN_TOP_MID, 0, 112);
     lv_obj_set_flex_flow(s_sp_devlist, LV_FLEX_FLOW_COLUMN);
     lv_obj_set_style_pad_row(s_sp_devlist, 12, 0);
     lv_obj_set_scroll_dir(s_sp_devlist, LV_DIR_VER);
     lv_obj_set_scrollbar_mode(s_sp_devlist, LV_SCROLLBAR_MODE_OFF);
+    /* Same reason as the volume slider: scrolling this list is a vertical drag, and
+     * letting it bubble would close the picker out from under the finger. */
+    lv_obj_remove_flag(s_sp_devlist, LV_OBJ_FLAG_GESTURE_BUBBLE);
 
     lv_obj_add_event_cb(scr, sp_gesture_cb, LV_EVENT_GESTURE, NULL);
 
     s_sp_devdrawn = -1;
     s_sp_devlit = -1;
+    s_sp_vol_painted = -1;   /* draw the gauge once on open, not only on change */
     s_sp_art_shown[0] = '\0';
     sp_send(SP_CMD_POLL);
     sp_send(SP_CMD_DEVICES);
@@ -5032,6 +5390,7 @@ static esp_err_t dl_evt(esp_http_client_event_t *e) {
  * path, minus the .part-and-rename dance: a partial body cannot leave anything
  * behind when the destination is memory, and the caller checks the length. */
 static bool asset_fetch_mem(const char *url, const char *bearer,
+                            const char *xname, const char *xval,
                             uint8_t *buf, size_t cap, size_t *out_len) {
     s_dl_total = 0; s_dl_got = 0; s_dl_pct = 0; s_dl_kb = 0; s_dl_accent = 0;
     s_dl_mem = buf; s_dl_mem_cap = cap; s_dl_mem_len = 0;
@@ -5051,9 +5410,11 @@ static bool asset_fetch_mem(const char *url, const char *bearer,
             snprintf(auth, sizeof(auth), "Bearer %.72s", bearer);
             esp_http_client_set_header(c, "Authorization", auth);
         }
+        if (xname && xval && xval[0]) esp_http_client_set_header(c, xname, xval);
         esp_err_t err = esp_http_client_perform(c);
         int status = esp_http_client_get_status_code(c);
         ok = (err == ESP_OK && status == 200);
+        if (!ok) ESP_LOGW(TAG, "fetch %.40s -> HTTP %d", url, status);
         esp_http_client_cleanup(c);
     }
     *out_len = s_dl_mem_len;
@@ -6277,9 +6638,16 @@ void app_main(void) {
          * The lock screen polls at half the rate. It only needs to be right at a
          * glance, and desk-clock mode never sleeps — an ungated 3 s poll there
          * would run for as long as the cube sat on the desk. */
-        bool sp_poll_lock = (s_app == APP_LOCK && s_screen_on && !s_doze);
+        bool sp_awake     = (s_screen_on && !s_doze);
+        bool sp_poll_lock = (s_app == APP_LOCK && sp_awake);
         int64_t sp_due = sp_poll_lock ? (SP_POLL_MS * 2) : SP_POLL_MS;
-        if ((s_app == APP_MUSIC || sp_poll_lock) && s_wifi_up &&
+        /* MUSIC used to poll regardless of the screen, which broke 7b's own rule
+         * and had a real cost: the cover is 139 KB, and a download still in flight
+         * when the panel dozed was cut off mid-body — Wi-Fi drops to
+         * WIFI_PS_MAX_MODEM at the same moment. The length check caught the partial
+         * and refused it, so nothing was ever drawn wrong, but it cost a wasted
+         * transfer and a 30 s backoff on a cover nobody could see. */
+        if (((s_app == APP_MUSIC && sp_awake) || sp_poll_lock) && s_wifi_up &&
             t - last_sp_poll >= sp_due) {
             last_sp_poll = t;
             sp_send(SP_CMD_POLL);
