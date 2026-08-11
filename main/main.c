@@ -3013,6 +3013,11 @@ static volatile bool s_sp_shuffle;
 static volatile bool s_sp_have_state;  /* a device is active */
 static volatile bool s_sp_authfail;
 static volatile bool s_sp_art_ready;
+/* Spotify reports which transport actions are currently impossible via
+ * actions.disallows — shuffle is genuinely unavailable while a radio/autoplay
+ * context is running, and skipping can be blocked too. Only disallowed actions
+ * appear in that object, so absent means allowed. */
+static volatile bool s_sp_no_shuffle, s_sp_no_next, s_sp_no_prev;
 static sp_dev_t s_sp_dev[SP_MAX_DEV];
 static volatile int s_sp_devcount;
 static volatile int s_sp_transfer_idx = -1;
@@ -3025,6 +3030,74 @@ static esp_http_client_handle_t s_sp_http;
 static char *s_sp_body;                 /* PSRAM response buffer */
 static int s_sp_len;
 #define SP_BODY_MAX 8192
+
+/* Spotify text is real-world Unicode: typographic apostrophes, accented artist
+ * names, em dashes. Our fonts carry ASCII plus LVGL's own symbols and nothing
+ * else, so any of that renders as an empty box — "Jainal's MacBook Pro" came
+ * back with U+2019 and showed as "Jainal[]s MacBook Pro".
+ *
+ * Folding to ASCII beats shipping a bigger font: a full Latin-1 range costs flash
+ * for glyphs chosen by guessing which languages turn up, and would still box on
+ * the first Cyrillic or CJK track title. A missing accent is legible; a box is
+ * not. */
+static void ascii_fold(const char *in, char *out, size_t n) {
+    size_t o = 0;
+    while (*in && o + 1 < n) {
+        unsigned char c = (unsigned char)*in;
+        uint32_t cp;
+        int len;
+        if (c < 0x80)        { cp = c;             len = 1; }
+        else if ((c & 0xE0) == 0xC0) { cp = c & 0x1F; len = 2; }
+        else if ((c & 0xF0) == 0xE0) { cp = c & 0x0F; len = 3; }
+        else if ((c & 0xF8) == 0xF0) { cp = c & 0x07; len = 4; }
+        else { in++; continue; }                  /* stray continuation byte */
+        for (int k = 1; k < len; k++) {
+            if ((in[k] & 0xC0) != 0x80) { cp = 0xFFFD; len = k; break; }
+            cp = (cp << 6) | (in[k] & 0x3F);
+        }
+        in += len;
+
+        const char *rep = NULL;
+        if (cp < 0x80) { out[o++] = (char)cp; continue; }
+        switch (cp) {
+        case 0x2018: case 0x2019: case 0x02BC: rep = "'";   break;  /* curly quotes */
+        case 0x201C: case 0x201D: rep = "\"";               break;
+        case 0x2013: case 0x2014: case 0x2212: rep = "-";   break;  /* dashes */
+        case 0x2026: rep = "...";                           break;
+        case 0x00A0: rep = " ";                             break;
+        case 0x00E6: rep = "ae"; break;  case 0x00C6: rep = "AE"; break;
+        case 0x00DF: rep = "ss"; break;
+        case 0x0153: rep = "oe"; break;  case 0x0152: rep = "OE"; break;
+        default:
+            /* Latin-1 / Latin Extended-A: keep the base letter. */
+            if (cp >= 0x00C0 && cp <= 0x00FF) {
+                static const char *lat =
+                    "AAAAAAACEEEEIIIIDNOOOOOxOUUUUYPs"
+                    "aaaaaaaceeeeiiiidnooooo/ouuuuypy";
+                rep = NULL;
+                out[o++] = lat[cp - 0x00C0];
+                continue;
+            }
+            if (cp >= 0x0100 && cp <= 0x017F) {
+                /* Latin Extended-A alternates upper/lower around a base letter;
+                 * close enough for a name, and far better than a box. */
+                static const char *ext = "AaAaAaCcCcCcCcCcDdDdEeEeEeEeEeGgGgGgGg"
+                                         "HhHhIiIiIiIiIiJjKkkLlLlLlLlLlNnNnNnnNn"
+                                         "OoOoOoRrRrRrSsSsSsSsTtTtTtUuUuUuUuUuUu"
+                                         "WwYyYZzZzZzs";
+                size_t idx = cp - 0x0100;
+                out[o++] = (idx < strlen(ext)) ? ext[idx] : '?';
+                continue;
+            }
+            rep = "?";
+            break;
+        }
+        if (rep) {
+            while (*rep && o + 1 < n) out[o++] = *rep++;
+        }
+    }
+    out[o] = '\0';
+}
 
 /* ---- HTTP plumbing, all on the spotify task ---- */
 
@@ -3178,23 +3251,29 @@ static void sp_poll_state(void) {
     cJSON *pl   = cJSON_GetObjectItem(j, "is_playing");
     cJSON *sh   = cJSON_GetObjectItem(j, "shuffle_state");
 
+    cJSON *act = cJSON_GetObjectItem(j, "actions");
+    cJSON *dis = act ? cJSON_GetObjectItem(act, "disallows") : NULL;
+    s_sp_no_shuffle = dis && cJSON_IsTrue(cJSON_GetObjectItem(dis, "toggling_shuffle"));
+    s_sp_no_next    = dis && cJSON_IsTrue(cJSON_GetObjectItem(dis, "skipping_next"));
+    s_sp_no_prev    = dis && cJSON_IsTrue(cJSON_GetObjectItem(dis, "skipping_prev"));
+
     s_sp_playing = cJSON_IsTrue(pl);
     s_sp_shuffle = cJSON_IsTrue(sh);
     s_sp_have_state = true;
 
     if (dev) {
         cJSON *n = cJSON_GetObjectItem(dev, "name");
-        if (cJSON_IsString(n)) snprintf(s_sp_devname, sizeof(s_sp_devname), "%s", n->valuestring);
+        if (cJSON_IsString(n)) ascii_fold(n->valuestring, s_sp_devname, sizeof(s_sp_devname));
     }
     if (item) {
         cJSON *n = cJSON_GetObjectItem(item, "name");
-        if (cJSON_IsString(n)) snprintf(s_sp_track, sizeof(s_sp_track), "%s", n->valuestring);
+        if (cJSON_IsString(n)) ascii_fold(n->valuestring, s_sp_track, sizeof(s_sp_track));
 
         cJSON *arts = cJSON_GetObjectItem(item, "artists");
         if (cJSON_IsArray(arts) && cJSON_GetArraySize(arts) > 0) {
             cJSON *a0 = cJSON_GetArrayItem(arts, 0);
             cJSON *an = a0 ? cJSON_GetObjectItem(a0, "name") : NULL;
-            if (cJSON_IsString(an)) snprintf(s_sp_artist, sizeof(s_sp_artist), "%s", an->valuestring);
+            if (cJSON_IsString(an)) ascii_fold(an->valuestring, s_sp_artist, sizeof(s_sp_artist));
         }
 
         /* Pick the image nearest the tile size; the broker rescales anyway, but
@@ -3233,7 +3312,7 @@ static void sp_poll_devices(void) {
             cJSON *nm = cJSON_GetObjectItem(d, "name");
             if (!cJSON_IsString(id) || !cJSON_IsString(nm)) continue;
             snprintf(s_sp_dev[n].id, sizeof(s_sp_dev[0].id), "%s", id->valuestring);
-            snprintf(s_sp_dev[n].name, sizeof(s_sp_dev[0].name), "%s", nm->valuestring);
+            ascii_fold(nm->valuestring, s_sp_dev[n].name, sizeof(s_sp_dev[0].name));
             s_sp_dev[n].active = cJSON_IsTrue(cJSON_GetObjectItem(d, "is_active"));
             n++;
         }
@@ -3315,6 +3394,9 @@ static void sp_task(void *arg) {
                 int code = sp_call(HTTP_METHOD_PUT, "/me/player", body);
                 ESP_LOGI(TAG, "spotify: transfer to %s -> HTTP %d",
                          s_sp_dev[idx].name, code);
+                /* is_active moved, so the cached list is now wrong */
+                vTaskDelay(pdMS_TO_TICKS(400));
+                sp_poll_devices();
             }
             goto confirm;
         }
@@ -3349,6 +3431,8 @@ static void sp_init(void) {
 
 static lv_obj_t *s_sp_art, *s_sp_art_ph, *s_sp_lbl_track, *s_sp_lbl_artist;
 static lv_obj_t *s_sp_btn_play_lbl, *s_sp_btn_shuf, *s_sp_btn_dev;
+static lv_obj_t *s_sp_btn_prev, *s_sp_btn_next;
+static int s_sp_devdrawn = -1;   /* signature of the drawn device list */
 static lv_obj_t *s_sp_devpanel, *s_sp_devlist;
 static char s_sp_art_shown[160];
 
@@ -3394,20 +3478,50 @@ static void sp_play_cb(lv_event_t *e) {
     }
     sp_send(s_sp_playing ? SP_CMD_PLAY : SP_CMD_PAUSE);
 }
-static void sp_next_cb(lv_event_t *e) { sp_send(SP_CMD_NEXT); }
-static void sp_prev_cb(lv_event_t *e) { sp_send(SP_CMD_PREV); }
+static void sp_next_cb(lv_event_t *e) { if (!s_sp_no_next) sp_send(SP_CMD_NEXT); }
+static void sp_prev_cb(lv_event_t *e) { if (!s_sp_no_prev) sp_send(SP_CMD_PREV); }
 static void sp_shuf_cb(lv_event_t *e) {
+    if (s_sp_no_shuffle) return;
     s_sp_shuffle = !s_sp_shuffle;
-    if (s_sp_btn_shuf) {
-        lv_obj_set_style_text_color(s_sp_btn_shuf,
-            lv_color_hex(s_sp_shuffle ? 0x1DB954 : 0x64748B), 0);
+    sp_send(SP_CMD_SHUFFLE);   /* the timer restyles the button */
+}
+
+/* On/off has to be unmistakable at a glance, so it is carried by a filled
+ * background rather than a tint on a small glyph — that was too subtle to read.
+ * Unavailable is a third state, drawn dimmer than off and not clickable, so a tap
+ * cannot fire a request Spotify would reject. */
+static void sp_style_toggle(lv_obj_t *lbl, bool on, bool avail,
+                            uint32_t accent, const char *glyph)
+{
+    if (!lbl) return;
+    lv_obj_t *b = lv_obj_get_parent(lbl);
+    if (glyph) lv_label_set_text(lbl, glyph);
+
+    if (!avail) {
+        lv_obj_set_style_bg_color(b, lv_color_hex(0x0A0E14), 0);
+        lv_obj_set_style_border_color(b, lv_color_hex(0x1A222D), 0);
+        lv_obj_set_style_border_opa(b, 255, 0);
+        lv_obj_set_style_text_color(lbl, lv_color_hex(0x2A3441), 0);
+        lv_obj_remove_flag(b, LV_OBJ_FLAG_CLICKABLE);
+    } else if (on) {
+        lv_obj_set_style_bg_color(b, lv_color_hex(accent), 0);
+        lv_obj_set_style_border_color(b, lv_color_hex(accent), 0);
+        lv_obj_set_style_border_opa(b, 255, 0);
+        lv_obj_set_style_text_color(lbl, lv_color_hex(0x05070B), 0);
+        lv_obj_add_flag(b, LV_OBJ_FLAG_CLICKABLE);
+    } else {
+        lv_obj_set_style_bg_color(b, lv_color_hex(0x10161F), 0);
+        lv_obj_set_style_border_color(b, lv_color_hex(accent), 0);
+        lv_obj_set_style_border_opa(b, 140, 0);
+        lv_obj_set_style_text_color(lbl, lv_color_hex(0x8FA3B8), 0);
+        lv_obj_add_flag(b, LV_OBJ_FLAG_CLICKABLE);
     }
-    sp_send(SP_CMD_SHUFFLE);
 }
 
 static void sp_show_devices(bool on) {
     if (!s_sp_devpanel) return;
     if (on) {
+        s_sp_devdrawn = -1;              /* force a redraw, never trust the cache */
         lv_obj_remove_flag(s_sp_devpanel, LV_OBJ_FLAG_HIDDEN);
         sp_send(SP_CMD_DEVICES);
     } else {
@@ -3419,14 +3533,14 @@ static void sp_devtap_cb(lv_event_t *e) {
     int idx = (int)(intptr_t)lv_obj_get_user_data(lv_event_get_target(e));
     if (idx < 0 || idx >= s_sp_devcount) return;
     s_sp_transfer_idx = idx;
-    snprintf(s_sp_devname, sizeof(s_sp_devname), "%s", s_sp_dev[idx].name);
+    snprintf(s_sp_devname, sizeof(s_sp_devname), "%s", s_sp_dev[idx].name);  /* already folded */
+    for (int k = 0; k < s_sp_devcount; k++) s_sp_dev[k].active = (k == idx);
+    s_sp_have_state = true;
     sp_send(SP_CMD_TRANSFER);
     sp_show_devices(false);
 }
 
 static void sp_devbtn_cb(lv_event_t *e) { sp_show_devices(true); }
-
-static int s_sp_devdrawn = -1;
 
 static void sp_timer_cb(lv_timer_t *t) {
     if (!s_sp_lbl_track) return;
@@ -3442,9 +3556,12 @@ static void sp_timer_cb(lv_timer_t *t) {
         lv_label_set_text(s_sp_lbl_artist, s_sp_artist);
     }
 
-    lv_label_set_text(s_sp_btn_play_lbl, s_sp_playing ? LV_SYMBOL_PAUSE : LV_SYMBOL_PLAY);
-    lv_obj_set_style_text_color(s_sp_btn_shuf,
-        lv_color_hex(s_sp_shuffle ? 0x1DB954 : 0x64748B), 0);
+    sp_style_toggle(s_sp_btn_play_lbl, s_sp_playing, s_sp_have_state, 0x1DB954,
+                    s_sp_playing ? LV_SYMBOL_PAUSE : LV_SYMBOL_PLAY);
+    sp_style_toggle(s_sp_btn_shuf, s_sp_shuffle, s_sp_have_state && !s_sp_no_shuffle,
+                    0x1DB954, NULL);
+    sp_style_toggle(s_sp_btn_prev, false, s_sp_have_state && !s_sp_no_prev, 0x334155, NULL);
+    sp_style_toggle(s_sp_btn_next, false, s_sp_have_state && !s_sp_no_next, 0x334155, NULL);
     /* Which device is playing lives on the corner button's colour, not on a
      * permanent caption — the name itself is in the picker. */
     if (s_sp_btn_dev) {
@@ -3462,21 +3579,56 @@ static void sp_timer_cb(lv_timer_t *t) {
 
     /* Rebuild the device list only when the set changes, not every tick — it is
      * a list of buttons and rebuilding it under a finger would fight the touch. */
+    /* Keyed on count AND which one is active. Keying on count alone meant
+     * switching between the same three devices never redrew, so the tick stayed
+     * on the old one — the transfer worked and the UI silently lied. */
+    int devsig = s_sp_devcount << 8;
+    for (int i = 0; i < s_sp_devcount; i++) {
+        if (s_sp_dev[i].active) devsig |= (i + 1);
+    }
     if (s_sp_devlist && !lv_obj_has_flag(s_sp_devpanel, LV_OBJ_FLAG_HIDDEN) &&
-        s_sp_devdrawn != s_sp_devcount) {
-        s_sp_devdrawn = s_sp_devcount;
+        s_sp_devdrawn != devsig) {
+        s_sp_devdrawn = devsig;
         lv_obj_clean(s_sp_devlist);
+        /* Cards, not list rows. There are only ever a handful of devices, so the
+         * space is better spent on targets big enough to hit on a small panel
+         * than on fitting a long list nobody has. */
         for (int i = 0; i < s_sp_devcount; i++) {
-            lv_obj_t *b = lv_list_add_button(s_sp_devlist,
-                s_sp_dev[i].active ? LV_SYMBOL_OK : LV_SYMBOL_AUDIO, s_sp_dev[i].name);
+            bool on = s_sp_dev[i].active;
+            lv_obj_t *b = lv_button_create(s_sp_devlist);
+            lv_obj_set_size(b, lv_pct(100), 76);
+            lv_obj_set_style_radius(b, 16, 0);
+            lv_obj_set_style_bg_color(b, lv_color_hex(on ? 0x11331F : 0x141B26), 0);
+            lv_obj_set_style_border_width(b, 2, 0);
+            lv_obj_set_style_border_color(b, lv_color_hex(on ? 0x1DB954 : 0x27313F), 0);
+            lv_obj_set_style_border_opa(b, on ? 255 : 160, 0);
+            lv_obj_set_style_bg_color(b, lv_color_hex(0x1DB954), LV_STATE_PRESSED);
+            lv_obj_set_style_pad_left(b, 16, 0);
             lv_obj_set_user_data(b, (void *)(intptr_t)i);
             lv_obj_add_event_cb(b, sp_devtap_cb, LV_EVENT_CLICKED, NULL);
-            lv_obj_set_style_bg_color(b, lv_color_hex(s_sp_dev[i].active ? 0x123524 : 0x1C1C2B), 0);
-            lv_obj_set_style_text_color(b, lv_color_hex(s_sp_dev[i].active ? 0x1DB954 : 0xD8D8E4), 0);
+
+            lv_obj_t *ic = lv_label_create(b);
+            lv_obj_set_style_text_font(ic, &lv_font_montserrat_20, 0);
+            lv_obj_set_style_text_color(ic, lv_color_hex(on ? 0x1DB954 : 0x64748B), 0);
+            lv_label_set_text(ic, on ? LV_SYMBOL_OK : LV_SYMBOL_VOLUME_MAX);
+            lv_obj_align(ic, LV_ALIGN_LEFT_MID, 0, 0);
+
+            lv_obj_t *nm = lv_label_create(b);
+            lv_obj_set_style_text_font(nm, &lv_font_montserrat_20, 0);
+            lv_obj_set_style_text_color(nm, lv_color_hex(on ? 0xE8FBFF : 0xC7D2E0), 0);
+            lv_label_set_long_mode(nm, LV_LABEL_LONG_DOT);
+            lv_obj_set_width(nm, CONTENT_W - 92);
+            lv_label_set_text(nm, s_sp_dev[i].name);
+            lv_obj_align(nm, LV_ALIGN_LEFT_MID, 38, 0);
         }
         if (s_sp_devcount == 0) {
-            lv_obj_t *b = lv_list_add_text(s_sp_devlist, "no devices - open Spotify somewhere");
-            lv_obj_set_style_text_color(b, lv_color_hex(0x64748B), 0);
+            lv_obj_t *t = lv_label_create(s_sp_devlist);
+            lv_obj_set_width(t, CONTENT_W - 24);
+            lv_obj_set_style_text_font(t, &hud_text_18, 0);
+            lv_obj_set_style_text_color(t, lv_color_hex(0x64748B), 0);
+            lv_obj_set_style_text_align(t, LV_TEXT_ALIGN_CENTER, 0);
+            lv_label_set_long_mode(t, LV_LABEL_LONG_WRAP);
+            lv_label_set_text(t, "no devices\nopen Spotify somewhere first");
         }
     }
 }
@@ -3499,7 +3651,7 @@ static void build_music_app(lv_obj_t *scr) {
     /* top corners: shuffle left, device picker right */
     s_sp_btn_shuf = sp_round_btn(scr, LV_SYMBOL_SHUFFLE, NULL, 80, 68, 64,
                                  sp_shuf_cb, 0x1DB954, 0x10161F);
-    s_sp_btn_dev = sp_round_btn(scr, LV_SYMBOL_AUDIO, NULL, 400, 68, 64,
+    s_sp_btn_dev = sp_round_btn(scr, LV_SYMBOL_VOLUME_MAX, NULL, 400, 68, 64,
                                 sp_devbtn_cb, 0x1DB954, 0x10161F);
 
     /* cover, smaller than before on purpose */
@@ -3543,12 +3695,12 @@ static void build_music_app(lv_obj_t *scr) {
     lv_obj_align(s_sp_lbl_artist, LV_ALIGN_TOP_MID, 0, 292);
 
     /* transport: the things you actually press, sized accordingly */
-    (void) sp_round_btn(scr, LV_SYMBOL_PREV, NULL, 118, 376, 96,
-                        sp_prev_cb, 0x334155, 0x141B26);
+    s_sp_btn_prev = sp_round_btn(scr, LV_SYMBOL_PREV, NULL, 118, 376, 96,
+                                 sp_prev_cb, 0x334155, 0x141B26);
     s_sp_btn_play_lbl = sp_round_btn(scr, LV_SYMBOL_PLAY, &lv_font_montserrat_20,
                                      240, 376, 116, sp_play_cb, 0x1DB954, 0x16241C);
-    (void) sp_round_btn(scr, LV_SYMBOL_NEXT, NULL, 362, 376, 96,
-                        sp_next_cb, 0x334155, 0x141B26);
+    s_sp_btn_next = sp_round_btn(scr, LV_SYMBOL_NEXT, NULL, 362, 376, 96,
+                                 sp_next_cb, 0x334155, 0x141B26);
 
     /* Device picker, full-screen over the top. Same shape as the Wi-Fi app's
      * sub-scene so the right key pops it the same way. */
@@ -3568,13 +3720,14 @@ static void build_music_app(lv_obj_t *scr) {
     lv_label_set_text(dt, "PLAY ON");
     lv_obj_align(dt, LV_ALIGN_TOP_MID, 0, TOP_MARGIN + 18);
 
-    s_sp_devlist = lv_list_create(s_sp_devpanel);
-    lv_obj_set_size(s_sp_devlist, CONTENT_W, 296);
-    lv_obj_align(s_sp_devlist, LV_ALIGN_TOP_MID, 0, 92);
-    lv_obj_set_style_bg_color(s_sp_devlist, lv_color_hex(0x11161F), 0);
-    lv_obj_set_style_border_width(s_sp_devlist, 0, 0);
-    lv_obj_set_style_radius(s_sp_devlist, 16, 0);
-    lv_obj_set_style_pad_all(s_sp_devlist, 6, 0);
+    s_sp_devlist = lv_obj_create(s_sp_devpanel);
+    lv_obj_remove_style_all(s_sp_devlist);
+    lv_obj_set_size(s_sp_devlist, CONTENT_W, 312);
+    lv_obj_align(s_sp_devlist, LV_ALIGN_TOP_MID, 0, 88);
+    lv_obj_set_flex_flow(s_sp_devlist, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_style_pad_row(s_sp_devlist, 12, 0);
+    lv_obj_set_scroll_dir(s_sp_devlist, LV_DIR_VER);
+    lv_obj_set_scrollbar_mode(s_sp_devlist, LV_SCROLLBAR_MODE_OFF);
 
     lv_obj_add_event_cb(scr, gesture_home_cb, LV_EVENT_GESTURE, NULL);
 
@@ -4620,6 +4773,7 @@ static void app_open(int idx) {
     s_sp_art = NULL; s_sp_art_ph = NULL; s_sp_lbl_track = NULL;
     s_sp_lbl_artist = NULL; s_sp_btn_play_lbl = NULL; s_sp_btn_shuf = NULL;
     s_sp_btn_dev = NULL; s_sp_devpanel = NULL; s_sp_devlist = NULL;
+    s_sp_btn_prev = NULL; s_sp_btn_next = NULL;
     s_pomo_clock = NULL; s_pomo_word = NULL;
     s_pomo_ring = NULL; s_pomo_arc = NULL; s_pomo_fill = NULL;
     for (int i = 0; i < POMO_SLOTS; i++) s_pomo_dial[i] = NULL;
