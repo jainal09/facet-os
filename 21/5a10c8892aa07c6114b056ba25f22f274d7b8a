@@ -1,0 +1,23 @@
+.env.example
+  s_57e4cf4a7836a6::t_cc5b54fc3dcfdd 1-7
+  s_57e4cf4a7836a6::t_84364d3ebfd3a8 9-12,14-17
+main/CMakeLists.txt
+  s_57e4cf4a7836a6::t_6a2eb9be6377b4 34-35
+  s_57e4cf4a7836a6::t_7ba3f911cd940e 21-33
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.22",
+  "base_commit_sha": "215a10c8892aa07c6114b056ba25f22f274d7b8a",
+  "prompts": {},
+  "sessions": {
+    "s_57e4cf4a7836a6": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "79540328-5c96-430d-b4c5-de35687f549e",
+        "model": "claude-opus-5"
+      },
+      "human_author": "Jainal Gosaliya <jainal09gosalia@gmail.com>"
+    }
+  }
+}
