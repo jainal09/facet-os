@@ -122,6 +122,32 @@ enum matched, it compiled clean, and nothing happened when the key was pressed.
 If a key action does nothing, check that the dispatcher can *reach* the handler
 before debugging the handler.
 
+**MUSIC is the one app that rebinds the keys**, and it takes all three: left
+raises the volume, right lowers it, middle mutes. A remote whose volume lives in
+a menu is not a remote, and the three side keys are the only controls you can
+find without looking at the screen.
+
+Left-is-up **deliberately contradicts the silkscreen**, which labels the leftmost
+key minus and the rightmost plus. It matches how the cube is actually held rather
+than how it is printed, it was asked for explicitly, and it is the kind of thing
+a later reader will try to "correct" back to the labels. Don't.
+
+The costs of rebinding are paid explicitly:
+
+- **Home moves to a swipe up from the bottom**, phone-style. `sp_gesture_cb`
+  handles it on this screen — the other apps use `gesture_home_cb`, same
+  direction. Lock is then one swipe plus one key rather than unreachable.
+- **The device picker keeps the global bindings**, so the right key can still pop
+  a sub-scene. `sp_keys()` returns false whenever that panel is visible, which is
+  what stops volume from trapping you in it.
+- Keys are offered to `sp_keys()` *before* the global chain, and it reports
+  whether it consumed them — the alternative, special-casing `APP_MUSIC` inside
+  each global branch, is how the lock-screen bug above happened.
+
+Held keys repeat: `btn_poll()` emits `BTN_REPEAT` every 130 ms after the long
+press. Every other consumer tests for `BTN_SHORT`/`BTN_LONG` specifically, so
+repeats are ignored without those call sites needing to know they exist.
+
 Waking from sleep always lands on the lock screen, never straight into an app.
 Tapping the lock screen goes **Home**, not back to wherever you locked from.
 
@@ -238,6 +264,153 @@ Wallpaper downloads are suppressed during a session — partly so a 400 KB fetch
 does not compete for internal SRAM with the audio codec, partly because a radio
 burst mid-focus is rude.
 
+**Pause has two triggers and one owner.** A tap toggles a live session; laying the
+cube flat pauses it and standing it up resumes. Both route through
+`pomo_set_running()`, which exists because two copies of that logic would drift,
+and because it holds a detail neither caller should have to remember: **resuming
+must re-stamp `s_pomo_tick_ms`.** The countdown is driven by elapsed wall time
+rather than by counting ticks, so without it the whole pause is charged to the
+session the instant it resumes — a bug that would present as the timer
+mysteriously losing minutes, nowhere near the pause that caused it.
+
+The helper is guarded on current state, so a transition that does not apply is a
+no-op. That is what lets the two triggers coexist: a session paused by tap is not
+disturbed by the cube then being set down. `POMO_DONE` ignores taps entirely,
+because the finish screen retires itself and a stray tap would otherwise start a
+whole new session.
+
+## MUSIC: a remote for whatever is already playing
+
+The cube never plays the audio. It drives whichever Spotify endpoint is active —
+phone, laptop, speaker — which is why it can be useful without a decent speaker
+of its own.
+
+**Direct to Spotify for everything interactive; the broker only where it earns
+its place.** Control, state and the device list go straight to `api.spotify.com`
+at 6 ms warm (see [HARDWARE.md §7f](HARDWARE.md)). The broker in [`broker/`](../broker)
+is touched for exactly two things — one-time pairing, and album art — so it is
+not a dependency of daily use:
+
+| Broker down | Result |
+|---|---|
+| Controls, state, device list | Unaffected |
+| Album art | Last cached art, or the placeholder |
+| First-time pairing | Blocked, but that is a one-off |
+
+**One task, one HTTP handle, one command queue.** `esp_http_client` handles carry
+no lock and mutate in place, so the handle is confined to the `spotify` task
+(stack in PSRAM) and touch callbacks only ever enqueue. Taps are optimistic: the
+icon flips immediately and the next poll confirms rather than discovers.
+
+**Album art is decoded by the broker, not the device.** It returns LVGL's RGB565
+`.bin` format, so `lv_bin_decoder` streams rows off the card per draw chunk and
+the device runs no image decoder at all — which sidesteps TJpgD never populating
+the image cache. Ask for **exactly the size that gets drawn**: the cover is 148 px,
+so `SP_ART_PX` is 148, and the file is 43 KB rather than 115 KB.
+
+That number is load-bearing in a second way. The cover has to end above the track
+title, and for three commits it did not — `SP_ART_PX` stayed at 240 through the
+relayout that moved the labels up to y262, so the title, the artist and the top of
+the play button were all drawn *over* the artwork. It was plainly visible in a
+photo of the device and nobody had said anything, because the eye reads it as a
+busy album cover. Geometry that depends on two constants agreeing is worth
+asserting or deriving, not restating.
+
+**Unavailable is a distinct state from off.** Spotify reports
+`actions.disallows` per transport verb and `device.supports_volume` per endpoint,
+and plenty of Connect speakers refuse remote volume. Controls therefore render in
+three states — on, off, and unavailable-and-not-clickable — because a button that
+looks live and does nothing is worse than one that looks disabled.
+
+**Volume converges rather than queues.** `s_sp_vol` is stepped locally so the bar
+tracks the key, and `s_sp_vol_sent` records what Spotify accepted; the two being
+unequal *is* the "a PUT is owed" flag. Nothing is cleared before the call, so a
+press landing mid-flight cannot be lost to a read-then-clear race — the trailing
+check sees the level moved and queues another round. The same function runs on
+every poll, which makes a dropped command self-healing within one cycle.
+
+**Gestures, because the keys are spent.** Swipe up goes home; swipe left and
+right change track, in the direction a carousel flicks. Both are skipped while the
+device picker is open, where a flick belongs to the list.
+
+**A reused connection has to be able to give up.** `esp_http_client_perform()`
+does not redial after a transport failure — it retries the dead socket forever.
+Seen live: the server reset a connection mid-transfer and every 3 s poll
+afterwards logged `esp_tls_conn_read error / Socket is not connected` while the
+app sat frozen, with nothing surfacing near the UI. So `sp_call()` checks
+`perform()`'s **return value**, not just the status code, and closes the handle on
+a genuine transport error so the next call redials at the cost of one 390 ms
+handshake. `ESP_ERR_NOT_SUPPORTED` is excluded — that is the Bearer-challenge
+path, which is a normal 401 and must not force a reconnect.
+
+The lesson generalises past this app: the whole point of a long-lived handle is
+that it survives, so the failure mode is *not* letting go when it should. Any
+long-lived client needs an explicit path back to disconnected.
+
+**Decoration must back off.** A failed art fetch only recorded the URL on
+success, so a truncated download retried on every poll — a 43 KB request every
+3 s, hammering the broker and pinning internal SRAM near its floor for as long as
+the track played. Failures are now remembered with a 30 s cooldown. Anything
+retried from a periodic poll needs a cooldown, or one failure becomes a load
+generator.
+
+**The library endpoints moved.** `/me/tracks/contains` and `/me/tracks` now answer
+403 regardless of scope; use `/me/library` with Spotify URIs. This cost real
+debugging time and is written up as [HARDWARE.md pitfall #16](HARDWARE.md#10-pitfalls-index).
+
+### The backdrop follows the cover
+
+The broker returns a dominant colour as an `X-Art-Accent` header on the art fetch,
+so the tint costs **no extra request and no extra bytes** — a second endpoint would
+have cost a 390 ms cold handshake per track. It is derived from the bytes being
+served rather than stored beside them, so a cache hit and a cache miss cannot
+disagree and no existing cache entry is invalidated.
+
+Three things make it usable rather than merely colourful:
+
+- **Conditioning happens on the server**, where there is float math and one place
+  to tune it. Averaging album art gives mud, and a near-black or near-white tint
+  makes a glyph on top unreadable, so the broker discards greys and near-blacks
+  per pixel, weights the rest by how colourful they are, and forces the result
+  into a saturation and lightness band. A genuinely monochrome cover makes it
+  **decline** — the player keeps its default rather than tinting itself a grey
+  indistinguishable from its own chrome.
+- **The tint goes behind the controls, not on them**, at a quarter strength. Full
+  value fights white text, and on an AMOLED every lit pixel costs power. Flat, never
+  a gradient: RGB565 bands visibly on a dark ramp.
+- **It is change-gated.** Setting a screen's background invalidates all 480×480 of
+  it, so applied on every tick this would be a full-frame flush forever.
+
+Black is the default and the fallback: the accent starts at 0 meaning "not known
+yet", so a screen still waiting on `/me/player` stays black rather than showing a
+colour that would read as chosen on purpose.
+
+### Now playing on the lock screen
+
+The lock screen grows a transport panel when Spotify has an active device, and is
+untouched when it does not. Three gates make it affordable:
+
+1. **Polls only while the screen is genuinely on** (`s_screen_on && !s_doze`), at
+   half the MUSIC rate. Dozing runs at 80 MHz with `WIFI_PS_MAX_MODEM` where an
+   HTTPS call costs ~4 s, so a 3 s cadence would never let the radio sleep — and
+   desk-clock mode never sleeps at all, so an ungated poll would run for as long
+   as the cube sat on the desk.
+2. **Wallpaper downloads are suppressed while the panel is up.** The wallpaper
+   fetch is the largest transient consumer of internal SRAM on this board, and the
+   panel fetches album art; overlapping them was the real risk, not the widgets.
+   Note this does *not* cover boot, when the lock screen decodes a wallpaper and
+   fetches art before the panel appears — the lowest floor yet recorded (5,368
+   bytes, since relieved by the Wi-Fi buffer trim) was measured in that window.
+3. **Nothing repaints unless it changed**, which is what makes a panel on a screen
+   that already redraws every 40 ms for its sweep arc cost approximately nothing.
+
+**The clock yields, not the buttons.** The first attempt kept the clock centred and
+fitted the transport into what was left, which produced 46 px targets — small
+enough to ghost-touch, and the same mistake the first MUSIC layout made. When the
+panel appears the clock drops to `hud_clock_48` and moves up, the divider hides,
+and the transport gets 76/88/76 px with real padding. The clock has nothing below
+it worth protecting.
+
 ## Sound
 
 Clips are authored offline and embedded in flash via `EMBED_FILES` (~99 KB),
@@ -288,8 +461,10 @@ main/
   credentials.h.in    template; CMake fills it from .env
   hud_fonts.h         font + icon glyph declarations
   hud_clock_76.c      Orbitron, digits and colon only (89 KB)
+  hud_clock_48.c      the same at 48 px, for the lock screen in music mode (40 KB)
   hud_text_18.c       Orbitron, ASCII (57 KB)
-  app_icons_64.c      four Material Icons glyphs (34 KB)
+  app_icons_64.c      six Material Icons glyphs (34 KB)
+  hud_icons_30.c      five 30 px glyphs: Connect, volume, mute, heart x2 (12 KB)
 components/
   esp32_s3_touch_amoled_2_16/   forked BSP, five fixes — see HARDWARE.md §9
 sdkconfig.defaults    the config that works; read HARDWARE.md §3 before editing

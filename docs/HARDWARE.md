@@ -145,8 +145,97 @@ indistinguishable in a free-size column and need opposite fixes.
 `xTaskCreate(..., 8192, ...)` costs 8 KB of the scarcest pool on the board.
 Anything that is not time-critical and never runs with the cache disabled should
 use `xTaskCreateWithCaps(..., MALLOC_CAP_SPIRAM)` instead — moving one network
-task's stack raised the measured floor from 13.6 KB to 21.8 KB, which is the
-largest single memory win found on this board so far.
+task's stack raised the measured floor from 13.6 KB to 21.8 KB, the largest
+single win *realised* on this board so far.
+
+**The Wi-Fi driver holds ~53.5 KB and never lets go.** Measured:
+`esp_wifi_deinit()` returns **53,560 bytes** of `8BIT|DMA|INTERNAL`
+(24,919 → 78,479). It is by far the largest consumer of the scarce pool —
+bigger than LVGL, the codec and everything else together — and
+`CONFIG_SPIRAM_TRY_ALLOCATE_WIFI_LWIP=y` is already on, so that 53.5 KB is what
+*cannot* be pushed to PSRAM.
+
+**`esp_wifi_stop()` frees 96 bytes.** The pools are allocated at
+`esp_wifi_init()`, not at start, so "stop Wi-Fi while idle to save memory" does
+not work — it has to be a full deinit. Worth knowing before designing anything
+around it.
+
+### Memory numbers that were wrong, and how
+
+Four separate wrong answers were produced about this one pool in a single day,
+by two people who were both being careful. They are listed individually because
+the pattern is only visible with all of them: **every one came from measuring
+something adjacent to the question and assuming it answered the question.**
+
+1. **Comparing two different pools.** `esp_get_free_internal_heap_size()` is
+   `8BIT|DMA|INTERNAL`; `heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL)`
+   watermarks a superset including 32-bit-only IRAM. Logged side by side they
+   produced rows where the minimum exceeded the current free — impossible for one
+   pool, and the tell that they were not one pool. Fix: one cap set everywhere,
+   which is what `MEM_CAPS` above exists for.
+
+2. **What a subsystem frees is not what it needs to start.**
+   `esp_wifi_deinit()` returns 53.5 KB, but that is an upper bound including
+   everything accreted while associated. `esp_wifi_init()` needs the static pools
+   plus the driver task — about 45 KB at the time. Budgeting against the teardown
+   figure overstated a 4 KB shortfall as 12 KB, a 3× error, and nearly cancelled
+   a feature that in fact fitted.
+
+3. **Guessing the overhead around a figure you did measure.** Static pools were
+   known exactly (count × 1600). The rest — driver task stack, management short
+   buffers, dynamic RX, descriptors — was guessed at 8 KB. Measured, it is
+   **14.7 KB**. The gate built on that guess passed with 1.5 KB to spare and
+   reported success; the true margin was inside the noise.
+
+4. **Applying a saving to a state where it does not exist.** Trimming
+   `STATIC_TX_BUFFER_NUM` returned 13,800 bytes and was read as extra headroom
+   during a BLE session — but Wi-Fi is *deinitialised* for a session, so those
+   buffers were never allocated then. It raised free-during-session by ~1.5 KB.
+   What it actually did was **lower the cost of restarting Wi-Fi** by 12,800,
+   which is what made a mid-session rescan possible. Same outcome, different
+   mechanism — and the mechanism is what tells you further trims pay at full
+   value against the requirement rather than against the free figure.
+
+The habit that catches all four: **say which pool, at which instant, in which
+state, and check the number against something independent** — the sanity check in
+§7g, where the controller having started at all bounds what `largest` can have
+been, is the cheapest example.
+
+Most of it was buffer counts nobody chose: `sdkconfig.defaults` pinned only the
+RX counts and the AMPDU flags, leaving IDF's default of **16 static TX buffers at
+~1.6 KB each = 25.6 KB** on a device whose largest transmission is an HTTP GET
+header. **Trimming `ESP_WIFI_STATIC_TX_BUFFER_NUM` 16 → 8 returned 13,800 bytes**
+— slightly more than the 12,800 the arithmetic predicts, presumably descriptor
+overhead going with it:
+
+| `STATIC_TX_BUFFER_NUM` | 16 (IDF default) | 8 | 4 |
+|---|---|---|---|
+| drawer free | 21,503 | 35,303 | — |
+| drawer min | 20,004 | 33,804 | — |
+| MUSIC + art, free | — | — | 38,319 |
+| MUSIC + art, **min** | **8,212** | 23,844 | **29,320** |
+
+Inbound throughput is unaffected at 4: three 43 KB covers downloaded clean in
+95 s, no retries, no `esp_tls` noise, fps 32–35 while interacting. Sustained
+*upload* is untested because nothing here uploads.
+
+That follows from what this device does: every heavy transfer is **inbound**, and
+TX buffers do not serve those. Keep the buffers *static* (Kconfig: "If PSRAM is
+enabled, Static should be selected"); the count is the lever, not the allocation
+strategy.
+
+A further ~27 KB sits in `ESP_WIFI_IRAM_OPT` and `ESP_WIFI_RX_IRAM_OPT`,
+documented as ">10 Kbytes" and ">17 Kbytes" — and IDF itself defaults both to `n`
+when `BT_ENABLED && SPIRAM`. Untouched so far, deliberately: they move code out
+of IRAM, so changing them in the same pass as a buffer count would confound any
+throughput regression between two causes.
+
+**A subsystem that silently accepts short allocations looks like it works.**
+NimBLE's runtime cost measured **23.3 KB** beside a running Wi-Fi and **26.5 KB**
+once Wi-Fi was deinitialised and there was room. Same build, same config: given
+less, it took less, advertised successfully, and reported no error. That is the
+failure class that survives the bench and fails in the field, and it is not
+specific to BLE — treat "it fits, just" as unproven rather than as a result.
 
 ## 5. Display and LVGL
 
@@ -461,6 +550,114 @@ want the 6 ms figure across a whole REST API rather than one URL:
 - **One handle is not thread-safe.** The struct carries no lock and every field
   is mutated in place. Confine it to one task — a command queue plus a single
   owning task is the shape that works.
+- **An invariant enforced by a comment decays silently.** `esp_wifi_connect()`
+  had a comment declaring one owner — true when written, and the reason a retry
+  storm had been fixed. Adding a BLE rescan path created a third caller without
+  touching either existing one, and the assertion was stale from that moment with
+  nothing to notice it. The failure it produced was intermittent and presented as
+  "no networks in range", i.e. nowhere near the change that caused it. **"Exactly
+  one place does X" is a claim about the whole program, and a comment cannot
+  enforce it** — a flag other callers must consult, or a single function they
+  must route through, can. Worth checking whenever a new subsystem touches a
+  shared peripheral: what else already assumes it is alone?
+- **`perform()` never redials — it retries the dead socket forever.** Observed on
+  hardware: the server reset a connection mid-transfer and every subsequent poll
+  logged `esp_tls_conn_read error, errno=Software caused connection abort` /
+  `Socket is not connected`. The device stayed up, the heap was healthy, the
+  status line kept printing, and the feature was simply dead — nothing surfaced
+  anywhere near the UI. Check `perform()`'s **return value**, not just
+  `esp_http_client_get_status_code()`, and call `esp_http_client_close()` on a
+  genuine transport error so the next call redials for one 390 ms handshake.
+  **Exclude `ESP_ERR_NOT_SUPPORTED`**, which is the Bearer-challenge return on a
+  401 above: treating that as a transport fault discards the connection on every
+  token expiry and silently gives back the 65x reuse this section exists to
+  document. The general shape is worth remembering — the point of a long-lived
+  handle is that it survives, so its failure mode is *not letting go when it
+  should*, and it needs an explicit path back to disconnected.
+
+## 7g. Bluetooth LE
+
+The S3 is **BLE 5.0 only, no BR/EDR**, which costs nothing here — Web Bluetooth
+speaks GATT anyway. All figures below are from this board with NimBLE.
+
+**Static cost is decided by one flag.** Measured with `idf.py size-components`:
+
+| | internal SRAM, static |
+|---|---|
+| Stock controller (in IRAM) | **~22.6 KB** |
+| `CONFIG_BT_CTRL_RUN_IN_FLASH_ONLY=y` | **~3.7 KB** |
+
+The flag moves the controller out of IRAM for ~123 KB more flash, against
+~11.9 MB unallocated. Without it BLE is simply unaffordable. In the full firmware
+the end-to-end delta including the provisioning module is **+5,032 B of DIRAM**
+and +298 KB of flash.
+
+**Runtime cost is ~23–26.5 KB and does not fit beside Wi-Fi.** See §4 for why
+the two figures differ. Measured on the shipping build with BT compiled in and
+Wi-Fi associated:
+
+| | free | min | largest |
+|---|---|---|---|
+| drawer | 35,303 | 33,804 | 31,744 |
+| lock + album art, min | — | 23,844 | — |
+| live BLE session (Wi-Fi deinitialised) | ~54,800 | — | — |
+
+Figures after the `STATIC_TX_BUFFER_NUM` trim in §4; before it, the drawer sat at
+21,503 and a live session at ~41,035.
+
+Quote figures taken *with* BT enabled: a floor measured before `BT_ENABLED`
+describes a different binary and flatters the comparison — enabling it costs
+roughly 6.8 KB of free and takes largest-block down by ~7.7 KB.
+
+**Sanity-check a memory sample against whether BLE started at all.** A reading of
+`largest 9,728` was once taken to describe a live session — which cannot be true,
+because the controller needs ~26 KB contiguous and it had plainly come up. The
+sample turned out to be from 10.3 s *before* `wifi_driver_down()`, labelled from
+adjacency in the log rather than from the clock. The controller's own success
+bounds the measurement, which makes this self-checking and worth doing before
+recording any figure: if BLE is running, `largest` was at least ~26 KB.
+
+So BLE and an initialised Wi-Fi cannot coexist, and the largest block is the
+sharper constraint — the controller wants contiguous internal memory, so even a
+free total that looked sufficient would not serve. The radios have to be
+serialised: `esp_wifi_deinit()` before the session, re-init after. With Wi-Fi
+down, ~52 KB stays free during a session, which is comfortable.
+
+**Tuning the host barely helps.** Cutting `MSYS_1`/`MSYS_2`,
+`TRANSPORT_ACL_FROM_LL_COUNT` and `TRANSPORT_EVT_COUNT` hard returned only
+~1.4 KB, because `CONFIG_BT_NIMBLE_MEM_ALLOC_MODE_EXTERNAL=y` already places host
+allocations in PSRAM. The cost is the *controller*, and it is close to fixed.
+
+**`CONFIG_BT_CTRL_BLE_MAX_ACT=1` does not work.** Advertising fails with `519`
+= `BLE_HS_HCI_ERR(7)`, "memory capacity exceeded" — the controller needs one
+activity for the advert and one for the connection it produces. **2 is the
+floor**, and the failure is a log line, not a crash, so the stack otherwise looks
+healthy.
+
+**Teardown genuinely reclaims.** `nimble_port_stop()` then `nimble_port_deinit()`
+(the order used by IDF's `blecent`) returns everything: over three cycles,
+**112–120 bytes once on first init, then 0 and 0**. So an on-demand session
+model is sound. Never call `esp_bt_mem_release()` — it is irreversible and
+blocks re-init until reboot.
+
+**No flash writes while the radio is up.** With the controller executing from
+flash, a flash *erase* stalls it. `SPI_FLASH_AUTO_SUSPEND` is not available to
+us: IDF disqualifies XMC-C parts ("tRS >= 1ms restriction… DO NOT enable"), and
+this board's flash is XMC. NVS commits are not confined to the obvious places —
+`pet_save()` alone fires off a 60 s timer with no user action — so gate every
+commit while a session is open and drain them afterwards. Note also that
+`esp_wifi_set_config()` writes NVS by default; `esp_wifi_set_storage(WIFI_STORAGE_RAM)`
+removes that, and nothing here reads esp_wifi's mirror back.
+
+**The NimBLE host task stack is internal and cannot move.** The port creates it
+with a plain `xTaskCreatePinnedToCore` (`nimble_port_freertos.c`), so the PSRAM
+stack trick does not apply; trim `CONFIG_BT_NIMBLE_HOST_TASK_STACK_SIZE` instead
+(default 4096, IDF's own minimal profile uses 3152).
+
+Enabling BT does **not** disturb the silent-hang surfaces — verified by
+regenerating `sdkconfig` from scratch and diffing: `SPIRAM_SPEED_40M` held, and
+`SPIRAM_FETCH_INSTRUCTIONS` / `RODATA` / `XIP_FROM_PSRAM` / `PM_DFS_INIT_AUTO`
+all stayed unset. It does auto-select `ESP_COEX_SW_COEXIST_ENABLE`.
 
 ## 8. Recovery when the board won't flash
 
@@ -545,7 +742,13 @@ it independently will need the same ones:
    `P=$(ls ... | head -1); [ -z "$P" ] && exit 1`.
 7. **`-Werror` at `-O2`.** `stringop-truncation` and `format-truncation` fire on
    perfectly intentional truncation. Bound conversions with `%.31s`, or suppress
-   per-component.
+   per-component. **The rule is not "copies between fixed buffers warn"** — it
+   is *copies gcc can range-analyse right up to the boundary* warn, which is why
+   `snprintf(dst, sizeof dst, "%s", src)` is fatal between two `char[33]`s and
+   silent a few lines away between two `char[160]`s whose source came through a
+   pointer gcc cannot range. The same-looking line being fine in one place and
+   fatal in another is the confusing part; the difference is what the optimiser
+   can prove, not what you wrote.
 8. **`fps=0.0` on a static screen is correct**, not a hang — LVGL only redraws
    on invalidation.
 9. **A "working" build may be working because something failed silently.** A
@@ -576,6 +779,25 @@ it independently will need the same ones:
     everything else. Take the LVGL lock around any panel command issued outside
     the LVGL task. Auto-sleep on an animated screen is the worst case, because
     its timer keeps flushes nearly continuous.
+
+    **`bsp_display_backlight_on/off()` are panel IO too, and they were the ones
+    that got missed.** They are not a GPIO — they write panel command `0x51`
+    (§7b) over the same QSPI device. `power_set_doze()` was given the lock and
+    `screen_toggle_power()`'s backlight calls, three lines away, were not. The
+    board deadlocked: the LVGL task blocked *forever* in
+    `spi_device_acquire_bus(portMAX_DELAY)` inside `panel_io_spi_tx_param()`
+    while holding the LVGL lock, so every subsequent `ui_lock()` timed out.
+
+    Symptom to grep for: **the UI is frozen but the device is clearly alive** —
+    the 15 s status line keeps printing, `wifi=up`, heap healthy, `fps=0.0`, and
+    the log repeats `Failed to acquire LVGL lock` / `LVGL lock timed out`. It is
+    not a crash, a watchdog, or a memory problem, and nothing panics. Pitfall #14
+    is why the rest of the system survives to tell you.
+
+    Diagnosed with #15 in one gdb session: `thread apply all bt` put the `lvgl`
+    thread in `dev_wait` → `spi_bus_lock_acquire_start` → `panel_io_spi_tx_param`,
+    which names the resource and the caller outright. Worth reaching for that
+    immediately rather than guessing — it took one attach.
 14. **`bsp_display_lock(-1)` in the main loop converts any LVGL stall into a
     total freeze.** Use a bounded timeout and log loudly on failure — a dropped
     UI frame is recoverable, an infinite wait is not.
@@ -585,12 +807,35 @@ it independently will need the same ones:
     frozen board without reflashing. Get `info threads` **and** the backtraces
     in a *single* gdb session — thread IDs are re-enumerated on every attach,
     and `monitor halt` leaves the CPUs stopped, so finish with `reset run`.
-16. **A vote counter is not hysteresis.** Autorotate flipped back and forth every
+16. **A 403 on one endpoint while a sibling endpoint returns 200 on the same
+    token is a deprecation, not a scope problem.** `GET /me/tracks/contains` and
+    `PUT /me/tracks` both answered `403 Forbidden` with `user-library-read` and
+    `user-library-modify` present in the token's own `scope` field — while
+    `GET /me/tracks?limit=1` and `GET /me/albums?limit=1` returned 200 on that
+    same token. Every symptom pointed at scopes, so the pairing flow was rebuilt
+    and re-authorised twice for nothing. Spotify's February 2026 Dev Mode changes
+    deprecated the per-type library endpoints in favour of `/me/library`, which is
+    keyed on Spotify **URIs** rather than bare ids:
+    `GET /me/library/contains?uris=spotify%3Atrack%3A<id>` and
+    `PUT`/`DELETE /me/library?uris=…`, all verified returning 200.
+    **The diagnostic that would have saved the time:** when one call fails, try a
+    *sibling* call needing the identical scope. Two endpoints disagreeing on the
+    same token rules out the token, and points at the endpoint.
+17. **A vote counter is not hysteresis.** Autorotate flipped back and forth every
     few seconds on a stationary desk despite requiring eight consecutive
     agreeing samples — near 45° the input itself is genuinely ambiguous, so the
     counter just confirms whichever wrong answer arrived first. Debounce fixes
     *noise*; it does not fix an ambiguous *decision*. Add a margin the winner
     must beat, and hold the current state when nothing wins (§6).
+18. **Enabling a component in sdkconfig does not measure it.** Turning on
+    `BT_ENABLED` and rebuilding showed BLE costing 672 bytes of DIRAM — a lovely
+    number and completely false. Nothing *referenced* NimBLE, so `--gc-sections`
+    discarded the whole stack. The tell was flash growing 4.5 KB when
+    `libbtdm_app_flash.a` alone carries ~195 KB of `.text`. To size a component,
+    link something that calls into it — an opaque reference the compiler cannot
+    fold, e.g. `if (esp_random() == 0xFFFFFFFFu) thing();` — then confirm with
+    `nm` on the ELF that its symbols are actually present before believing any
+    figure. Real answer for BLE: **+5,032 B**, not 672.
 
 ## 11. Debugging method that worked
 
