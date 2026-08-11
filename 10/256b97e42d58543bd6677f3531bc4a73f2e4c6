@@ -1,0 +1,27 @@
+docs/HARDWARE.md
+  s_57e4cf4a7836a6::t_373083ec27d380 395-423
+main/main.c
+  s_57e4cf4a7836a6::t_692c6231dcfb73 259-274
+  s_57e4cf4a7836a6::t_bacf9aaf4f7598 678,2493,2532,2551,2583,2665,2810,2828
+  s_57e4cf4a7836a6::t_4be3fb1914e325 2260-2263,2265-2268,2278-2281
+  s_57e4cf4a7836a6::t_1ff4fba12e8d4b 2695-2704,2706
+  s_57e4cf4a7836a6::t_fbeb46eb071401 2031-2034
+  s_57e4cf4a7836a6::t_4e93209610824d 52
+  s_57e4cf4a7836a6::t_5191738c1db7b0 2009-2012
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.22",
+  "base_commit_sha": "10256b97e42d58543bd6677f3531bc4a73f2e4c6",
+  "prompts": {},
+  "sessions": {
+    "s_57e4cf4a7836a6": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "79540328-5c96-430d-b4c5-de35687f549e",
+        "model": "claude-opus-5"
+      },
+      "human_author": "Jainal Gosaliya <jainal09gosalia@gmail.com>"
+    }
+  }
+}
