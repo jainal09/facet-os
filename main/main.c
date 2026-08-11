@@ -3559,16 +3559,18 @@ static void build_lock_screen(lv_obj_t *scr) {
         wall_lv(slot, lvpath, sizeof(lvpath));
         lv_obj_t *wall = lv_image_create(scr);
         lv_image_set_src(wall, lvpath);
+        /* Fill the panel, whatever size the file turned out to be.
+         *
+         * The request asks imgix for exactly 480x480, but what comes back is not
+         * always that — a source photo smaller than 480 on one side comes back
+         * short, and the image was then drawn at its natural size, leaving a
+         * bare strip along one edge where the wallpaper simply stopped. Pinning
+         * the widget to the full screen and letting COVER scale into it keeps
+         * the aspect ratio and guarantees no gap. */
+        lv_obj_set_size(wall, BSP_LCD_H_RES, BSP_LCD_V_RES);
         lv_obj_center(wall);
-        /* Opacity alone is not enough. A bright photo faded over black just goes
-         * grey, and a grey field across the whole panel reads as an overlay
-         * sitting on top of the UI rather than as a background behind it — it
-         * also wrecks the contrast the HUD depends on. Fade it AND crush it
-         * toward black, which keeps the texture while dropping the luminance.
-         * Darker is also cheaper on an AMOLED. */
-        lv_obj_set_style_image_opa(wall, 105, 0);
-        lv_obj_set_style_image_recolor(wall, lv_color_hex(0x000000), 0);
-        lv_obj_set_style_image_recolor_opa(wall, 130, 0);
+        lv_image_set_inner_align(wall, LV_IMAGE_ALIGN_COVER);
+        lv_obj_set_style_image_opa(wall, 110, 0);
         lv_obj_remove_flag(wall, LV_OBJ_FLAG_CLICKABLE);
         s_wall_slot = slot;
 
