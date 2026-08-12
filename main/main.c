@@ -64,7 +64,6 @@
 
 #include "credentials.h"
 #include "hud_fonts.h"
-#include "esp_lv_decoder.h"
 #include "cJSON.h"
 #include "ble_prov.h"
 
@@ -266,6 +265,9 @@ static lv_obj_t *s_lock_np, *s_lock_np_art, *s_lock_np_ph, *s_lock_np_track;
 static lv_obj_t *s_lock_np_prev, *s_lock_np_play, *s_lock_np_next;
 static volatile bool s_lock_np_up;
 static uint32_t s_lock_np_bg;    /* last scrim colour, 0 = unset */
+static bool s_lock_np_off;       /* user swiped the panel away this visit */
+static bool s_lock_np_had;       /* was something playing on the previous tick? */
+static int64_t s_lock_swipe_at;  /* lock_tap_cb ignores a click in a swipe's shadow */
 static lv_obj_t *s_lock_rule;    /* divider under the clock; moves with it */
 static int s_sweep_deg;
 
@@ -2075,6 +2077,9 @@ static lv_obj_t *make_action_btn(lv_obj_t *parent, const char *txt,
     return b;
 }
 
+/* Unreferenced while FACET_APP_PET is 0. Kept compiled rather than deleted so it
+ * cannot bit-rot; --gc-sections drops it from the image, so it costs no flash. */
+__attribute__((unused))
 static void build_pet_app(lv_obj_t *scr) {
     s_scr_pet = scr;
     lv_obj_remove_flag(s_scr_pet, LV_OBJ_FLAG_SCROLLABLE);
@@ -4488,10 +4493,17 @@ static void sp_chrome_apply(void *unused, int32_t p) {
     if (!s_sp_art) return;
     const int32_t F = SP_CHROME_FULL;
 
-    int size = 296 - (32 * p / F);          /* 296 immersive -> 264 with chrome */
-    int cx   = 240 + (16 * p / F);          /* 240           -> 256             */
-    int y    =  30 + (10 * p / F);          /*  30           ->  40             */
+    /* Fixed size, deliberately. Resizing it scaled a JPEG every frame, which is
+     * both expensive and how the IntegerDivideByZero crash happened:
+     * lv_color_format_get_size(LV_COLOR_FORMAT_RAW) is 0, so the transform path
+     * computed buf_stride = blend_w * 0 and divided by it
+     * (lv_draw_sw_img.c:515). The chrome sliding in over the cover reads just as
+     * well and costs nothing per frame. */
+    int size = SP_ART_PX;
+    int cx   = 240;
+    int y    = 30;
     int x    = cx - size / 2;
+    (void)F; (void)p;
 
     lv_obj_set_size(s_sp_art, size, size);
     lv_obj_set_pos(s_sp_art, x, y);
@@ -5270,6 +5282,11 @@ static void build_music_app(lv_obj_t *scr) {
 
 /* ---------------- app drawer ---------------- */
 
+/* PIP is compiled but not registered. Its code stays — this is a build-time
+ * choice about what ships in THIS image, not a deletion. Flip to 1 to bring it
+ * back; nothing else needs changing. */
+#define FACET_APP_PET 0
+
 typedef struct {
     const char *name;                 /* shown in the drawer */
     const char *id;                   /* stable storage key   */
@@ -5281,7 +5298,9 @@ typedef struct {
 
 static const app_def_t s_apps[APP_COUNT] = {
     [APP_CONTROL] = { "CONTROL", "control", ICON_DASHBOARD, 0x22D3EE, build_control_app, NULL     },
+#if FACET_APP_PET
     [APP_PET]    = { "PIP",    "pet",    ICON_PETS,      0xF59E0B, build_pet_app,    pet_save },
+#endif
     [APP_MUSIC]  = { "MUSIC",  "music",  ICON_MUSIC,     0x1DB954, build_music_app,  NULL      },
     /* Red, and not the amber the app itself still uses for a running session:
      * PIP directly above it is 0xF59E0B, and two ambers side by side in a 2x2
@@ -5295,6 +5314,14 @@ static const app_def_t s_apps[APP_COUNT] = {
      * The in-app amber is 0xFFB454 at pomo_refresh(). */
     [APP_POMO]   = { "FOCUS",  "pomo",   ICON_TARGET,    0xFF453A, build_pomo_app,   pomo_save },
 };
+
+/* An app can be compiled out (FACET_APP_PET), which leaves a zeroed hole in this
+ * table rather than shortening it — the enum still indexes past it. Everything
+ * that walks the table must skip holes, or the drawer draws a blank tile, the key
+ * cycles onto nothing, and app_open() calls a NULL build(). */
+static bool app_enabled(int i) {
+    return i >= 0 && i < APP_COUNT && s_apps[i].build != NULL;
+}
 
 static void tile_cb(lv_event_t *e) {
     app_request((int)(intptr_t)lv_obj_get_user_data(lv_event_get_target(e)));
@@ -5319,6 +5346,7 @@ static void build_drawer(lv_obj_t *scr) {
     lv_obj_remove_flag(grid, LV_OBJ_FLAG_SCROLLABLE);
 
     for (int i = 0; i < APP_COUNT; i++) {
+        if (!app_enabled(i)) continue;          /* compiled out of this image */
         lv_color_t accent = lv_color_hex(s_apps[i].color);
 
         lv_obj_t *tile = lv_button_create(grid);
@@ -6082,7 +6110,18 @@ static int s_lock_slow;
 static void lock_np_refresh(void) {
     if (!s_lock_np) return;
 
-    bool show = s_sp_have_state && s_sp_track[0];
+    bool playing = s_sp_have_state && s_sp_track[0];
+
+    /* Playback starting again is a new thing to announce, so it clears a previous
+     * dismissal. Without this, swiping the panel away once would silence it until
+     * the lock screen was rebuilt, which is not what "dismiss" means. */
+    if (playing && !s_lock_np_had) {
+        if (s_lock_np_off) ESP_LOGW(TAG, "lock: dismissal cleared — playback restarted");
+        s_lock_np_off = false;
+    }
+    s_lock_np_had = playing;
+
+    bool show = playing && !s_lock_np_off;
     if (show == s_lock_np_up) {
         if (!show) return;                      /* nothing to do while hidden */
     } else {
@@ -6177,6 +6216,45 @@ static void lock_timer_cb(lv_timer_t *t) {
     lock_refresh();
 }
 
+/* The panel sits along the bottom edge, so swiping it down pushes it off the way
+ * it came — the same direction a phone uses to dismiss a sheet. Up brings it back,
+ * so a dismissal is undoable without waiting for the next track. */
+static void lock_gesture_cb(lv_event_t *e) {
+    lv_indev_t *indev = lv_indev_active();
+    lv_dir_t d = lv_indev_get_gesture_dir(indev);
+
+    /* Claim the touch FIRST. A drag still delivers CLICKED on release and a click
+     * here means "go home", so any early return lets a swipe navigate away —
+     * which is exactly what happened: swipes kept landing as "screen tapped ->
+     * home" with not one gesture logged. A swipe is never a tap. */
+    lv_indev_wait_release(indev);
+    s_lock_swipe_at = now_ms();
+
+    if (!s_sp_have_state || !s_sp_track[0]) return;
+
+    /* Push it away in any direction; pull it back up. A plain toggle was wrong —
+     * a second swipe in the same direction brought the panel back, which is not
+     * what "dismiss" means to a hand that just repeated itself.
+     *
+     * The first version accepted only TOP and BOTTOM and returned silently on
+     * anything else, which is indistinguishable from the handler never running.
+     * It turns out the natural gesture here is sideways: LV_DIR_LEFT. */
+    bool off = (d != LV_DIR_TOP);
+    if (off == s_lock_np_off) return;
+    s_lock_np_off = off;
+
+    /* Repaint HERE, not on the next tick. lock_np_refresh() otherwise runs at
+     * ~1 Hz (s_lock_slow % 25 inside a 40 ms timer), so a dismissal could take a
+     * full second to become visible — which feels precisely like the swipe was
+     * not registered, and invites a second one. That is almost certainly what
+     * "2 out of 6 registers" actually was: not lost gestures, lost feedback.
+     *
+     * Safe to call directly: a gesture callback runs on the LVGL task, so the
+     * lock is already held. */
+    lock_np_refresh();
+    ESP_LOGI(TAG, "lock: now-playing %s (dir=%d)", off ? "dismissed" : "restored", (int)d);
+}
+
 static void lock_tap_cb(lv_event_t *e) {
     /* Asleep? The first touch only wakes — it must not unlock, the same way a
      * phone shows you the lock screen before letting you in. */
@@ -6185,6 +6263,22 @@ static void lock_tap_cb(lv_event_t *e) {
         return;
     }
     ESP_LOGI(TAG, "lock: screen tapped -> home");
+    if (now_ms() - s_lock_swipe_at < 500) return;   /* that was a swipe, not a tap */
+
+    /* The now-playing panel owns its own area. Its buttons consume their own
+     * clicks, but the gaps between them fell through to here and unlocked — so
+     * reaching for pause left the lock screen, and a swipe to dismiss was fighting
+     * the unlock for the same touch. The panel is 246 px tall against the bottom
+     * edge with a 42 px margin, so it starts at y192; below that the lock screen
+     * does nothing and the panel decides. Above it, tap still unlocks. */
+    if (s_lock_np_up) {
+        lv_indev_t *indev = lv_indev_active();
+        if (indev) {
+            lv_point_t pt;
+            lv_indev_get_point(indev, &pt);
+            if (pt.y >= 192) return;
+        }
+    }
     app_request(APP_DRAWER);      /* always home, not "wherever you locked from" */
 }
 
@@ -6322,6 +6416,7 @@ static void build_lock_screen(lv_obj_t *scr) {
 
     lv_obj_add_flag(scr, LV_OBJ_FLAG_CLICKABLE);
     lv_obj_add_event_cb(scr, lock_tap_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_add_event_cb(scr, lock_gesture_cb, LV_EVENT_GESTURE, NULL);
 
     s_lock_slow = 0;
     lock_refresh();                       /* correct on the first frame */
@@ -6471,7 +6566,10 @@ static void app_action(void) {
         }
         break;
     default:                                        /* drawer: step through apps */
-        drawer_pick = (drawer_pick + 1) % APP_COUNT;
+        for (int n = 0; n < APP_COUNT; n++) {   /* step past any compiled-out app */
+            drawer_pick = (drawer_pick + 1) % APP_COUNT;
+            if (app_enabled(drawer_pick)) break;
+        }
         app_request(drawer_pick);
         break;
     }
@@ -6535,6 +6633,8 @@ static void app_open(int idx) {
      * is torn down, with nothing left on screen to explain why. */
     s_lock_np_up = false;
     s_lock_np_bg = 0;
+    s_lock_np_off = false;
+    s_lock_np_had = false;
     s_lock_rule = NULL;
 
     /* Free the outgoing app BEFORE building the next one. A cross-fade with
@@ -6545,7 +6645,7 @@ static void app_open(int idx) {
     lv_screen_load(scr);
     if (old_scr && old_scr != scr) lv_obj_delete(old_scr);
 
-    if (idx >= 0 && idx < APP_COUNT)  s_apps[idx].build(scr);
+    if (app_enabled(idx))             s_apps[idx].build(scr);
     else if (idx == APP_LOCK)         build_lock_screen(scr);
     else                              build_drawer(scr);
     s_app = idx;
@@ -6587,6 +6687,7 @@ static void app_mem_bench(void) {
     mem_line("DRAWER");
 
     for (int i = 0; i < APP_COUNT; i++) {
+        if (!app_enabled(i)) continue;
         app_open(i);
         vTaskDelay(pdMS_TO_TICKS(1800));    /* render a few frames */
         mem_line(s_apps[i].name);
@@ -6660,20 +6761,25 @@ void app_main(void) {
         bright_apply(s_bright);
         log_mem("display-up");
 
-        /* Register the JPEG/PNG decoder with LVGL. The Kconfig flag only compiles
-         * it in — without this call it is dead code, which is exactly how it sat
-         * vendored and inert in this tree for months. Album art is baseline JPEG
-         * now, so nothing draws without it. */
-        static esp_lv_decoder_handle_t s_decoder;
-        esp_err_t derr = esp_lv_decoder_init(&s_decoder);
-        if (derr != ESP_OK) {
-            ESP_LOGE(TAG, "image decoder init failed (%s) — album art will not draw",
-                     esp_err_to_name(derr));
-        } else {
-            log_mem("decoder-up");
-        }
         if (ui_lock()) {
             lv_display_add_event_cb(disp, refr_ready_cb, LV_EVENT_REFR_READY, NULL);
+
+            /* LVGL only emits a gesture once the finger has travelled 50 px AND
+             * held a velocity of 3 — defaults tuned for a phone. On this panel
+             * that lost about two thirds of real swipes: measured 2 registering
+             * out of 6 deliberate ones, which reads as "the gesture is broken"
+             * rather than "you swiped too gently".
+             *
+             * 28 px and velocity 1 accept the slower, shorter drag this cover
+             * glass actually produces. Over-triggering is already guarded against
+             * everywhere it matters: lv_indev_wait_release() gives one action per
+             * touch, MUSIC has a 550 ms cooldown, and both screens ignore a click
+             * that lands in a swipe's shadow. */
+            for (lv_indev_t *in = lv_indev_get_next(NULL); in; in = lv_indev_get_next(in)) {
+                if (lv_indev_get_type(in) != LV_INDEV_TYPE_POINTER) continue;
+                lv_indev_set_gesture_min_distance(in, 28);
+                lv_indev_set_gesture_min_velocity(in, 1);
+            }
             bsp_display_unlock();
         }
         app_open(APP_DRAWER);
