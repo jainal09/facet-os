@@ -7,7 +7,9 @@ unlimited by comparison. So the design question is never "will it fit on the
 device" — it is "will it fit in internal SRAM *at the same time as everything
 else*".
 
-Board-level facts live in [HARDWARE.md](HARDWARE.md).
+Board-level facts live in [HARDWARE.md](HARDWARE.md). The researched-and-deferred
+plan to make each app its own firmware image is in
+[MULTI-IMAGE.md](MULTI-IMAGE.md) — read it before proposing that again.
 
 ## The app model
 
