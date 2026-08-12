@@ -497,16 +497,48 @@ interactive commands on the single worker task, and the app felt broken —
 Yielding on "is the command queue non-empty" then starved it completely, because a
 poll is enqueued every 3 s and the work takes longer than that, so the queue is
 essentially never empty — *yield to the user's commands, not to your own
-housekeeping*. It now yields to a flag raised only by user actions, fills one
-cover per pass, and keeps "the list is stale" separate from "slots still need
-covers", because conflating those meant four broker round trips to fill three
-slots.
+housekeeping*. It now yields to a flag raised only by user actions, and keeps
+"the list is stale" separate from "slots still need covers", because conflating
+those meant four broker round trips to fill three slots.
 
-Steady state is one ~420 byte list fetch plus **one** cover per track change —
-the same download rate as having no lookahead at all.
+The window is six tracks deep and fills in a **burst**: on a skip the queue is
+re-asked immediately and every empty slot is filled in one pass, with two guards
+that are the whole design. The burst yields to `s_sp_urgent` between covers, so
+the most a user command ever waits is the single download already in flight; and
+it stops on the first fill that reports no progress, because a failed download
+leaves its slot pending and retrying it in the same burst is an infinite loop —
+one that pins the only worker task and presents as Spotify going dead at random,
+nowhere near the prefetcher. Steady state is still one ~420 byte list fetch plus
+**one** cover per track change — the same download rate as having no lookahead at
+all.
+
+Two bugs here cost a full evening each, and both generalise:
+
+- **A buffer's metadata must travel with the buffer.** The queue-refresh
+  carry-over moved `buf`, `accent` and `ready` into the rebuilt slot table and
+  forgot `len` — so a carried cover was ready-with-0-bytes, and promoting it
+  handed LVGL an empty source. The decoder refused it, the RAW dsc fell through
+  to the software blender, and the panel showed nothing, with no error, on every
+  cover after it (HARDWARE.md pitfall #27). Promotion now also refuses `len == 0`
+  outright, whatever produced it.
+- **Success may only be claimed with the work actually done.** `sp_art_show()`
+  stamped "shown" even when its `ui_lock()` timed out, so the UI tick believed
+  the cover was up while the object stayed hidden and nothing ever retried — an
+  infinite loading ring over correct bytes sitting in RAM. The stamps moved
+  inside the lock; a timed-out show now heals on the next poll, because the
+  already-on-hand branch finds `ready` still false and shows again. That branch
+  also re-stamps the track id: its bytes belong to *whatever is playing now*, and
+  the id is what the tick compares.
+
+The loading ring over the placeholder has **one writer** — the MUSIC tick — after
+a hide from the fetch-failure path was silently undone by the tick's own gate one
+frame later. It keys on the art URL: no artwork means the note sits alone, and a
+failed fetch keeps the ring through its cooldown because a retry genuinely is
+coming.
 
 Not covered: *previous*. Spotify exposes no history endpoint, so back-swipes stay
-as slow as they were.
+as slow as they were — which is also why heavy back-and-forth swiping shows a
+lower cache hit rate than forward listening.
 
 ### Now playing on the lock screen
 

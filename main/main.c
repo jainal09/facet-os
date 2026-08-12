@@ -243,7 +243,7 @@ static uint32_t s_dl_accent;
 
 /* Declared up here because sp_fetch_art() swaps the cover in itself — it sits
  * above the screen code but needs the widgets and the PSRAM buffer. */
-static lv_obj_t *s_sp_art, *s_sp_art_ph;
+static lv_obj_t *s_sp_art, *s_sp_art_ph, *s_sp_spin;
 static char s_sp_art_shown[160];  /* which art the widgets are showing */
 static char s_sp_art_id[26];      /* the TRACK the loaded cover belongs to */
 static uint8_t *s_sp_art_buf;            /* PSRAM, SP_ART_MAX */
@@ -1259,9 +1259,15 @@ static void imu_init(void) {
     ESP_LOGW(TAG, "QMI8658 not found — autorotate disabled");
 }
 
+/* Defined below bright_apply(), which owns the only path to panel command 0x51
+ * (pitfall #23) — so the transition cannot be written inline here. */
+static void rot_fade_begin(void);
+static void rot_fade_end(void);
+
 static void rotation_apply(int r) {
     r &= 3;
-    if (!ui_lock()) return;
+    rot_fade_begin();
+    if (!ui_lock()) { rot_fade_end(); return; }
 
     esp_lcd_panel_handle_t panel = bsp_display_panel_handle();
     if (panel) {
@@ -1276,6 +1282,7 @@ static void rotation_apply(int r) {
     }
     lv_obj_invalidate(lv_screen_active());       /* old frame is now scrambled */
     bsp_display_unlock();
+    rot_fade_end();
 
     s_rot = r;
     ESP_LOGI(TAG, "rotation -> %d deg (swap=%d mx=%d my=%d) ax=%d ay=%d az=%d",
@@ -1523,6 +1530,53 @@ static bool bright_apply(int pct) {
     bsp_display_unlock();
     s_bright_applied = pct;
     return true;
+}
+
+/* ---------------- rotation transition ----------------
+ * The swap/mirror is instant. The full-screen repaint that must follow it is
+ * not: 480 rows through 32-row draw buffers is fifteen chunked flushes, and
+ * watching them arrive one band at a time is exactly the "slow render" look —
+ * the hardware is fast, the *reveal* is what is slow.
+ *
+ * So do the repaint where nobody can see it. Brightness 0 on an AMOLED is
+ * genuinely black, not a dimmed grey, so the panel blanks, the frame lands
+ * whole, and the level ramps back.
+ *
+ * The ramp is an LVGL animation rather than a sleep loop because rotation is
+ * applied from the main loop *and* from a UI callback, and blocking the latter
+ * for a quarter second would stall every other widget on the screen. */
+static int s_rot_fade_to;      /* level to return to; 0 = no transition running */
+
+static void rot_fade_exec(void *var, int32_t v) { (void)var; bright_apply((int)v); }
+static void rot_fade_done(lv_anim_t *a)         { (void)a;   s_rot_fade_to = 0; }
+
+static void rot_fade_begin(void) {
+    if (!s_screen_on) return;            /* never light a panel that is asleep */
+    if (!ui_lock()) return;
+    /* Capture what is actually on the glass, not s_bright — FOCUS dims through
+     * the same writer, and restoring the user's level here would silently undo
+     * it. A second turn arriving mid-ramp must not capture the ramp's own
+     * partial value, hence the guard rather than an unconditional read. */
+    if (s_rot_fade_to == 0) s_rot_fade_to = s_bright_applied;
+    lv_anim_delete(&s_rot_fade_to, rot_fade_exec);
+    bsp_display_unlock();
+    bright_apply(0);
+}
+
+static void rot_fade_end(void) {
+    if (!s_screen_on || s_rot_fade_to <= 0) return;
+    if (!ui_lock()) { bright_apply(s_rot_fade_to); s_rot_fade_to = 0; return; }
+    lv_anim_t a;
+    lv_anim_init(&a);
+    lv_anim_set_var(&a, &s_rot_fade_to);
+    lv_anim_set_exec_cb(&a, rot_fade_exec);
+    lv_anim_set_completed_cb(&a, rot_fade_done);
+    lv_anim_set_values(&a, 0, s_rot_fade_to);
+    lv_anim_set_delay(&a, 70);           /* let the repaint land in the dark */
+    lv_anim_set_duration(&a, 260);
+    lv_anim_set_path_cb(&a, lv_anim_path_ease_out);
+    lv_anim_start(&a);
+    bsp_display_unlock();
 }
 
 /* ---------------- screen switching ---------------- */
@@ -4082,7 +4136,12 @@ static char s_sp_art_failed[160];
  * Buffers live in PSRAM, not on the card. The card would be free to hold them,
  * but reading 139 KB back off FATFS during the swipe puts the latency straight
  * back into the moment this exists to make instant. */
-#define SP_PF_N   3
+/* Six tracks of lookahead. Each slot costs 336 bytes of .bss plus one PSRAM
+ * cover buffer allocated on first use, so the depth is bounded by patience
+ * rather than memory — steady state is still one cover per track change, and
+ * only the initial fill gets longer. The broker caps the queue request too;
+ * raising this past queueMaxItems in broker/queue.go silently gets you fewer. */
+#define SP_PF_N   6
 #define SP_QUEUE_MAX 1024
 
 typedef struct {
@@ -4106,7 +4165,7 @@ static void sp_art_show(void);   /* defined below; the promoter needs it */
 static bool sp_pf_promote(const char *art_url) {
     for (int i = 0; i < SP_PF_N; i++) {
         sp_pf_t *e = &s_sp_pf[i];
-        if (!e->ready || strcmp(e->url, art_url) != 0) continue;
+        if (!e->ready || e->len == 0 || strcmp(e->url, art_url) != 0) continue;
 
         uint8_t *tmp = s_sp_art_buf;
         size_t   tl  = s_sp_art_len;
@@ -4115,7 +4174,19 @@ static bool sp_pf_promote(const char *art_url) {
         e->ready = false;                 /* its bytes are on screen now */
 
         snprintf(s_sp_art_have, sizeof(s_sp_art_have), "%s", art_url);
-        snprintf(s_sp_art_id, sizeof(s_sp_art_id), "%s", e->id);
+        /* Stamp the track that is PLAYING, not the queue entry we matched.
+         *
+         * Promotion matches on art URL on purpose, so two tracks off one album
+         * share a single fetch — which means the entry's own id routinely is not
+         * the current track's. The UI tick hides the cover whenever
+         * s_sp_art_id != s_sp_track_id, so stamping e->id here handed it bytes it
+         * then immediately rejected: the cover appeared and vanished within a
+         * frame, leaving the placeholder over an accent-tinted screen.
+         *
+         * The failure rate scaled with the *hit* rate, so every improvement to
+         * the prefetcher made the artwork disappear more often — which reads as
+         * the prefetch being broken, and is the opposite of true. */
+        snprintf(s_sp_art_id, sizeof(s_sp_art_id), "%s", s_sp_track_id);
         s_sp_accent = e->accent;
         s_sp_art_failed[0] = '\0';
         sp_art_show();
@@ -4205,10 +4276,15 @@ static void sp_art_show(void) {
             lv_image_set_src(s_lock_np_art, &s_sp_art_dsc);
             lv_obj_remove_flag(s_lock_np_art, LV_OBJ_FLAG_HIDDEN);
         }
+        /* Success is only claimable with the swap actually done. Stamping these
+         * on the lock-timeout path told the UI tick the cover was up while the
+         * object was still hidden — nothing would ever retry, and the ring spun
+         * forever. Left unstamped, the next poll finds url==have with ready still
+         * false and calls back in here: the failure heals in one cycle. */
+        snprintf(s_sp_art_shown, sizeof(s_sp_art_shown), "%s", s_sp_art_have);
+        s_sp_art_ready = true;
         bsp_display_unlock();
     }
-    snprintf(s_sp_art_shown, sizeof(s_sp_art_shown), "%s", s_sp_art_have);
-    s_sp_art_ready = true;
 }
 
 /* Fill at most one slot, then hand the worker back.
@@ -4217,23 +4293,33 @@ static void sp_art_show(void) {
  * play/next/volume — each a fresh TLS handshake plus 139 KB — so a swipe queued
  * behind three to five seconds of background work and the app felt broken.
  * Background work does not get to hold the worker interactive commands run on. */
-static void sp_pf_fill_one(void) {
-    if (s_sp_urgent) return;                  /* the user is waiting; try later */
+/* Returns true only if this pass actually filled a slot.
+ *
+ * The return value is load-bearing, not informational: the caller bursts while
+ * slots remain pending, and a slot whose download FAILS stays pending. Retrying
+ * it inside the same burst is an infinite loop that pins the single worker task
+ * and starves every poll and user command behind it — which does not present as
+ * a slow prefetch, it presents as Spotify going silently dead, at random,
+ * only on tracks whose cover happened to fail. */
+static bool sp_pf_fill_one(void) {
+    if (s_sp_urgent) return false;            /* the user is waiting; try later */
 
     for (int i = 0; i < SP_PF_N; i++) {
         sp_pf_t *e = &s_sp_pf[i];
         if (e->ready || !e->url[0]) continue;
         if (!e->buf) {
             e->buf = heap_caps_malloc(SP_ART_MAX, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-            if (!e->buf) { s_sp_pf_pending = false; return; }   /* out of PSRAM */
+            if (!e->buf) { s_sp_pf_pending = false; return false; }  /* out of PSRAM */
         }
         if (sp_art_get(e->url, e->buf, &e->len, &e->accent)) {
             e->ready = true;
             ESP_LOGI(TAG, "spotify: prefetched %d \"%.20s\"", i + 1, e->name);
+            return true;
         }
-        return;                               /* one per pass, by design */
+        return false;                         /* leave it pending for a later pass */
     }
     s_sp_pf_pending = false;                  /* nothing left to fill */
+    return false;
 }
 
 /* Refresh the lookahead: ask the broker what is coming, keep anything already
@@ -4288,6 +4374,13 @@ static void sp_fetch_queue(void) {
         for (int k = 0; k < SP_PF_N; k++) {
             if (s_sp_pf[k].ready && strcmp(s_sp_pf[k].url, next[i].url) == 0) {
                 next[i].buf = s_sp_pf[k].buf; next[i].accent = s_sp_pf[k].accent;
+                /* len must travel with buf: next[] is zero-initialised, so
+                 * forgetting it carries the cover over as ready-with-0-bytes.
+                 * Promoting that hands LVGL an empty src, the decoder refuses
+                 * it, and the RAW fall-through draws nothing — every cover
+                 * after it too, since the queue refresh now runs per skip.
+                 * That was the "art never shows up" bug of 2026-08-12. */
+                next[i].len = s_sp_pf[k].len;
                 next[i].ready = true;
                 s_sp_pf[k].buf = NULL; s_sp_pf[k].ready = false;
                 break;
@@ -4331,11 +4424,21 @@ static void sp_fetch_art(void) {
     }
     lastskip = 0;
 
-    /* Already on hand. sp_art_clear() lowers the ready flag on every track change,
-     * so this has to re-assert it or the placeholder stays up forever for anything
-     * that does not need a new download — the next track off the same album. */
+    /* Already on hand — the next track off the same album, or a swipe that went
+     * next-then-back. Two things have to happen here and both were once missing:
+     *
+     * Stamp the id: these bytes are this track's art now, and the UI tick hides
+     * the cover whenever the stamped id disagrees with the playing track. Without
+     * the stamp this branch produced an INFINITE loader — ready never became
+     * current, the ring spun over a correct cover sitting in RAM, and the next
+     * poll took this same branch and changed nothing, forever.
+     *
+     * Re-show when cleared: sp_art_clear() hid the object; setting a flag does
+     * not unhide it. Gated on ready so the steady state — this branch runs on
+     * every poll once the art is stable — does not re-decode per poll. */
     if (strcmp(s_sp_art_url, s_sp_art_have) == 0) {
-        s_sp_art_ready = true;
+        snprintf(s_sp_art_id, sizeof(s_sp_art_id), "%s", s_sp_track_id);
+        if (!s_sp_art_ready) sp_art_show();
         return;
     }
 
@@ -4377,6 +4480,7 @@ static void sp_task(void *arg) {
 
     sp_cmd_t cmd;
     while (1) {
+        bool skipped = false;                 /* did this command change track? */
         if (xQueueReceive(s_sp_q, &cmd, portMAX_DELAY) != pdTRUE) continue;
         if (cmd != SP_CMD_POLL) s_sp_urgent = false;   /* it is being served now */
         if (!s_wifi_up) continue;
@@ -4398,7 +4502,19 @@ static void sp_task(void *arg) {
                 s_sp_queue_dirty = false;
                 sp_fetch_queue();             /* re-ask, then fill one */
             } else if (s_sp_pf_pending) {
-                sp_pf_fill_one();             /* list is current, just keep filling */
+                /* Fill in a burst, not one cover per poll. One-per-poll was safe
+                 * and useless: polls are 3 s apart, so six slots took the better
+                 * part of a minute and any touch restarted the wait — the cache
+                 * was never ahead of the user, which is the only state in which
+                 * it is worth having.
+                 *
+                 * Bursting is only safe because of the check between each cover.
+                 * The original failure here was three synchronous downloads
+                 * sitting in front of the user's commands on the one worker task;
+                 * s_sp_urgent is raised by any user action, so the most a swipe
+                 * can now wait is the single download already in flight. */
+                for (int n = 0; n < SP_PF_N && s_sp_pf_pending && !s_sp_urgent; n++)
+                    if (!sp_pf_fill_one()) break;
             }
             break;
         case SP_CMD_DEVICES: sp_poll_devices(); break;
@@ -4411,8 +4527,10 @@ static void sp_task(void *arg) {
          * rather than to discover. */
         case SP_CMD_PLAY:    sp_call(HTTP_METHOD_PUT,  "/me/player/play", NULL);  goto confirm;
         case SP_CMD_PAUSE:   sp_call(HTTP_METHOD_PUT,  "/me/player/pause", NULL); goto confirm;
-        case SP_CMD_NEXT:    sp_call(HTTP_METHOD_POST, "/me/player/next", NULL);  goto confirm;
-        case SP_CMD_PREV:    sp_call(HTTP_METHOD_POST, "/me/player/previous", NULL); goto confirm;
+        case SP_CMD_NEXT:    sp_call(HTTP_METHOD_POST, "/me/player/next", NULL);
+                             skipped = true; goto confirm;
+        case SP_CMD_PREV:    sp_call(HTTP_METHOD_POST, "/me/player/previous", NULL);
+                             skipped = true; goto confirm;
         case SP_CMD_SHUFFLE: {
             char p[64];
             snprintf(p, sizeof(p), "/me/player/shuffle?state=%s",
@@ -4440,11 +4558,48 @@ static void sp_task(void *arg) {
         }
         continue;
 
-    confirm:
-        vTaskDelay(pdMS_TO_TICKS(350));   /* let Spotify settle before reading back */
+    confirm: {
+        /* Confirm adaptively instead of sleeping a flat 350 ms.
+         *
+         * That delay existed so Spotify had advanced before we read back, and it
+         * was pure dead time with the cover blank — paid in full on every skip
+         * even when the server had caught up in a fraction of it. Now: ask early,
+         * and only wait again if the track really has not changed yet.
+         *
+         * Only skips get the loop. Play and pause do not change the track, so
+         * polling until it changes would spin them out to the full timeout — the
+         * opposite of the intent. */
+        char before[26];
+        snprintf(before, sizeof(before), "%s", s_sp_track_id);
+        int64_t t_cmd = now_ms();
+
+        vTaskDelay(pdMS_TO_TICKS(70));
         sp_poll_state();
-        sp_check_liked();
+        if (skipped) {
+            for (int i = 0; i < 5 && strcmp(s_sp_track_id, before) == 0; i++) {
+                vTaskDelay(pdMS_TO_TICKS(60));
+                sp_poll_state();
+            }
+        }
+
+        /* The cover before the heart. Both are round trips, but only one of them
+         * is what the user is staring at — running sp_check_liked() first put a
+         * whole HTTPS call between the swipe and the artwork. */
         sp_fetch_art();
+        if (skipped) ESP_LOGI(TAG, "spotify: cover up %lldms after skip",
+                              (long long)(now_ms() - t_cmd));
+        sp_push_volume();
+        sp_check_liked();
+        /* A skip is precisely when what-comes-next changed, so refill here rather
+         * than waiting up to 3 s for the next poll to notice. Still last, and
+         * still behind the urgent check — the cover for the track the user is on
+         * has already been drawn by this point. */
+        if (skipped && !s_sp_urgent) {
+            if (s_sp_queue_dirty) { s_sp_queue_dirty = false; sp_fetch_queue(); }
+            for (int n = 0; n < SP_PF_N && s_sp_pf_pending && !s_sp_urgent; n++)
+                if (!sp_pf_fill_one()) break;
+        }
+    }
     }
 }
 
@@ -4457,12 +4612,12 @@ static void sp_send(sp_cmd_t c) {
 static void sp_init(void) {
     s_sp_q = xQueueCreate(6, sizeof(sp_cmd_t));
     if (!s_sp_q) return;
-    if (xTaskCreateWithCaps(sp_task, "spotify", 8192, NULL, 4, NULL,
+    if (xTaskCreateWithCaps(sp_task, "spotify", 12288, NULL, 4, NULL,
                             MALLOC_CAP_SPIRAM) != pdPASS) {
         ESP_LOGE(TAG, "!! spotify stack fell back to INTERNAL SRAM — costs ~8 KB "
                       "of the scarce pool; expect a lower floor");
         s_stack_fallback = true;
-        xTaskCreate(sp_task, "spotify", 8192, NULL, 4, NULL);
+        xTaskCreate(sp_task, "spotify", 12288, NULL, 4, NULL);
     }
 }
 
@@ -4616,6 +4771,7 @@ static lv_obj_t *sp_round_btn(lv_obj_t *par, const char *glyph, const lv_font_t 
 static void sp_art_clear(void) {
     if (s_sp_art)    lv_obj_add_flag(s_sp_art, LV_OBJ_FLAG_HIDDEN);
     if (s_sp_art_ph) lv_obj_remove_flag(s_sp_art_ph, LV_OBJ_FLAG_HIDDEN);
+    if (s_sp_spin)   lv_obj_remove_flag(s_sp_spin, LV_OBJ_FLAG_HIDDEN);
     s_sp_art_ready = false;
     s_sp_art_shown[0] = '\0';
 }
@@ -5036,6 +5192,25 @@ static void sp_timer_cb(lv_timer_t *t) {
         s_sp_art_shown[0] = '\0';
     }
 
+    /* The ring is a promise that a cover is coming. Nothing is coming when there
+     * is no URL to fetch — MUSIC open against a paused account — or when the last
+     * attempt at this one failed and is sitting out its cooldown. A ring turning
+     * against either is a lie, and a permanent one: it invalidates every frame
+     * for as long as the screen is up. Change-gated, like everything else on this
+     * tick, because the flag setters invalidate whether or not anything moved. */
+    if (s_sp_spin && !lv_obj_has_flag(s_sp_art_ph, LV_OBJ_FLAG_HIDDEN)) {
+        /* The tick is the ring's only writer — a hide from another task just
+         * fought this gate and lost one frame later. Keyed on the art URL: if the
+         * track has no artwork at all the note sits alone and nothing pretends
+         * otherwise, and a failed fetch keeps the ring through its cooldown
+         * because a retry genuinely is coming. */
+        bool want = s_sp_art_url[0] != '\0';
+        if (want == lv_obj_has_flag(s_sp_spin, LV_OBJ_FLAG_HIDDEN)) {
+            if (want) lv_obj_remove_flag(s_sp_spin, LV_OBJ_FLAG_HIDDEN);
+            else      lv_obj_add_flag(s_sp_spin, LV_OBJ_FLAG_HIDDEN);
+        }
+    }
+
     /* Rebuild the device list only when the set changes, not every tick — it is
      * a list of buttons and rebuilding it under a finger would fight the touch. */
     /* Keyed on count AND which one is active. Keying on count alone meant
@@ -5138,6 +5313,21 @@ static void build_music_app(lv_obj_t *scr) {
     lv_obj_set_style_text_color(ph, lv_color_hex(0x1E293B), 0);
     lv_label_set_text(ph, ICON_MUSIC);
     lv_obj_center(ph);
+
+    /* A ring around the note while bytes are on the way. The wait is real —
+     * poll, then fetch — and a still placeholder makes that read as a stall
+     * rather than as progress. LVGL animates this off its own timer, so it
+     * stays fluid while the network task works, and it costs one small
+     * invalidation per frame instead of a full redraw. */
+    s_sp_spin = lv_spinner_create(s_sp_art_ph);
+    lv_obj_set_size(s_sp_spin, 116, 116);
+    lv_obj_center(s_sp_spin);
+    lv_spinner_set_anim_params(s_sp_spin, 1100, 65);
+    lv_obj_remove_flag(s_sp_spin, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_set_style_arc_width(s_sp_spin, 5, LV_PART_MAIN);
+    lv_obj_set_style_arc_width(s_sp_spin, 5, LV_PART_INDICATOR);
+    lv_obj_set_style_arc_color(s_sp_spin, lv_color_hex(0x1B2230), LV_PART_MAIN);
+    lv_obj_set_style_arc_color(s_sp_spin, lv_color_hex(0x1DB954), LV_PART_INDICATOR);
 
     s_sp_art = lv_image_create(scr);
     lv_obj_set_size(s_sp_art, SP_ART_PX, SP_ART_PX);
@@ -5270,6 +5460,15 @@ static void build_music_app(lv_obj_t *scr) {
     s_sp_chrome = false;
     s_sp_chrome_p = 0;
     sp_chrome_apply(NULL, 0);      /* immersive by default, no animation on open */
+
+    /* The cover is the backdrop and everything else sits on top of it. LVGL
+     * draws children in creation order, and the art is created after the left
+     * column — so without this the artwork paints over shuffle, like and
+     * devices, and over the transport row once it is wide enough to reach them.
+     * The track chip and labels are created after the art and deliberately stay
+     * above it. */
+    lv_obj_move_background(s_sp_art);
+    lv_obj_move_background(s_sp_art_ph);
 
     s_sp_devdrawn = -1;
     s_sp_devlit = -1;

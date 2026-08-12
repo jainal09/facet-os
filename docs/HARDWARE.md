@@ -1021,6 +1021,21 @@ it independently will need the same ones:
     the RSSI at the moment it happens. Put RSSI on the periodic status line
     generally: a stalled bulk transfer is a link symptom and diagnosing it blind
     wastes a session.
+27. **An LVGL image that paints nothing, with no error anywhere, is a decoder
+    rejection — and with `LV_USE_LOG` off it is silent by construction.** A
+    cover with valid JPEG bytes stopped rendering: the object was unhidden,
+    `lv_image_decoder_get_info()` returned OK (it merely echoes the header *you*
+    wrote into the dsc — it proves nothing about decodability), pools were
+    healthy, and the panel showed bare background. Enabling `CONFIG_LV_USE_LOG`
+    at WARN named it in one run: `lv_draw_sw_blend_image_to_rgb565: Not
+    supported source color format` — no decoder claimed the source (its
+    `data_size` was 0), so the RAW-format dsc fell through to the software
+    blender, which cannot blend an undecoded JPEG and skips it. The log is now
+    pinned on at WARN in `sdkconfig.defaults`: a healthy build prints nothing,
+    and the failure class stops being invisible. Related trap in the same hunt:
+    a widget's *absence* has two causes — hidden flag or failed draw — and they
+    need different tools; check the flag from code, and let LVGL's own log rule
+    the draw in or out, rather than reasoning about either from a photo.
 
 ## 11. Debugging method that worked
 
