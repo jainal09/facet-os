@@ -245,11 +245,11 @@ static uint32_t s_dl_accent;
  * above the screen code but needs the widgets and the PSRAM buffer. */
 static lv_obj_t *s_sp_art, *s_sp_art_ph;
 static char s_sp_art_shown[160];  /* which art the widgets are showing */
+static char s_sp_art_id[26];      /* the TRACK the loaded cover belongs to */
 static uint8_t *s_sp_art_buf;            /* PSRAM, SP_ART_BYTES */
 static lv_image_dsc_t s_sp_art_dsc;      /* points into s_sp_art_buf + header */
-static bool asset_fetch_mem(const char *url, const char *bearer,
-                            const char *xname, const char *xval,
-                            uint8_t *buf, size_t cap, size_t *out_len);
+static bool broker_fetch(const char *path, const char *xname, const char *xval,
+                         uint8_t *buf, size_t cap, size_t *out_len);
 
 static lv_obj_t *s_lock_time, *s_lock_date, *s_lock_batt;
 static lv_obj_t *s_lock_sweep, *s_lock_batt_arc;
@@ -3496,12 +3496,21 @@ static void pomo_poll(int64_t t) {
  * the artist and the top of the play button straight over the artwork. The fetch
  * uses the same number: asking the broker for exactly the drawn size means no
  * scaling and a 43 KB file instead of 115 KB. */
-#define SP_ART_PX     264
-/* The cover sits centred between the left button column and the volume slider,
- * not on the screen. Those two are not symmetric about x240, so screen-centring
- * gave a 6 px gutter on one side and 38 px on the other. Midpoint of x102..410 is
- * x256, hence +16. Everything that sits on the cover carries the same offset. */
-#define SP_ART_DX     16
+#define SP_ART_PX     296
+/* Immersive by default: the secondary controls slide off and the cover fills the
+ * space. One animation drives every property from a single 0..256 progress value,
+ * because the cover, the label chip, both labels, the left column and the slider
+ * all have to move together — six widgets animated independently is six chances
+ * for them to disagree mid-transition.
+ *
+ *   p = 0    immersive  cover 296 @ centre 240, y30   chrome off-screen
+ *   p = 256  chrome     cover 264 @ centre 256, y40   chrome at rest
+ *
+ * The chrome centre is 256, not 240: the left column ends at x102 and the slider
+ * starts at x410, so the midpoint of the space the cover actually occupies is 256.
+ * Screen-centring left a 6 px gutter one side and 38 the other. */
+#define SP_CHROME_FULL   256
+#define SP_CHROME_HIDE_MS 4000    /* auto-hide after this much quiet */
 /* The cover lives in PSRAM, not on the card. LVGL's bin decoder can stream rows
  * off FATFS per draw chunk, which is what made a file cheap — but that is ~15 card
  * reads per frame, and it collapses the moment the image has to be scaled (the
@@ -3580,7 +3589,9 @@ static volatile bool s_sp_queue_dirty = true;
  * this rather than to "is the queue non-empty", which was the previous test and
  * was wrong: a POLL is enqueued every 3 s and the work takes longer than that, so
  * the queue is essentially never empty and the lookahead never ran at all. */
+static int64_t s_sp_swipe_at;     /* last accepted swipe; sp_tap_cb ignores its shadow */
 static volatile bool s_sp_urgent;
+
 
 /* Distinct from s_sp_queue_dirty on purpose. dirty means "what comes next may
  * have changed, re-ask the broker"; pending means "the list is current, some
@@ -3895,6 +3906,7 @@ static void sp_poll_state(void) {
         snprintf(prev_id, sizeof(prev_id), "%s", s_sp_track_id);
 
         cJSON *tid = cJSON_GetObjectItem(item, "id");
+
         if (cJSON_IsString(tid)) {
             snprintf(s_sp_track_id, sizeof(s_sp_track_id), "%s", tid->valuestring);
             /* A stale heart is worse than no heart: it invites a tap that
@@ -4084,6 +4096,7 @@ static bool sp_pf_promote(const char *art_url) {
         e->ready = false;                 /* its bytes are on screen now */
 
         snprintf(s_sp_art_have, sizeof(s_sp_art_have), "%s", art_url);
+        snprintf(s_sp_art_id, sizeof(s_sp_art_id), "%s", e->id);
         s_sp_accent = e->accent;
         s_sp_art_failed[0] = '\0';
         sp_art_show();
@@ -4099,7 +4112,7 @@ static bool sp_pf_promote(const char *art_url) {
  * failure handling — rather than a parallel copy that drifts. */
 static bool sp_art_get(const char *art_url, uint8_t *buf, uint32_t *accent_out) {
     char url[512];
-    int n = snprintf(url, sizeof(url), "%s/art.bin?s=%d&u=", BROKER_URL, SP_ART_PX);
+    int n = snprintf(url, sizeof(url), "/art.bin?s=%d&u=", SP_ART_PX);
     static const char hex[] = "0123456789ABCDEF";
     for (const unsigned char *p = (const unsigned char *)art_url;
          *p && n < (int)sizeof(url) - 4; p++) {
@@ -4112,7 +4125,7 @@ static bool sp_art_get(const char *art_url, uint8_t *buf, uint32_t *accent_out) 
     url[n] = '\0';
 
     size_t got = 0;
-    bool ok = asset_fetch_mem(url, BROKER_TOKEN, NULL, NULL, buf, SP_ART_BYTES, &got);
+    bool ok = broker_fetch(url, NULL, NULL, buf, SP_ART_BYTES, &got);
 
     /* A body that started and stopped is a stalled link, not a refusal. The server
      * side is ruled out — it serves this in 4-157 ms and tolerates a reader
@@ -4124,7 +4137,7 @@ static bool sp_art_get(const char *art_url, uint8_t *buf, uint32_t *accent_out) 
         ESP_LOGW(TAG, "spotify: art stalled at %u/%u (rssi %d) — retrying once",
                  (unsigned)got, SP_ART_BYTES, wifi_rssi());
         got = 0;
-        ok = asset_fetch_mem(url, BROKER_TOKEN, NULL, NULL, buf, SP_ART_BYTES, &got);
+        ok = broker_fetch(url, NULL, NULL, buf, SP_ART_BYTES, &got);
     }
     if (!ok) return false;
 
@@ -4209,11 +4222,11 @@ static void sp_fetch_queue(void) {
     }
 
     char url[160];
-    snprintf(url, sizeof(url), "%s/queue?n=%d&s=%d", BROKER_URL, SP_PF_N, SP_ART_PX);
+    snprintf(url, sizeof(url), "/queue?n=%d&s=%d", SP_PF_N, SP_ART_PX);
 
     size_t got = 0;
-    if (!asset_fetch_mem(url, BROKER_TOKEN, "X-Spotify-Token", s_sp_access,
-                         (uint8_t *)s_sp_body, SP_QUEUE_MAX - 1, &got) || got == 0) {
+    if (!broker_fetch(url, "X-Spotify-Token", s_sp_access,
+                      (uint8_t *)s_sp_body, SP_QUEUE_MAX - 1, &got) || got == 0) {
         ESP_LOGW(TAG, "queue: fetch failed (%u B)", (unsigned)got);
         return;
     }
@@ -4316,6 +4329,7 @@ static void sp_fetch_art(void) {
     uint32_t accent = 0;
     if (sp_art_get(s_sp_art_url, s_sp_art_buf, &accent)) {
         snprintf(s_sp_art_have, sizeof(s_sp_art_have), "%s", s_sp_art_url);
+        snprintf(s_sp_art_id, sizeof(s_sp_art_id), "%s", s_sp_track_id);
         s_sp_accent = accent;
         s_sp_art_failed[0] = '\0';
         sp_art_show();
@@ -4434,13 +4448,98 @@ static lv_obj_t *s_sp_btn_prev, *s_sp_btn_next, *s_sp_btn_like;
 /* The volume HUD: a vertical fill beside the cover plus a glyph that goes to
  * mute at zero. Hidden until a key says otherwise, so the cover keeps the space
  * and nothing permanent is spent on it. */
-static lv_obj_t *s_sp_vol_bar, *s_sp_vol_icon;
+static lv_obj_t *s_sp_vol_bar, *s_sp_vol_icon, *s_sp_chip;
 static int s_sp_devdrawn = -1;   /* signature of the drawn device list */
 static int s_sp_devlit = -1;     /* last device-button tint, -1 = unset */
 static int s_sp_vol_painted = -1; /* last level drawn on the gauge */
+static bool s_sp_chrome;          /* secondary controls shown? hidden by default */
+static int32_t s_sp_chrome_p;     /* 0 = immersive, SP_CHROME_FULL = chrome */
+static int64_t s_sp_chrome_at;    /* when last shown, for the auto-hide */
 static lv_obj_t *s_sp_devpanel, *s_sp_devlist;
 static lv_obj_t *s_sp_scr;      /* the MUSIC screen, for the accent backdrop */
 static uint32_t s_sp_bg_drawn;  /* last backdrop colour, 0 = unset */
+
+/* Lay the whole scene out from one progress value. Driven by the animation, so it
+ * stays integer maths with no allocation and no logging. Six widgets animated
+ * independently would be six chances to disagree mid-transition; one source of
+ * truth cannot. */
+static void sp_chrome_apply(void *unused, int32_t p) {
+    if (!s_sp_art) return;
+    const int32_t F = SP_CHROME_FULL;
+
+    int size = 296 - (32 * p / F);          /* 296 immersive -> 264 with chrome */
+    int cx   = 240 + (16 * p / F);          /* 240           -> 256             */
+    int y    =  30 + (10 * p / F);          /*  30           ->  40             */
+    int x    = cx - size / 2;
+
+    lv_obj_set_size(s_sp_art, size, size);
+    lv_obj_set_pos(s_sp_art, x, y);
+    if (s_sp_art_ph) {
+        lv_obj_set_size(s_sp_art_ph, size, size);
+        lv_obj_set_pos(s_sp_art_ph, x, y);
+    }
+    /* The chip rides 6 px inside the cover's bottom edge, so it tracks both size
+     * and position rather than being pinned to a screen coordinate. */
+    if (s_sp_chip) {
+        lv_obj_set_size(s_sp_chip, size - 12, 60);
+        lv_obj_set_pos(s_sp_chip, cx - (size - 12) / 2, y + size - 66);
+    }
+    if (s_sp_lbl_track)  lv_obj_set_pos(s_sp_lbl_track,  cx - 120, y + size - 59);
+    if (s_sp_lbl_artist) lv_obj_set_pos(s_sp_lbl_artist, cx - 120, y + size - 32);
+
+    /* Translate rather than reposition: it composes with the layout above, and
+     * unlike a transform it allocates no transient layer per redraw (HARDWARE 5). */
+    int32_t ltx = -150 + (150 * p / F);
+    int32_t rtx =   96 - ( 96 * p / F);
+    if (s_sp_btn_shuf) lv_obj_set_style_translate_x(lv_obj_get_parent(s_sp_btn_shuf), ltx, 0);
+    if (s_sp_btn_like) lv_obj_set_style_translate_x(lv_obj_get_parent(s_sp_btn_like), ltx, 0);
+    if (s_sp_btn_dev)  lv_obj_set_style_translate_x(lv_obj_get_parent(s_sp_btn_dev),  ltx, 0);
+    if (s_sp_vol_bar)  lv_obj_set_style_translate_x(s_sp_vol_bar,  rtx, 0);
+    if (s_sp_vol_icon) lv_obj_set_style_translate_x(s_sp_vol_icon, rtx, 0);
+}
+
+/* Transport stays put in both states — it is the one thing you always want under
+ * a thumb. Only the secondary controls come and go. */
+static void sp_chrome_set(bool show, bool animate) {
+    s_sp_chrome_at = now_ms();
+    if (show == s_sp_chrome && animate) return;
+    s_sp_chrome = show;
+
+    int32_t to = show ? SP_CHROME_FULL : 0;
+    if (!animate) { s_sp_chrome_p = to; sp_chrome_apply(NULL, to); return; }
+
+    lv_anim_t a;
+    lv_anim_init(&a);
+    lv_anim_set_var(&a, &s_sp_chrome_p);
+    lv_anim_set_exec_cb(&a, sp_chrome_apply);
+    lv_anim_set_values(&a, s_sp_chrome_p, to);
+    lv_anim_set_duration(&a, 220);
+    lv_anim_set_path_cb(&a, lv_anim_path_ease_out);
+    lv_anim_start(&a);
+    s_sp_chrome_p = to;
+}
+
+/* A drag across a clickable screen still delivers LV_EVENT_CLICKED on release, so
+ * every swipe was also toggling the chrome. Ignore a click that lands in the
+ * shadow of a gesture. */
+static void sp_tap_cb(lv_event_t *e) {
+    if (now_ms() - s_sp_swipe_at < 500) return;
+
+    /* Dead zone over the transport. The buttons consume their own clicks, but the
+     * gaps between them fall through to the screen — so a near-miss on play, which
+     * on this touchscreen is common, toggled the chrome instead. That is the worst
+     * place on the screen to put a surprise: you were reaching for pause.
+     *
+     * 330 is just above the transport row (buttons start at y338). Below it, a tap
+     * that missed a button does nothing, which is the correct answer for a miss. */
+    lv_indev_t *indev = lv_indev_active();
+    if (indev) {
+        lv_point_t pt;
+        lv_indev_get_point(indev, &pt);
+        if (pt.y >= 330) return;
+    }
+    sp_chrome_set(!s_sp_chrome, true);
+}
 
 /* Circular button placed by centre, in absolute screen coordinates.
  *
@@ -4636,7 +4735,6 @@ static void sp_nudge(int dir, int32_t dist) {
  * stops a fast second flick from landing before the first has been confirmed by a
  * poll, which is a real gesture but almost never an intended one. */
 #define SP_SWIPE_MS 550
-static int64_t s_sp_swipe_at;
 
 static void sp_gesture_cb(lv_event_t *e) {
     lv_indev_t *indev = lv_indev_active();
@@ -4739,6 +4837,11 @@ static void sp_vol_slider_cb(lv_event_t *e) {
 
 static void sp_vol_hud_show(void) {
     s_sp_vol_shown = now_ms();
+    /* Reveal the controls, don't just keep them alive: the slider IS the volume
+     * readout, and hiding it while the user is changing volume means pressing a
+     * key with nothing to look at. Auto-hide then retires it 4 s after the last
+     * press, so it costs nothing once they stop. */
+    sp_chrome_set(true, true);
     if (!s_sp_vol_bar) return;
     sp_vol_hud_paint(true);
 }
@@ -4837,6 +4940,14 @@ static void sp_timer_cb(lv_timer_t *t) {
         }
     }
 
+    /* Chrome retires itself. Driven from this tick rather than an lv_timer of its
+     * own — teardown only deletes s_app_timer, so a second timer would be a leak
+     * waiting for someone to forget it. A volume key press counts as activity, so
+     * adjusting volume does not have the controls vanish under your thumb. */
+    if (s_sp_chrome && (now_ms() - s_sp_chrome_at) > SP_CHROME_HIDE_MS) {
+        sp_chrome_set(false, true);
+    }
+
     /* The volume HUD is on demand: it appears when a key moves the level and
      * retires itself, so the cover keeps the space the rest of the time. */
     if (s_sp_vol_bar) {
@@ -4873,8 +4984,11 @@ static void sp_timer_cb(lv_timer_t *t) {
      * The explicit sp_art_clear() on swipe and button still earns its place: it
      * drops the cover on the touch, where this rule would wait for the poll that
      * moves s_sp_art_url. */
-    bool art_current = s_sp_art_ready && s_sp_art_url[0] &&
-                       strcmp(s_sp_art_have, s_sp_art_url) == 0;
+    /* Keyed on the track, not the URL: /me/player and the broker's queue each pick
+     * the "nearest" image from their own copy of the list, and when those two
+     * disagree a perfectly good cover looked stale — it hid and downloaded again. */
+    bool art_current = s_sp_art_ready && s_sp_art_id[0] &&
+                       strcmp(s_sp_art_id, s_sp_track_id) == 0;
 
     if (art_current && strcmp(s_sp_art_shown, s_sp_art_have) != 0) {
         /* sp_fetch_art() swaps the image in itself now, so this only catches a
@@ -4982,7 +5096,6 @@ static void build_music_app(lv_obj_t *scr) {
     s_sp_art_ph = lv_obj_create(scr);
     lv_obj_remove_style_all(s_sp_art_ph);
     lv_obj_set_size(s_sp_art_ph, SP_ART_PX, SP_ART_PX);
-    lv_obj_align(s_sp_art_ph, LV_ALIGN_TOP_MID, SP_ART_DX, 40);
     lv_obj_set_style_bg_color(s_sp_art_ph, lv_color_hex(0x11161F), 0);
     lv_obj_set_style_bg_opa(s_sp_art_ph, LV_OPA_COVER, 0);
     lv_obj_set_style_radius(s_sp_art_ph, 20, 0);
@@ -4995,7 +5108,6 @@ static void build_music_app(lv_obj_t *scr) {
 
     s_sp_art = lv_image_create(scr);
     lv_obj_set_size(s_sp_art, SP_ART_PX, SP_ART_PX);
-    lv_obj_align(s_sp_art, LV_ALIGN_TOP_MID, SP_ART_DX, 40);
     lv_image_set_inner_align(s_sp_art, LV_IMAGE_ALIGN_COVER);
     lv_obj_add_flag(s_sp_art, LV_OBJ_FLAG_HIDDEN);
     lv_obj_remove_flag(s_sp_art, LV_OBJ_FLAG_CLICKABLE);
@@ -5037,14 +5149,13 @@ static void build_music_app(lv_obj_t *scr) {
     /* Flat, not a gradient — RGB565 bands visibly on a dark ramp (HARDWARE.md 5).
      * Inset 6 px from the cover so it reads as a chip floating on the artwork
      * rather than as the cover having been cropped. */
-    lv_obj_t *chip = lv_obj_create(scr);
-    lv_obj_remove_style_all(chip);
-    lv_obj_set_size(chip, SP_ART_PX - 12, 60);
-    lv_obj_align(chip, LV_ALIGN_TOP_MID, SP_ART_DX, 228);
-    lv_obj_set_style_bg_color(chip, lv_color_hex(0x05070B), 0);
-    lv_obj_set_style_bg_opa(chip, 185, 0);
-    lv_obj_set_style_radius(chip, 16, 0);
-    lv_obj_remove_flag(chip, LV_OBJ_FLAG_CLICKABLE);
+    s_sp_chip = lv_obj_create(scr);
+    lv_obj_remove_style_all(s_sp_chip);
+    lv_obj_set_size(s_sp_chip, SP_ART_PX - 12, 60);
+    lv_obj_set_style_bg_color(s_sp_chip, lv_color_hex(0x05070B), 0);
+    lv_obj_set_style_bg_opa(s_sp_chip, 185, 0);
+    lv_obj_set_style_radius(s_sp_chip, 16, 0);
+    lv_obj_remove_flag(s_sp_chip, LV_OBJ_FLAG_CLICKABLE);
 
     s_sp_lbl_track = lv_label_create(scr);
     lv_obj_set_width(s_sp_lbl_track, 240);
@@ -5053,7 +5164,6 @@ static void build_music_app(lv_obj_t *scr) {
     lv_obj_set_style_text_align(s_sp_lbl_track, LV_TEXT_ALIGN_CENTER, 0);
     lv_label_set_long_mode(s_sp_lbl_track, LV_LABEL_LONG_SCROLL_CIRCULAR);
     lv_label_set_text(s_sp_lbl_track, "connecting...");
-    lv_obj_align(s_sp_lbl_track, LV_ALIGN_TOP_MID, SP_ART_DX, 235);
 
     s_sp_lbl_artist = lv_label_create(scr);
     lv_obj_set_width(s_sp_lbl_artist, 240);
@@ -5062,7 +5172,6 @@ static void build_music_app(lv_obj_t *scr) {
     lv_obj_set_style_text_align(s_sp_lbl_artist, LV_TEXT_ALIGN_CENTER, 0);
     lv_label_set_long_mode(s_sp_lbl_artist, LV_LABEL_LONG_DOT);
     lv_label_set_text(s_sp_lbl_artist, "");
-    lv_obj_align(s_sp_lbl_artist, LV_ALIGN_TOP_MID, SP_ART_DX, 262);
 
     /* transport: the things you actually press, sized accordingly */
     /* Glyph sizes are 36 for the skips and 48 for play/pause, against the 14 px
@@ -5120,6 +5229,14 @@ static void build_music_app(lv_obj_t *scr) {
     lv_obj_remove_flag(s_sp_devlist, LV_OBJ_FLAG_GESTURE_BUBBLE);
 
     lv_obj_add_event_cb(scr, sp_gesture_cb, LV_EVENT_GESTURE, NULL);
+    /* Buttons consume their own clicks, so this only ever sees the background or
+     * the cover — exactly the "tap to toggle" surface we want. */
+    lv_obj_add_flag(scr, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(scr, sp_tap_cb, LV_EVENT_CLICKED, NULL);
+
+    s_sp_chrome = false;
+    s_sp_chrome_p = 0;
+    sp_chrome_apply(NULL, 0);      /* immersive by default, no animation on open */
 
     s_sp_devdrawn = -1;
     s_sp_devlit = -1;
@@ -5429,37 +5546,59 @@ static esp_err_t dl_evt(esp_http_client_event_t *e) {
     return ESP_OK;
 }
 
-/* Fetch into a caller-owned buffer. Same client and event handler as the file
- * path, minus the .part-and-rename dance: a partial body cannot leave anything
- * behind when the destination is memory, and the caller checks the length. */
-static bool asset_fetch_mem(const char *url, const char *bearer,
-                            const char *xname, const char *xval,
-                            uint8_t *buf, size_t cap, size_t *out_len) {
+/* One long-lived connection to the broker, shared by the cover fetch and the
+ * queue fetch — they are the same host, and esp_http_client_set_url() only closes
+ * the socket when host or port changes, never for a path (HARDWARE.md §7f).
+ *
+ * This matters more than it looks. Every fetch used to build a fresh client, so
+ * each cover and each queue refresh paid a full TLS handshake: **390 ms before a
+ * single byte of image**, against 6 ms on a warm connection. Filling three
+ * lookahead slots was over a second of pure handshake.
+ *
+ * Confined to the Spotify task, because the handle carries no lock and every
+ * field is mutated in place. */
+static esp_http_client_handle_t s_brk_http;
+
+static bool broker_fetch(const char *path, const char *xname, const char *xval,
+                         uint8_t *buf, size_t cap, size_t *out_len) {
     s_dl_total = 0; s_dl_got = 0; s_dl_pct = 0; s_dl_kb = 0; s_dl_accent = 0;
     s_dl_mem = buf; s_dl_mem_cap = cap; s_dl_mem_len = 0;
 
-    esp_http_client_config_t cfg = {
-        .url = url,
-        .crt_bundle_attach = esp_crt_bundle_attach,
-        .timeout_ms = 12000,
-        .event_handler = dl_evt,
-        .max_redirection_count = 5,
-    };
-    esp_http_client_handle_t c = esp_http_client_init(&cfg);
-    bool ok = false;
-    if (c) {
-        if (bearer && bearer[0]) {
-            char auth[96];
-            snprintf(auth, sizeof(auth), "Bearer %.72s", bearer);
-            esp_http_client_set_header(c, "Authorization", auth);
-        }
-        if (xname && xval && xval[0]) esp_http_client_set_header(c, xname, xval);
-        esp_err_t err = esp_http_client_perform(c);
-        int status = esp_http_client_get_status_code(c);
-        ok = (err == ESP_OK && status == 200);
-        if (!ok) ESP_LOGW(TAG, "fetch %.40s -> HTTP %d", url, status);
-        esp_http_client_cleanup(c);
+    if (!s_brk_http) {
+        char base[192];
+        snprintf(base, sizeof(base), "%s%s", BROKER_URL, path);
+        esp_http_client_config_t cfg = {
+            .url = base,
+            .crt_bundle_attach = esp_crt_bundle_attach,
+            .timeout_ms = 12000,
+            .event_handler = dl_evt,
+            .keep_alive_enable = true,
+            .max_redirection_count = 5,
+        };
+        s_brk_http = esp_http_client_init(&cfg);
+        if (!s_brk_http) { s_dl_mem = NULL; return false; }
+    } else {
+        esp_http_client_set_url(s_brk_http, path);   /* path only: socket survives */
     }
+
+    char auth[96];
+    snprintf(auth, sizeof(auth), "Bearer %.72s", BROKER_TOKEN);
+    esp_http_client_set_header(s_brk_http, "Authorization", auth);
+    esp_http_client_set_method(s_brk_http, HTTP_METHOD_GET);
+    if (xname && xval && xval[0]) esp_http_client_set_header(s_brk_http, xname, xval);
+
+    esp_err_t err = esp_http_client_perform(s_brk_http);
+    int status = esp_http_client_get_status_code(s_brk_http);
+    bool ok = (err == ESP_OK && status == 200);
+
+    /* A dead socket is never retried into — perform() will not redial on its own,
+     * so a transport failure has to close it or every later fetch fails too. */
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "broker %.24s: %s (HTTP %d, %u B) — redialling",
+                 path, esp_err_to_name(err), status, (unsigned)s_dl_mem_len);
+        esp_http_client_close(s_brk_http);
+    }
+
     *out_len = s_dl_mem_len;
     s_dl_mem = NULL; s_dl_mem_cap = s_dl_mem_len = 0;
     return ok;
@@ -5950,8 +6089,8 @@ static void lock_np_refresh(void) {
 
     /* Same rule as MUSIC: show the cover only while the file on the card is the
      * one this track wants, so a stale album never sits under a new title. */
-    bool art_ok = s_sp_art_ready && s_sp_art_url[0] &&
-                  strcmp(s_sp_art_have, s_sp_art_url) == 0;
+    bool art_ok = s_sp_art_ready && s_sp_art_id[0] &&
+                  strcmp(s_sp_art_id, s_sp_track_id) == 0;
     if (art_ok && lv_obj_has_flag(s_lock_np_art, LV_OBJ_FLAG_HIDDEN)) {
         lv_image_set_src(s_lock_np_art, &s_sp_art_dsc);
         lv_obj_remove_flag(s_lock_np_art, LV_OBJ_FLAG_HIDDEN);
