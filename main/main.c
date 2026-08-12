@@ -64,6 +64,7 @@
 
 #include "credentials.h"
 #include "hud_fonts.h"
+#include "esp_lv_decoder.h"
 #include "cJSON.h"
 #include "ble_prov.h"
 
@@ -246,7 +247,8 @@ static uint32_t s_dl_accent;
 static lv_obj_t *s_sp_art, *s_sp_art_ph;
 static char s_sp_art_shown[160];  /* which art the widgets are showing */
 static char s_sp_art_id[26];      /* the TRACK the loaded cover belongs to */
-static uint8_t *s_sp_art_buf;            /* PSRAM, SP_ART_BYTES */
+static uint8_t *s_sp_art_buf;            /* PSRAM, SP_ART_MAX */
+static size_t   s_sp_art_len;            /* bytes of JPEG actually held */
 static lv_image_dsc_t s_sp_art_dsc;      /* points into s_sp_art_buf + header */
 static bool broker_fetch(const char *path, const char *xname, const char *xval,
                          uint8_t *buf, size_t cap, size_t *out_len);
@@ -3518,8 +3520,18 @@ static void pomo_poll(int64_t t) {
  * 8 MB of free PSRAM removes the card from both the write and the render path, and
  * an in-memory descriptor needs no decoder at all: LVGL blits RGB565 straight out
  * of the buffer. */
-#define SP_ART_HDR    12
-#define SP_ART_BYTES  (SP_ART_HDR + SP_ART_PX * SP_ART_PX * 2)
+/* Baseline JPEG on the wire, not raw RGB565. A 296 px cover measured **5,946
+ * bytes against 175,244** — 29x less to move, which turns a ~1 s download into
+ * ~0.05 s and lets the lookahead actually stay ahead of a fast skipper.
+ *
+ * Raw pixels were the right call when the only decoder was TJpgD, which never
+ * populates LVGL's image cache and so re-decodes on every draw chunk forever.
+ * That stopped being true twice over: esp_lv_decoder is vendored, DOES register
+ * with the cache, and freeing 104 KB of internal SRAM made its scratch affordable.
+ *
+ * A truncated transfer is now self-detecting: JPEG ends in FFD9, so the integrity
+ * check proves the body arrived rather than merely counting bytes. */
+#define SP_ART_MAX    (64 * 1024)
 
 typedef enum {
     SP_CMD_POLL = 1,
@@ -4074,7 +4086,8 @@ typedef struct {
     char artist[64];
     char url[160];
     uint32_t accent;
-    uint8_t *buf;          /* PSRAM, SP_ART_BYTES; allocated on first use */
+    uint8_t *buf;          /* PSRAM, SP_ART_MAX; allocated on first use */
+    size_t   len;          /* JPEG is variable length, unlike the raw format */
     bool ready;            /* buf holds this entry's cover */
 } sp_pf_t;
 
@@ -4091,8 +4104,9 @@ static bool sp_pf_promote(const char *art_url) {
         if (!e->ready || strcmp(e->url, art_url) != 0) continue;
 
         uint8_t *tmp = s_sp_art_buf;
-        s_sp_art_buf = e->buf;
-        e->buf = tmp;
+        size_t   tl  = s_sp_art_len;
+        s_sp_art_buf = e->buf;  s_sp_art_len = e->len;
+        e->buf = tmp;           e->len = tl;
         e->ready = false;                 /* its bytes are on screen now */
 
         snprintf(s_sp_art_have, sizeof(s_sp_art_have), "%s", art_url);
@@ -4110,9 +4124,10 @@ static bool sp_pf_promote(const char *art_url) {
  * the broker derived from it. Split out of sp_fetch_art() so the prefetcher can
  * use the identical path — same URL encoding, same header validation, same
  * failure handling — rather than a parallel copy that drifts. */
-static bool sp_art_get(const char *art_url, uint8_t *buf, uint32_t *accent_out) {
+static bool sp_art_get(const char *art_url, uint8_t *buf, size_t *len_out,
+                       uint32_t *accent_out) {
     char url[512];
-    int n = snprintf(url, sizeof(url), "/art.bin?s=%d&u=", SP_ART_PX);
+    int n = snprintf(url, sizeof(url), "/art?s=%d&u=", SP_ART_PX);
     static const char hex[] = "0123456789ABCDEF";
     for (const unsigned char *p = (const unsigned char *)art_url;
          *p && n < (int)sizeof(url) - 4; p++) {
@@ -4125,7 +4140,7 @@ static bool sp_art_get(const char *art_url, uint8_t *buf, uint32_t *accent_out) 
     url[n] = '\0';
 
     size_t got = 0;
-    bool ok = broker_fetch(url, NULL, NULL, buf, SP_ART_BYTES, &got);
+    bool ok = broker_fetch(url, NULL, NULL, buf, SP_ART_MAX, &got);
 
     /* A body that started and stopped is a stalled link, not a refusal. The server
      * side is ruled out — it serves this in 4-157 ms and tolerates a reader
@@ -4133,40 +4148,46 @@ static bool sp_art_get(const char *art_url, uint8_t *buf, uint32_t *accent_out) 
      * Retrying immediately recovers what a 30 s backoff would have made a visible
      * gap. Only once, and only for a partial: a genuine 4xx retried in a loop is
      * how you turn one bad response into a hammering. */
-    if (!ok && got > 0 && got < SP_ART_BYTES) {
-        ESP_LOGW(TAG, "spotify: art stalled at %u/%u (rssi %d) — retrying once",
-                 (unsigned)got, SP_ART_BYTES, wifi_rssi());
+    /* A body that started and stopped is a stalled link, not a refusal — the far
+     * end serves this in milliseconds and tolerates very slow readers. Retry once,
+     * immediately, rather than blacking the cover out for 30 s. */
+    if (!ok && got > 0) {
+        ESP_LOGW(TAG, "spotify: art stalled at %u B (rssi %d) — retrying once",
+                 (unsigned)got, wifi_rssi());
         got = 0;
-        ok = broker_fetch(url, NULL, NULL, buf, SP_ART_BYTES, &got);
+        ok = broker_fetch(url, NULL, NULL, buf, SP_ART_MAX, &got);
     }
     if (!ok) return false;
 
     /* Nothing decodes these bytes on the way through, so a short body or a broker
      * answering with something else would be blitted to the panel as garbage.
      * There is no decoder in this path to reject it — the check has to be here. */
-    if (got != SP_ART_BYTES) {
-        ESP_LOGW(TAG, "spotify: art short (%u of %u)", (unsigned)got, SP_ART_BYTES);
+    /* Start of Image and End of Image. Unlike a byte count this proves the body
+     * actually finished — a stalled transfer has no FFD9 — and nothing downstream
+     * would reject a half JPEG on our behalf. */
+    if (got < 8 || buf[0] != 0xFF || buf[1] != 0xD8 ||
+        buf[got - 2] != 0xFF || buf[got - 1] != 0xD9) {
+        ESP_LOGW(TAG, "spotify: art not a complete JPEG (%u B)", (unsigned)got);
         return false;
     }
-    uint16_t w = (uint16_t)(buf[4] | (buf[5] << 8));
-    uint16_t h = (uint16_t)(buf[6] | (buf[7] << 8));
-    if (buf[0] != 0x19 || buf[1] != 0x12 || w != SP_ART_PX || h != SP_ART_PX) {
-        ESP_LOGW(TAG, "spotify: art header wrong (%02x %02x %ux%u)", buf[0], buf[1], w, h);
-        return false;
-    }
+    if (len_out) *len_out = got;
     if (accent_out) *accent_out = s_dl_accent;   /* 0 when the cover has no usable hue */
     return true;
 }
 
 /* Point the on-screen image at whatever s_sp_art_buf currently holds. */
 static void sp_art_show(void) {
+    /* RAW: the bytes are encoded, so LVGL hands them to a registered decoder
+     * rather than blitting them. esp_lv_decoder recognises the JPEG magic and,
+     * crucially, puts the decoded bitmap in the image cache — so it decodes once
+     * per cover, not once per draw chunk. */
     s_sp_art_dsc.header.magic  = LV_IMAGE_HEADER_MAGIC;
-    s_sp_art_dsc.header.cf     = LV_COLOR_FORMAT_RGB565;
+    s_sp_art_dsc.header.cf     = LV_COLOR_FORMAT_RAW;
     s_sp_art_dsc.header.w      = SP_ART_PX;
     s_sp_art_dsc.header.h      = SP_ART_PX;
-    s_sp_art_dsc.header.stride = SP_ART_PX * 2;
-    s_sp_art_dsc.data          = s_sp_art_buf + SP_ART_HDR;
-    s_sp_art_dsc.data_size     = SP_ART_PX * SP_ART_PX * 2;
+    s_sp_art_dsc.header.stride = 0;
+    s_sp_art_dsc.data          = s_sp_art_buf;
+    s_sp_art_dsc.data_size     = s_sp_art_len;
 
     if (ui_lock()) {
         lv_image_cache_drop(&s_sp_art_dsc);      /* same pointer, new bytes */
@@ -4198,10 +4219,10 @@ static void sp_pf_fill_one(void) {
         sp_pf_t *e = &s_sp_pf[i];
         if (e->ready || !e->url[0]) continue;
         if (!e->buf) {
-            e->buf = heap_caps_malloc(SP_ART_BYTES, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+            e->buf = heap_caps_malloc(SP_ART_MAX, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
             if (!e->buf) { s_sp_pf_pending = false; return; }   /* out of PSRAM */
         }
-        if (sp_art_get(e->url, e->buf, &e->accent)) {
+        if (sp_art_get(e->url, e->buf, &e->len, &e->accent)) {
             e->ready = true;
             ESP_LOGI(TAG, "spotify: prefetched %d \"%.20s\"", i + 1, e->name);
         }
@@ -4322,18 +4343,18 @@ static void sp_fetch_art(void) {
         (now_ms() - s_sp_art_failed_at) < SP_ART_RETRY_MS) return;
 
     if (!s_sp_art_buf) {
-        s_sp_art_buf = heap_caps_malloc(SP_ART_BYTES, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        s_sp_art_buf = heap_caps_malloc(SP_ART_MAX, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
         if (!s_sp_art_buf) { ESP_LOGE(TAG, "spotify: no PSRAM for art"); return; }
     }
 
     uint32_t accent = 0;
-    if (sp_art_get(s_sp_art_url, s_sp_art_buf, &accent)) {
+    if (sp_art_get(s_sp_art_url, s_sp_art_buf, &s_sp_art_len, &accent)) {
         snprintf(s_sp_art_have, sizeof(s_sp_art_have), "%s", s_sp_art_url);
         snprintf(s_sp_art_id, sizeof(s_sp_art_id), "%s", s_sp_track_id);
         s_sp_accent = accent;
         s_sp_art_failed[0] = '\0';
         sp_art_show();
-        ESP_LOGI(TAG, "spotify: art updated (%u B, psram)", (unsigned)SP_ART_BYTES);
+        ESP_LOGI(TAG, "spotify: art updated (%u B jpeg)", (unsigned)s_sp_art_len);
     } else {
         snprintf(s_sp_art_failed, sizeof(s_sp_art_failed), "%s", s_sp_art_url);
         s_sp_art_failed_at = now_ms();
@@ -5574,6 +5595,11 @@ static bool broker_fetch(const char *path, const char *xname, const char *xval,
             .event_handler = dl_evt,
             .keep_alive_enable = true,
             .max_redirection_count = 5,
+            /* The queue request carries the Spotify access token as a header, and
+             * that alone is ~300 chars — past the 512-byte default the client uses
+             * to assemble a request. It logged "Buffer length is small to fit all
+             * the headers" on every queue fetch. */
+            .buffer_size_tx = 1024,
         };
         s_brk_http = esp_http_client_init(&cfg);
         if (!s_brk_http) { s_dl_mem = NULL; return false; }
@@ -6633,6 +6659,19 @@ void app_main(void) {
     } else {
         bright_apply(s_bright);
         log_mem("display-up");
+
+        /* Register the JPEG/PNG decoder with LVGL. The Kconfig flag only compiles
+         * it in — without this call it is dead code, which is exactly how it sat
+         * vendored and inert in this tree for months. Album art is baseline JPEG
+         * now, so nothing draws without it. */
+        static esp_lv_decoder_handle_t s_decoder;
+        esp_err_t derr = esp_lv_decoder_init(&s_decoder);
+        if (derr != ESP_OK) {
+            ESP_LOGE(TAG, "image decoder init failed (%s) — album art will not draw",
+                     esp_err_to_name(derr));
+        } else {
+            log_mem("decoder-up");
+        }
         if (ui_lock()) {
             lv_display_add_event_cb(disp, refr_ready_cb, LV_EVENT_REFR_READY, NULL);
             bsp_display_unlock();

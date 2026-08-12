@@ -22,6 +22,7 @@
 package main
 
 import (
+	"bytes"
 	"crypto/rand"
 	"crypto/sha256"
 	"crypto/subtle"
@@ -578,6 +579,49 @@ func dominantColor(bin []byte) (string, bool) {
 		sb += b * wt
 		wsum += wt
 	}
+	return conditionAccent(sr, sg, sb, wsum)
+}
+
+// dominantColorJPEG is the same judgement over an encoded cover. The device now
+// receives baseline JPEG rather than raw RGB565 — a 296px cover is ~22 KB instead
+// of 175,244 — so the accent has to be derivable from that. Decoding here costs a
+// few milliseconds on a machine that has them, and keeps the cache-hit and
+// cache-miss paths identical, which is the property that made the raw version
+// trustworthy in the first place.
+func dominantColorJPEG(data []byte) (string, bool) {
+	img, err := jpeg.Decode(bytes.NewReader(data))
+	if err != nil {
+		return "", false
+	}
+	b := img.Bounds()
+	var sr, sg, sb, wsum float64
+	// Same stride in pixels as the RGB565 sampler: every 4th.
+	for y := b.Min.Y; y < b.Max.Y; y += 2 {
+		for x := b.Min.X; x < b.Max.X; x += 2 {
+			r32, g32, b32, _ := img.At(x, y).RGBA()
+			r, g, bb := float64(r32>>8), float64(g32>>8), float64(b32>>8)
+			mx := math.Max(r, math.Max(g, bb))
+			mn := math.Min(r, math.Min(g, bb))
+			if mx < 40 {
+				continue
+			}
+			sat := (mx - mn) / mx
+			if sat < 0.15 {
+				continue
+			}
+			wt := sat * mx
+			sr += r * wt
+			sg += g * wt
+			sb += bb * wt
+			wsum += wt
+		}
+	}
+	return conditionAccent(sr, sg, sb, wsum)
+}
+
+// conditionAccent turns weighted colour sums into something the UI can actually
+// use: never grey, never so dark or so bright that a glyph on top disappears.
+func conditionAccent(sr, sg, sb, wsum float64) (string, bool) {
 	if wsum == 0 {
 		return "", false // monochrome art; caller keeps its own default
 	}
@@ -630,6 +674,9 @@ func serveArt(w http.ResponseWriter, data []byte, rawOut bool) {
 		}
 	} else {
 		w.Header().Set("Content-Type", "image/jpeg")
+		if accent, ok := dominantColorJPEG(data); ok {
+			w.Header().Set("X-Art-Accent", accent)
+		}
 	}
 	w.Header().Set("Content-Length", strconv.Itoa(len(data)))
 	// Art for a given track never changes, so let anything in between keep it.

@@ -175,6 +175,11 @@ CONFIG_FATFS_MAX_LFN=64
 CONFIG_LV_USE_FS_POSIX=y
 CONFIG_LV_FS_POSIX_LETTER=83
 CONFIG_LV_USE_TJPGD=y
+# Album art arrives as baseline JPEG now (5,946 B vs 175,244 for raw RGB565), so
+# the device needs a decoder that participates in LVGL's image cache. TJpgD does
+# not — it re-decodes on every draw chunk, forever. esp_lv_decoder does, and its
+# ~10 KB of scratch became affordable once LVGL stopped occupying 104 KB of DIRAM.
+CONFIG_ESP_LVGL_ADAPTER_ENABLE_DECODER=y
 # imgix (Unsplash's CDN) always emits PROGRESSIVE jpeg, which TJpgD cannot
 # decode — it silently yields a 0x0 image. PNG is bigger on the wire but
 # decodes reliably, and 400 KB is nothing against a 32 GB card.
