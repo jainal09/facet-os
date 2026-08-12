@@ -141,6 +141,28 @@ what Wi-Fi buffers, DMA descriptors and BLE need. Log free, minimum **and
 largest block** from identical caps: exhaustion and fragmentation are
 indistinguishable in a free-size column and need opposite fixes.
 
+**The largest single consumer of internal SRAM was LVGL's code, not anyone's
+data.** `CONFIG_LV_ATTRIBUTE_FAST_MEM_USE_IRAM=y` copies LVGL's hot drawing
+functions into internal RAM for speed, and on this build that was **104,880
+bytes — 40% of the entire DIRAM pool**, four times what the Wi-Fi TX-buffer trim
+won. Turning it off moves that code to the flash cache:
+
+| | before | after |
+|---|---|---|
+| DIRAM used | 250,915 (73%) | **146,035 (43%)** |
+| heap free, running | ~41,000 | **145,059** |
+| minimum watermark | ~29,000 | **112,836** |
+| largest block | 31,744 | **77,824** |
+
+**The cost is ~7%, and the obvious way to measure it is wrong.** 40 fps against
+43, same screen, same interaction. A first reading of "4.3 fps" came from a
+*static* screen and looked like a tenfold collapse — that is Pitfalls #8, where
+near-zero fps is the correct answer rather than a slow one. Measure this under a
+drag, never at idle.
+
+Worth generalising: `.text` was **201,635 of 250,915** DIRAM bytes here. On this
+board, ask what *code* is in internal RAM before hunting for buffers.
+
 **Task stacks default to internal SRAM, and they are expensive.** A single
 `xTaskCreate(..., 8192, ...)` costs 8 KB of the scarcest pool on the board.
 Anything that is not time-critical and never runs with the cache disabled should

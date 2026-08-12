@@ -58,7 +58,19 @@ CONFIG_LV_OBJ_STYLE_CACHE=y
 # 2 draw units (vendor value): 1 unit + LV_USE_OS stalls LVGL9 render dispatch
 # after the first frame (measured fps=0.0 across all 1-unit builds)
 CONFIG_LV_DRAW_SW_DRAW_UNIT_CNT=2
-CONFIG_LV_ATTRIBUTE_FAST_MEM_USE_IRAM=y
+# Measured 2026-08-12: this flag copies LVGL's hot drawing code into internal RAM
+# and costs 104,880 bytes of DIRAM to do it — 40% of the entire pool, and more
+# than four times what the Wi-Fi TX-buffer trim won. Turning it off moves that
+# code to the flash cache.
+#
+# The price is ~7%, not the order of magnitude it first appeared to be: 40 fps
+# against 43 measured on the same screen under the same interaction. The scary
+# first reading (4.3) was a *static* screen, which is Pitfalls #8 — fps near zero
+# there is correct, not slow. Do not re-derive this from an idle screen.
+#
+#   DIRAM used   250,915 -> 146,035      heap free   ~41 K -> 145 K
+#   largest blk   31,744 ->  77,824      min watermark ~29 K -> 95.7 K
+CONFIG_LV_ATTRIBUTE_FAST_MEM_USE_IRAM=n
 CONFIG_LV_USE_SYSMON=y
 # LVGL's fps/CPU overlay draws an ugly grey box over the UI
 CONFIG_LV_USE_PERF_MONITOR=n
