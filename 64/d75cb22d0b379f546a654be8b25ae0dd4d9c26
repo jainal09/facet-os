@@ -1,0 +1,21 @@
+sdkconfig.defaults
+  s_57e4cf4a7836a6::t_a0e86c7d4305f0 61-73
+docs/HARDWARE.md
+  s_57e4cf4a7836a6::t_d01448274a7cef 144-165
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.22",
+  "base_commit_sha": "64d75cb22d0b379f546a654be8b25ae0dd4d9c26",
+  "prompts": {},
+  "sessions": {
+    "s_57e4cf4a7836a6": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "79540328-5c96-430d-b4c5-de35687f549e",
+        "model": "claude-opus-5"
+      },
+      "human_author": "Jainal Gosaliya <jainal09gosalia@gmail.com>"
+    }
+  }
+}
