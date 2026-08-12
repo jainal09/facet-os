@@ -52,7 +52,9 @@ CONFIG_IDF_EXPERIMENTAL_FEATURES=y
 CONFIG_LV_USE_CLIB_MALLOC=y
 CONFIG_LV_USE_CLIB_STRING=y
 CONFIG_LV_USE_CLIB_SPRINTF=y
-CONFIG_LV_DEF_REFR_PERIOD=15
+# 10 ms, not 15: the refresh period caps the frame rate at 1000/period, so 15 ms
+# was a 66 fps ceiling. The panel and the draw buffers can do better now.
+CONFIG_LV_DEF_REFR_PERIOD=10
 CONFIG_LV_OS_FREERTOS=y
 CONFIG_LV_OBJ_STYLE_CACHE=y
 # 2 draw units (vendor value): 1 unit + LV_USE_OS stalls LVGL9 render dispatch
