@@ -1,0 +1,28 @@
+main/main.c
+  s_57e4cf4a7836a6::t_ebcf66d54957ea 251-252,4115,4128,4140,4225,4228-4229,4949,5549-5563,5567-5581,5583-5601
+  s_57e4cf4a7836a6::t_c92a1250d219d8 3499-3513
+  s_57e4cf4a7836a6::t_9461fc225d6f6d 4451,4455-4457,4462-4521,4543,5152-5158,5232-5239
+  s_57e4cf4a7836a6::t_f2f77469b66d00 4527-4540
+  s_57e4cf4a7836a6::t_0f53c4bc32baa5 3595,3909,4522-4526,4541-4542
+  s_57e4cf4a7836a6::t_5af834432069ef 4840-4844
+  s_57e4cf4a7836a6::t_a9b1473e9cc6e7 248,4099,4332,4987-4991,6092-6093
+  s_57e4cf4a7836a6::t_c47c38e1981801 4943-4948
+  s_57e4cf4a7836a6::t_f4ad71d5a91e5c 3592
+  s_57e4cf4a7836a6::t_3aec93b8c8d17f 4950
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.22",
+  "base_commit_sha": "a9ac86d9c1c059c344e0c97347dc8c25f3c8997d",
+  "prompts": {},
+  "sessions": {
+    "s_57e4cf4a7836a6": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "79540328-5c96-430d-b4c5-de35687f549e",
+        "model": "claude-opus-5"
+      },
+      "human_author": "Jainal Gosaliya <jainal09gosalia@gmail.com>"
+    }
+  }
+}
