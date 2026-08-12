@@ -1462,6 +1462,12 @@ static btn_ev_t btn_poll(btn_t *b, int64_t t) {
  * outright, and the only control that could undo it would be a slider you can no
  * longer see. There is no other way into this device, so the range stops at a
  * level that is dim but still legible.
+ *
+ * 10% is 25/255 out of the 0x51 register, and it was checked on the actual panel
+ * through the actual cover glass rather than reasoned about — the slider was
+ * dragged to minimum and the screen stayed readable. It is the whole safety
+ * argument for the feature, so re-check it rather than trusting this line if the
+ * panel, the cover glass or the brightness curve ever changes.
  */
 #define BRIGHT_MIN     10
 #define BRIGHT_DEFAULT 100
