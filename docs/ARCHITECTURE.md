@@ -400,11 +400,91 @@ Black is the default and the fallback: the accent starts at 0 meaning "not known
 yet", so a screen still waiting on `/me/player` stays black rather than showing a
 colour that would read as chosen on purpose.
 
+### Laying out a square screen with round corners
+
+The cover is **264 px**, up from 148, and the change that bought it was not
+horizontal. It was never limited by width — it was pinned in the band between the
+top button row and the track title. Moving shuffle, like and devices into a column
+down the left edge, and volume into a permanent slider down the right, vacated
+that band. Track and artist then moved **onto** the cover on a flat chip, because
+with them in their own row the vertical stack still capped the art at ~228 no
+matter how much width the edges gave back.
+
+Two things worth copying:
+
+- **Positions are checked against the corner arcs before they are written.** The
+  panel is a 480×480 rounded rect with r=110, so a point is invalid only if it is
+  inside a corner's bounding box *and* further than 110 from that corner's centre.
+  Ten elements were verified against that rule in a throwaway script before any C
+  was written; nothing had to be nudged afterwards.
+- **The cover centres on the gap it lives in, not on the screen.** The column ends
+  at x102 and the slider starts at x410, so the midpoint is x256. Screen-centring
+  left a 6 px gutter on one side and 38 on the other and read as a mistake. A
+  single `SP_ART_DX` offset carries the cover and everything stacked on it.
+
+Touch targets follow [HARDWARE.md pitfall #24](HARDWARE.md#10-pitfalls-index):
+76 px minimum, and the clock yields rather than the buttons shrinking.
+
+### Lookahead: making a swipe instant
+
+The next three tracks' covers, names and accents are fetched before they are
+asked for, so a swipe draws immediately instead of waiting on a poll plus a 139 KB
+download.
+
+**The queue is summarised by the broker, and that is a memory decision rather than
+a bandwidth one.** Spotify's `/me/player/queue` returns the next twenty tracks in
+full — 55,569 bytes measured. cJSON allocates roughly one 64-byte node per value,
+and `SPIRAM_MALLOC_ALWAYSINTERNAL=128` sends every allocation *under* 128 bytes to
+internal SRAM, so ~800 nodes is ~50 KB against the 27–35 KB the device has.
+Parsing it on the cube would not have been slow, it would have failed — as an
+allocation storm, during a swipe. The broker returns **408 bytes** of exactly what
+gets drawn, with one-letter keys because every byte of key name is a byte of
+internal SRAM during the parse.
+
+**Two properties make the cache safe rather than merely fast:**
+
+1. The list is re-asked whenever what-comes-next may have changed: any new track
+   id — including a different playlist started from the phone, which arrives here
+   as nothing more than a new id — and a shuffle toggle, which reorders the queue
+   without changing the current track.
+2. **Promotion requires an exact art-URL match.** A stale entry cannot show the
+   wrong cover; it can only cost a download. That is what makes the window between
+   a change and the next refresh harmless. Matching on URL rather than track id
+   also means two tracks off one album share a single fetch.
+
+Promotion swaps buffer pointers rather than copying 139 KB. Buffers are PSRAM, not
+the card — the card would hold them happily, but reading 139 KB back off FATFS
+during the swipe puts the latency straight back into the moment this exists to
+remove.
+
+**Scheduling it took three attempts, and the two failures generalise.** Fetching
+all three covers synchronously put 3–5 seconds of background work in front of
+interactive commands on the single worker task, and the app felt broken —
+*background work does not get to hold the worker that user commands run on*.
+Yielding on "is the command queue non-empty" then starved it completely, because a
+poll is enqueued every 3 s and the work takes longer than that, so the queue is
+essentially never empty — *yield to the user's commands, not to your own
+housekeeping*. It now yields to a flag raised only by user actions, fills one
+cover per pass, and keeps "the list is stale" separate from "slots still need
+covers", because conflating those meant four broker round trips to fill three
+slots.
+
+Steady state is one ~420 byte list fetch plus **one** cover per track change —
+the same download rate as having no lookahead at all.
+
+Not covered: *previous*. Spotify exposes no history endpoint, so back-swipes stay
+as slow as they were.
+
 ### Now playing on the lock screen
 
 The lock screen grows a transport panel when Spotify has an active device, and is
 untouched when it does not. Three gates make it affordable:
 
+0. **Polling stops with the screen, in MUSIC too.** This was originally gated for
+   the lock screen only, and MUSIC kept polling with the panel dark — which broke
+   §7b's own rule and had a real cost: a 139 KB cover still in flight when the
+   panel dozed was cut off mid-body, because Wi-Fi drops to `WIFI_PS_MAX_MODEM` at
+   the same moment.
 1. **Polls only while the screen is genuinely on** (`s_screen_on && !s_doze`), at
    half the MUSIC rate. Dozing runs at 80 MHz with `WIFI_PS_MAX_MODEM` where an
    HTTPS call costs ~4 s, so a 3 s cadence would never let the radio sleep — and

@@ -271,6 +271,23 @@ specific to BLE — treat "it fits, just" as unproven rather than as a result.
   `lv_obj_delete_delayed()`. That is safe even if the screen is torn down first:
   `lv_obj_destructor` calls `lv_anim_delete(obj, NULL)`, which cancels the
   pending delete along with the object.
+- **`lv_label_set_text()` has no equality short-circuit.** `set_text_internal()`
+  always reallocates, re-measures and invalidates, and on a `LONG_SCROLL_CIRCULAR`
+  label it re-runs the scroll setup. Rewriting unchanged text on a timer therefore
+  costs a flush per tick forever. A 400 ms tick rewriting eight labels held a
+  *static* screen at 2-3 fps; gating on `strcmp` took it to **0.0 fps**, which is
+  the correct answer for a screen where nothing moved (Pitfalls #8). Style setters
+  behave the same way — they invalidate whether or not the value changed.
+- **`LV_OBJ_FLAG_GESTURE_BUBBLE` is set on every object that has a parent**
+  (`lv_obj.c:593`). So a drag on a child reaches the screen's gesture handler:
+  dragging a volume slider fired swipe-up-for-home and left the app. Any widget
+  that owns a drag — a slider, a scrollable list — must
+  `lv_obj_remove_flag(o, LV_OBJ_FLAG_GESTURE_BUBBLE)` or its drags escape.
+- **`LV_EVENT_GESTURE` repeats for as long as the finger is down.** One flick
+  skipped two or three tracks. `lv_indev_wait_release(indev)` at the top of the
+  handler is the fix — it suppresses further events until the touch ends. A time
+  cooldown alone does not do it, because the repeats arrive inside one gesture;
+  the two guard different things and a fast double-flick wants both.
 - The panel has heavily rounded corners and curved cover glass. Content within
   ~55 px of an edge is clipped or unreadable at an angle; keep circles ≤ 430 px.
 
@@ -370,6 +387,18 @@ are rebound to volume.
   at `0xA4`; battery voltage at `0x34`/`0x35` as `((hi & 0x1F) << 8) | lo` mV.
   Battery-present is `0x00` bit 3; charging is `0x01` bits[6:5] == 01.
 - Voltage is a good sanity check and fallback: 3.30 V ≈ 0%, 4.20 V ≈ 100%.
+- **The gauge at `0xA4` latches, and it will lie confidently.** It read a flat
+  **100% while the ADC said 3964 mV** — nearer 60% — and held that for a five-hour
+  soak. It is a coulomb counter: it only re-learns across a full charge and
+  discharge, so on a device that lives on a charger it can stay wrong indefinitely.
+  **No library fixes this.** `XPowersLib` is the de-facto AXP2101 driver and its
+  `getBatteryPercent()` reads this same register; the chip *is* the fuel gauge, and
+  the calibration lives in silicon. Cross-check it against the ADC instead:
+  a disagreement over ~25 points, **or** a claim of ≥95% while measuring under
+  4.10 V — a cell at full charge does not read below that even while charging,
+  when terminal voltage is at its most flattering, so that pairing is a
+  contradiction no load condition explains. The wide-gap test alone is not enough:
+  100% at 4013 mV is only 21 points out and slips through.
 
 ## 7b. Power management and idle drain
 
@@ -946,6 +975,30 @@ it independently will need the same ones:
     is already compiled in and carries the same `LV_SYMBOL_*` glyphs as the
     14 px default, so it costs no flash. Use `lv_obj_set_ext_click_area()` to
     widen the hit test without disturbing the layout.
+25. **A gesture handler on the screen steals drags from every widget under it.**
+    Symptom: dragging a slider navigates away; scrolling a list closes the panel
+    it is in. Not a touch bug — LVGL bubbles gestures up from any child with a
+    parent, by default (§5). Clear `LV_OBJ_FLAG_GESTURE_BUBBLE` on anything that
+    owns a drag. Related symptom, different cause: **one swipe performing the
+    action two or three times** is `LV_EVENT_GESTURE` repeating while the finger
+    stays down, and wants `lv_indev_wait_release()`.
+26. **A truncated HTTPS body with a healthy server is a link event, and the way
+    to find that out is to eliminate the far end rather than reason about it.** A
+    139 KB download stopped at exactly 14,587 bytes, twice — an identical byte
+    count that looks deterministic and invites a search for an off-by-something
+    that does not exist. What settled it, cheaply, was four measurements: the
+    server's own logs showed it served the object in 4-157 ms; eight fetches of
+    the same object from a laptop came back complete; a reader deliberately
+    trickling 1 KB every 3 s was still being served after 75 s, so nothing
+    upstream cuts off slow consumers; and the link measured -40 dBm. That leaves
+    the local side, with `errno 11` (EAGAIN) meaning the socket read simply timed
+    out waiting.
+    Do not guess a fix from there. Make the failure cheap — a partial body earns
+    **one** immediate retry, since the far end demonstrably has not given up —
+    and make the next occurrence self-documenting by logging the byte count and
+    the RSSI at the moment it happens. Put RSSI on the periodic status line
+    generally: a stalled bulk transfer is a link symptom and diagnosing it blind
+    wastes a session.
 
 ## 11. Debugging method that worked
 
