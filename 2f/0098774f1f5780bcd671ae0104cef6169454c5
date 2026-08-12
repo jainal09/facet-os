@@ -1,0 +1,34 @@
+main/main.c
+  s_57e4cf4a7836a6::t_3f2d8eea1558a4 4296-4305,4312,4317,4319,4322,4516-4517,4599-4600
+  s_57e4cf4a7836a6::t_558a417171dcf2 4483,4530-4533,4561-4576,4578-4587,4589-4592,4602
+  s_57e4cf4a7836a6::t_3dafd42597e4a7 4168,4377-4383
+  s_57e4cf4a7836a6::t_ab083dd2195b0b 5195-5201,5208-5213
+  s_57e4cf4a7836a6::t_bb9872a391988e 4139-4144,4615,4620,5464-5471
+  s_57e4cf4a7836a6::t_abac4c00676ee5 4177-4189
+  s_57e4cf4a7836a6::t_a47bf744b19e9b 4279-4285,4427-4438,4440-4441,5202-5207
+  s_57e4cf4a7836a6::t_94bd50e9699b52 4505-4515,4593-4598,4601
+  s_57e4cf4a7836a6::t_3d009cbd481090 246,1262-1266,1269-1270,1285,1535-1579,4774,5317-5330
+  s_57e4cf4a7836a6::t_a5b7c752ff3fe8 1580-1581,5331,5472
+docs/ARCHITECTURE.md
+  s_57e4cf4a7836a6::t_6155648073f7ce 504-537,540-541
+  s_57e4cf4a7836a6::t_7ee36da301569b 500-502
+  s_57e4cf4a7836a6::t_93dbe7197ed7b2 503
+docs/HARDWARE.md
+  s_57e4cf4a7836a6::t_6155648073f7ce 1024-1038
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.22",
+  "base_commit_sha": "2f0098774f1f5780bcd671ae0104cef6169454c5",
+  "prompts": {},
+  "sessions": {
+    "s_57e4cf4a7836a6": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "79540328-5c96-430d-b4c5-de35687f549e",
+        "model": "claude-fable-5"
+      },
+      "human_author": "Jainal Gosaliya <jainal09gosalia@gmail.com>"
+    }
+  }
+}
