@@ -77,6 +77,15 @@ CONFIG_LV_USE_SYSMON=y
 # LVGL's fps/CPU overlay draws an ugly grey box over the UI
 CONFIG_LV_USE_PERF_MONITOR=n
 
+# LVGL's log stays on at WARN, permanently. A draw that cannot proceed — a
+# decoder refusing a source, a RAW image reaching the software blender — is
+# otherwise COMPLETELY silent: the widget just paints nothing. One such failure
+# ("art never shows up", 2026-08-12) was undiagnosable until this was enabled,
+# and at WARN a healthy build logs nothing at all, so it costs only flash.
+CONFIG_LV_USE_LOG=y
+CONFIG_LV_LOG_LEVEL_WARN=y
+CONFIG_LV_LOG_PRINTF=y
+
 #### CPU / FreeRTOS
 CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_240=y
 CONFIG_FREERTOS_HZ=1000
