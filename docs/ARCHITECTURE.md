@@ -150,6 +150,37 @@ Held keys repeat: `btn_poll()` emits `BTN_REPEAT` every 130 ms after the long
 press. Every other consumer tests for `BTN_SHORT`/`BTN_LONG` specifically, so
 repeats are ignored without those call sites needing to know they exist.
 
+### The power state machine, written down
+
+It had never been written out, and that is how a bug got in: always-on suppressed
+the *sleep* branch but not the *auto-lock* branch, so a cube parked on MUSIC kept
+its panel lit and then tore the app down anyway. Two idle behaviours, written at
+different times, one of which learned about a later flag.
+
+| from | trigger | to |
+|---|---|---|
+| any app, screen on | idle > `AUTO_LOCK_MS`, **not** always-on | lock screen |
+| lock screen, screen on | idle > `LOCK_SLEEP_MS`, **not** always-on | panel off + doze |
+| any app | left key | lock screen |
+| lock screen | left key | panel off + doze |
+| panel off | any key **or** touch | panel on, still locked — the press is swallowed |
+| lock screen, screen on | tap | drawer (home), never back to the previous app |
+| lock screen | right hold | toggle always-on (desk clock) |
+| FOCUS, session running | `lv_display_trigger_activity()` each tick | never idles out; dims via brightness instead |
+| FOCUS, session finished | `POMO_DONE_MS` elapsed | lock screen |
+
+**The invariant everything rests on: the panel only ever sleeps from the lock
+screen.** Nothing enforces it. It holds because auto-lock always moves to
+`APP_LOCK` before the sleep timer can fire, so no app is ever on screen when the
+panel goes dark — and every consumer depends on that. The wake path lights the
+panel and nothing else, which is only correct if the lock screen is already behind
+it.
+
+`screen_toggle_power()` now logs a warning if that is ever violated, rather than
+asserting. A wrong screen after wake is miserable to diagnose from the symptom;
+one log line names it. It is also the reason an app that owns the whole screen is a
+redesign and not a flag — see [MULTI-IMAGE.md](MULTI-IMAGE.md).
+
 Waking from sleep always lands on the lock screen, never straight into an app.
 Tapping the lock screen goes **Home**, not back to wherever you locked from.
 

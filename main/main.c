@@ -1524,6 +1524,22 @@ static bool bright_apply(int pct) {
 /* ---------------- screen switching ---------------- */
 
 static void screen_toggle_power(void) {
+    /* INVARIANT: the panel only ever sleeps from the lock screen.
+     *
+     * Nothing enforces this — it holds because auto-lock always moves to APP_LOCK
+     * before the sleep timer can fire, so no app is ever on screen when the panel
+     * goes dark. Every consumer quietly depends on it: the wake path logs "stays
+     * locked" and does nothing but light the panel, which is only correct if the
+     * lock screen is already what is behind it.
+     *
+     * That is why an app owning the whole screen is a redesign rather than a flag
+     * (docs/MULTI-IMAGE.md) — it would violate a rule that was never written down.
+     * Until then, warn rather than assert: a wrong screen after wake is a
+     * confusing bug to chase from the symptom, and one log line names it. */
+    if (s_screen_on && s_app != APP_LOCK) {
+        ESP_LOGW(TAG, "panel sleeping from app %d, not the lock screen — "
+                      "wake will land there; see docs/MULTI-IMAGE.md", s_app);
+    }
     s_screen_on = !s_screen_on;
 
     /* The backlight calls are panel IO, not a GPIO: bsp_display_backlight_off()
@@ -6569,7 +6585,7 @@ void app_main(void) {
 
         /* MUSIC rebinds all three keys to volume, so it is offered them first.
          * It declines on the device-picker scene, which leaves the right key free
-         * to pop that sub-scene the usual way. Home there is the swipe-down
+         * to pop that sub-scene the usual way. Home there is the swipe-up
          * gesture the music screen already carries. */
         bool key_used = false;
         if (s_app == APP_MUSIC && (kleft || kright || pwr)) {
