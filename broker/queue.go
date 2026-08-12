@@ -22,7 +22,7 @@ import (
 )
 
 const (
-	queueMaxItems = 5
+	queueMaxItems = 8
 	queueDefault  = 3
 )
 
