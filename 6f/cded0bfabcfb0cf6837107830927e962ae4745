@@ -1,0 +1,64 @@
+sdkconfig.defaults
+  s_ccdd329d5d5f6c::t_dd6c8a4615348d 201-203
+  s_57e4cf4a7836a6::t_439aae0f63a2d1 204
+main/main.c
+  s_84909056732f4f::t_409f5bc89524be 9-11
+  s_57e4cf4a7836a6::t_5d49a1fde3d6b4 3315-3316
+  s_84909056732f4f::t_6ea5916e5f33e8 3829-3860,3863-3989,3992-4001,4003-4116,4118-4121,6091
+  s_57e4cf4a7836a6::t_cec38eac83699c 3338,3422-3426,3466-3475,3479-3480,3483,3518-3527,3533-3538,3599-3607,3656-3660,3664,3666,3669,3673,3675-3706,3789-3796,7358
+  s_57e4cf4a7836a6::t_23808167c1b18a 7424
+  s_57e4cf4a7836a6::t_439aae0f63a2d1 136-139,1455-1462,1754-1756,2295,5527,7450-7465,7472
+  s_84909056732f4f::t_78d85db0fd168d 3861-3862
+  s_84909056732f4f::t_4a9c082dca3187 7356
+  s_84909056732f4f::t_d8fa4166afeefa 2716,2730,2883-2888,3017-3037,3201-3205,7402
+  s_57e4cf4a7836a6::t_918de8e2538293 7414-7421
+  s_84909056732f4f::t_94cce6d555cfe6 121,1000-1004,1007-1020,1025-1028,1030,1033-1035,1040-1160,1162,1164-1166,1182-1185,1191
+  s_84909056732f4f::t_b96ec98a4fb857 1005-1006,1021-1024,1029,1031-1032,1036-1039,1161,1163,1192,3990-3991,4002,4117,7357
+  s_84909056732f4f::t_f015cd27c29629 7355,7427-7430,7613
+  s_84909056732f4f::t_df5c85cddec4e0 3206
+  s_57e4cf4a7836a6::t_8cae7309b1770c 7473
+main/hud_fonts.h
+  s_57e4cf4a7836a6::t_6e4d8d36eab95d 26
+docs/ARCHITECTURE.md
+  s_84909056732f4f::t_7f9b721ad23a1e 325-335,339-347
+  s_84909056732f4f::t_d8fa4166afeefa 336-338
+  s_84909056732f4f::t_30dcd17aad625d 322-324
+  s_84909056732f4f::t_54561a2aa3b7a0 170,311-321
+README.md
+  s_84909056732f4f::t_409f5bc89524be 37,39
+  s_84909056732f4f::t_d8fa4166afeefa 36
+main/app_icons_64.c
+  s_57e4cf4a7836a6::t_ed9225f7412d37 4,151,232,251,483,529,771-934,1123-1124,1132,1140,1150,1153-1155,1169,1175,1181,1188,1197-1201
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.22",
+  "base_commit_sha": "6fcded0bfabcfb0cf6837107830927e962ae4745",
+  "prompts": {},
+  "sessions": {
+    "s_57e4cf4a7836a6": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "79540328-5c96-430d-b4c5-de35687f549e",
+        "model": "claude-fable-5"
+      },
+      "human_author": "Jainal Gosaliya <jainal09gosalia@gmail.com>"
+    },
+    "s_84909056732f4f": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019ffb48-0122-7890-b574-8e1110771bf8",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "Jainal Gosaliya <jainal09gosalia@gmail.com>"
+    },
+    "s_ccdd329d5d5f6c": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "d2df3d37-ef18-494e-92e2-186fbc38ea5c",
+        "model": "claude-fable-5"
+      },
+      "human_author": "Jainal Gosaliya <jainal09gosalia@gmail.com>"
+    }
+  }
+}
