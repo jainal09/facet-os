@@ -9,15 +9,14 @@ COPY go.mod go.sum ./
 RUN go mod download
 
 COPY *.go ./
-# The provisioning page is //go:embed-ed into the binary, so it has to be in
-# the build context. Without this the build fails at compile time rather than
-# shipping an image that 404s.
+# The provisioning and DAYS pages are //go:embed-ed into the binary, so they
+# have to be in the build context. Without this the build fails at compile time
+# rather than shipping an image that 404s.
 COPY static/ ./static/
 
-# The tests assert that the album-art output is baseline JPEG, which is the one
-# property the firmware cannot work without. Running them here means a
-# regression fails the image build rather than silently shipping a cover the
-# cube renders as nothing.
+# The tests assert the album-art format as well as the authenticated countdown
+# contract. Running them here means a regression fails the image build rather
+# than silently shipping data the cube cannot consume.
 RUN go vet ./... && go test ./...
 
 RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /facet-broker .

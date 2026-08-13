@@ -1,6 +1,7 @@
 # Facet broker
 
-The small amount of server the cube cannot be. Two jobs, and it stays out of the
+The small amount of server the cube cannot be. It handles OAuth, album-art
+transcoding, and tiny phone-friendly editors, while staying out of the
 interactive path for everything else.
 
 ```
@@ -8,14 +9,14 @@ interactive path for everything else.
    │  CUBE   │ ─────────────────────────────────────▶  │ api.spotify  │
    │         │ ◀─────────────────────────────────────  └──────────────┘
    │         │
-   │         │   one-time pairing, and album art       ┌──────────────┐
+   │         │   pairing, art, and DAYS state          ┌──────────────┐
    │         │ ─────────────────────────────────────▶  │   broker     │
    └─────────┘                                         └──────────────┘
 ```
 
-**If this service is down, playback control still works.** The cube holds its own
-refresh token and talks straight to Spotify. Only album art and first-time
-pairing depend on the broker, so it is not a dependency of daily use.
+**If this service is down, playback control still works and DAYS keeps its last
+saved countdown.** The cube holds its own Spotify refresh token and talks
+straight to Spotify. The broker is not in either app's interactive path.
 
 ## Why it exists
 
@@ -32,6 +33,12 @@ handles baseline only, and its baseline path never populates LVGL's image cache
 (see [`docs/HARDWARE.md` §7c](../docs/HARDWARE.md)), so having one predictable
 format arriving at one known size is worth keeping.
 
+**DAYS.** A phone or laptop serves as the comfortable date picker and keyboard.
+`/days` is inert public markup; the page asks for the device bearer before it can
+read or change `/countdown`. The compact state is atomically persisted under the
+cache volume, while the cube keeps its own copy for an instant, offline-first
+open.
+
 ## Endpoints
 
 | Route | Auth | Purpose |
@@ -42,6 +49,9 @@ format arriving at one known size is worth keeping.
 | `GET /token?c=CODE` | Bearer | Cube polls this; returns the refresh token **once**, then forgets it |
 | `GET /art?u=URL&s=240` | Bearer | Fetch, centre-crop, scale, re-encode as baseline JPEG, cache |
 | `GET /art.bin?u=URL&s=240` | Bearer | Same, but returns a pre-decoded RGB565 bitmap in LVGL's binary format — **the device does no decoding at all** |
+| `GET /days` | — | Phone-friendly date/message editor; contains no countdown state or secret |
+| `GET /countdown` | Bearer | Compact cube payload: target date, message, and date set |
+| `POST /countdown` | Bearer | Validate and atomically replace the DAYS state |
 
 ## Security
 
@@ -50,6 +60,8 @@ That shapes every decision here:
 
 - `/token` and `/art` require a bearer matching `BROKER_TOKEN`, compared in
   constant time.
+- `/countdown` uses the same bearer. `/days` is only inert markup; possessing its
+  URL does not reveal or grant access to the saved countdown.
 - `/art` takes an **allowlist** of Spotify image hosts, not a URL filter. A
   service that fetches arbitrary URLs on request is an open proxy — usable to
   reach link-local metadata endpoints or to launder traffic. Scheme must be

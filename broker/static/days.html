@@ -1,0 +1,125 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Facet · Days Until</title>
+<style>
+  :root {
+    --bg: #05070b; --card: #0c111a; --line: #1b2230;
+    --text: #f2e9dc; --dim: #7a8ba5; --accent: #8b7cf6;
+  }
+  * { box-sizing: border-box; margin: 0; }
+  body {
+    background: var(--bg); color: var(--text); min-height: 100vh;
+    display: grid; place-items: center; padding: 24px;
+    font: 16px/1.5 ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  }
+  .card {
+    width: min(420px, calc(100vw - 48px)); background: var(--card);
+    border: 1px solid var(--line); border-radius: 20px; padding: 28px;
+  }
+  h1 {
+    font-size: 13px; font-weight: 600; letter-spacing: 4px;
+    color: var(--dim); text-transform: uppercase; text-align: center;
+  }
+  .preview { text-align: center; margin: 22px 0 26px; }
+  .preview b {
+    font-size: 64px; font-weight: 700; letter-spacing: 2px;
+    font-variant-numeric: tabular-nums; color: var(--accent); display: block;
+  }
+  .preview span { font-size: 12px; letter-spacing: 3px; color: var(--dim); }
+  label { font-size: 11px; letter-spacing: 2px; color: var(--dim); display: block; margin: 14px 0 6px; }
+  input {
+    width: 100%; padding: 12px 14px; border-radius: 12px;
+    border: 1px solid var(--line); background: var(--bg); color: var(--text);
+    font: inherit; outline: none;
+  }
+  input:focus { border-color: var(--accent); }
+  .count { font-size: 11px; color: var(--dim); text-align: right; margin-top: 4px; }
+  button {
+    width: 100%; margin-top: 22px; padding: 14px; border: 0; border-radius: 12px;
+    background: var(--accent); color: #0b0616; font: inherit; font-weight: 700;
+    letter-spacing: 3px; cursor: pointer;
+  }
+  button:active { transform: translateY(1px); }
+  #msg { text-align: center; font-size: 12px; letter-spacing: 2px; color: var(--dim); margin-top: 14px; min-height: 18px; }
+  #msg.ok { color: #35c759; }
+  #msg.err { color: #ff453a; }
+</style>
+</head>
+<body>
+<div class="card">
+  <h1>Days Until</h1>
+  <div class="preview"><b id="n">—</b><span id="w">PICK A DATE</span></div>
+
+  <label for="d">TARGET DATE</label>
+  <input id="d" type="date">
+
+  <label for="t">TEXT ON THE CUBE</label>
+  <input id="t" type="text" maxlength="48" placeholder="WHAT IS THIS COUNTING DOWN TO"
+         autocomplete="off" spellcheck="false">
+  <div class="count"><span id="c">0</span>/48</div>
+
+  <label for="k">DEVICE KEY</label>
+  <input id="k" type="password" placeholder="the broker bearer" autocomplete="off">
+
+  <button id="save">SAVE TO CUBE</button>
+  <div id="msg"></div>
+</div>
+
+<script>
+  const $ = id => document.getElementById(id);
+  const KEY = 'facet_days_key';
+  $('k').value = localStorage.getItem(KEY) || '';
+
+  function days() {
+    if (!$('d').value) return null;
+    const MS = 86400000;
+    const today = new Date(); today.setHours(12, 0, 0, 0);
+    const tgt = new Date($('d').value + 'T12:00:00');
+    return Math.round((tgt - today) / MS);
+  }
+  function preview() {
+    const n = days();
+    $('c').textContent = $('t').value.length;
+    if (n === null) { $('n').textContent = '—'; $('w').textContent = 'PICK A DATE'; return; }
+    $('n').textContent = Math.abs(n);
+    $('w').textContent = n > 1 ? 'DAYS' : n === 1 ? 'DAY' : n === 0 ? 'TODAY' : 'DAYS AGO';
+  }
+  ['d', 't'].forEach(id => $(id).addEventListener('input', preview));
+
+  function msg(text, cls) { const m = $('msg'); m.textContent = text; m.className = cls || ''; }
+
+  async function load() {
+    const key = $('k').value.trim();
+    if (!key) { msg('ENTER THE KEY TO LOAD / SAVE'); return; }
+    try {
+      const r = await fetch('/countdown', { headers: { Authorization: 'Bearer ' + key } });
+      if (r.status === 401) { msg('WRONG KEY', 'err'); return; }
+      const j = await r.json();
+      if (j.d) { $('d').value = j.d; $('t').value = j.t || ''; preview(); msg('LOADED', 'ok'); }
+    } catch { msg('BROKER UNREACHABLE', 'err'); }
+  }
+
+  $('save').addEventListener('click', async () => {
+    const key = $('k').value.trim();
+    if (!key) { msg('ENTER THE DEVICE KEY', 'err'); return; }
+    if (!$('d').value) { msg('PICK A DATE', 'err'); return; }
+    localStorage.setItem(KEY, key);
+    try {
+      const r = await fetch('/countdown', {
+        method: 'POST',
+        headers: { Authorization: 'Bearer ' + key, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ d: $('d').value, t: $('t').value })
+      });
+      if (r.ok) msg('SAVED - THE CUBE PICKS IT UP ON ITS NEXT FETCH', 'ok');
+      else if (r.status === 401) msg('WRONG KEY', 'err');
+      else msg('SAVE FAILED (' + r.status + ')', 'err');
+    } catch { msg('BROKER UNREACHABLE', 'err'); }
+  });
+
+  if ($('k').value) load();
+</script>
+</body>
+</html>

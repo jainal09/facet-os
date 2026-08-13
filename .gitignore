@@ -31,5 +31,6 @@ pwrlog*.csv
 
 # Broker: local build output, secrets and transcode cache
 broker/facet-broker
+broker/broker
 broker/broker.env
 broker/cache/

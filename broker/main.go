@@ -1,7 +1,7 @@
 // Facet broker — the small amount of server the cube cannot be.
 //
-// It exists for exactly two jobs, and deliberately stays out of the interactive
-// path for everything else:
+// It exists only where a server genuinely buys something, and deliberately
+// stays out of the interactive path for everything else:
 //
 //  1. Pairing. Spotify's OAuth needs an HTTPS redirect target, and it does not
 //     offer the device-code flow that would let a screen with no keyboard pair
@@ -15,6 +15,10 @@
 //     either undecodable or re-decoded fifteen times per frame. Transcoding here
 //     removes the whole risk class and drops a 640x640 cover to a few KB at
 //     exactly the size the panel draws.
+//
+//  3. Small phone UIs and shared state. Wi-Fi provisioning and DAYS use the
+//     browser for interactions that are miserable on a round 480 px panel, then
+//     hand the cube compact authenticated payloads.
 //
 // Deployed behind Tailscale Funnel, which means it is on the public internet.
 // Everything below is written with that in mind: no open image proxy, no
@@ -145,6 +149,8 @@ func main() {
 	mux.HandleFunc("/queue", b.handleQueue)
 	// Wi-Fi setup UI. Unauthenticated by design — see provision.go.
 	mux.HandleFunc("/provision", b.handleProvision)
+	mux.HandleFunc("/countdown", b.handleCountdown)
+	mux.HandleFunc("/days", b.handleDaysPage)
 
 	srv := &http.Server{
 		Addr:              cfg.addr,
