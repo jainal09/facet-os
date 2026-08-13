@@ -23,6 +23,7 @@ LV_FONT_DECLARE(app_icons_64);
 #define ICON_MEMORY     "\xEE\x8C\xA2"   /* U+E322 */
 #define ICON_TARGET     "\xEE\x8E\x9E"   /* U+E39E "adjust" — a bullseye, for FOCUS */
 #define ICON_MUSIC      "\xEE\x90\x85"   /* U+E405 music_note */
+#define ICON_EVENT      "\xEE\xA1\xB8"   /* U+E878 event — a dated calendar, for DAYS */
 
 /* A second, small icon face. app_icons_64 is sized for drawer tiles; a 64 px
  * glyph in a 56 px button is unusable. Five glyphs, ~12 KB of flash. */

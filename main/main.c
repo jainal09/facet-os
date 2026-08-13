@@ -6,12 +6,9 @@
  *
  * Apps are built on open and freed on close; see docs/ARCHITECTURE.md.
  *
- * Keys
- *   left  (IO18, GPIO18) : HOME/SETUP = screen off/on   PET = feed
- *   mid   (PWR)          : toggle Wi-Fi setup           PET = play
- *                          not a GPIO — read from the AXP2101 PWRKEY IRQ
- *   right (BOOT, GPIO0)  : short = open pet             PET = rest
- *                          long  = back to HOME
+ * Keys use one global contract: left (GPIO0) locks, middle (PWRKEY through the
+ * AXP2101) goes home, and right (GPIO18) goes back / invokes the app action.
+ * MUSIC deliberately consumes all three for volume. See ARCHITECTURE.md.
  *
  * Everything sits in a safe area: the 480x480 AMOLED has heavily rounded
  * corners and curved cover glass, so content within ~55px of an edge is
@@ -121,7 +118,7 @@ static EventGroupHandle_t s_evt;
 /* Apps are built when opened and destroyed when closed, so only the running
  * app costs RAM. That removes the widget ceiling entirely — the cost of a
  * switch is one rebuild, not a reboot. */
-enum { APP_CONTROL = 0, APP_MUSIC, APP_POMO, APP_PET, APP_COUNT };
+enum { APP_CONTROL = 0, APP_MUSIC, APP_POMO, APP_DAYS, APP_PET, APP_COUNT };
 #define APP_DRAWER (-1)
 #define APP_LOCK   (-2)
 #define AUTO_LOCK_MS  60000     /* unlocked and idle -> lock */
@@ -136,6 +133,10 @@ static lv_timer_t  *s_app_timer;             /* owned by the running app */
 /* Switching is always deferred to the main task: tearing a screen down from
  * inside one of its own touch callbacks would free the object mid-event. */
 static void app_request(int idx) { s_req_app = idx; }
+/* One-shot: the next app switch animates the outgoing screen sliding off the
+ * top. Set only by the swipe-up-home gestures, so every other switch — keys,
+ * lock, drawer taps — stays an instant cut. */
+static bool s_app_slide;
 
 /* 0 when not associated. Worth having on the status line: a bulk transfer that
  * stalls for 12 s is a link symptom, and this board can sit on a range extender
@@ -996,6 +997,173 @@ static void net_bench_run(void) {
 }
 #endif
 
+/* ---------------- DAYS: cached countdown data ----------------
+ *
+ * The web page writes one target to the broker. The cube keeps the last good
+ * answer locally so opening the app never waits on DNS or TLS, then asks again
+ * in the background on every open and once a day. The network task is the only
+ * writer. A tiny cross-core critical section publishes the fixed-size snapshot
+ * to the LVGL task; it covers only a 72-byte copy, never a render callback. */
+
+#define DAYS_BLOB_VER        1
+#define DAYS_FETCH_MS        (24 * 60 * 60 * 1000LL)
+#define DAYS_RETRY_MS        (15 * 60 * 1000LL)
+#define DAYS_RESPONSE_MAX    256
+
+typedef struct {
+    uint8_t ver;
+    char target[11];                    /* YYYY-MM-DD */
+    char set_on[11];                    /* YYYY-MM-DD */
+    char text[49];                      /* broker caps it at 48 ASCII bytes */
+} days_blob_t;
+
+static days_blob_t s_days;
+static uint32_t s_days_version;
+static bool s_req_days_fetch = true;
+static bool s_days_fetching;
+static portMUX_TYPE s_days_lock = portMUX_INITIALIZER_UNLOCKED;
+static int64_t s_days_last_ok_ms;
+static int64_t s_days_last_attempt_ms;
+
+static void days_publish(const days_blob_t *next) {
+    portENTER_CRITICAL(&s_days_lock);
+    s_days = *next;
+    s_days_version++;
+    portEXIT_CRITICAL(&s_days_lock);
+}
+
+static void days_snapshot(days_blob_t *out, uint32_t *version) {
+    portENTER_CRITICAL(&s_days_lock);
+    *out = s_days;
+    if (version) *version = s_days_version;
+    portEXIT_CRITICAL(&s_days_lock);
+}
+
+static void days_load(void) {
+    days_blob_t saved = {0};
+    if (store_load("days", &saved, sizeof(saved)) && saved.ver == DAYS_BLOB_VER) {
+        saved.target[sizeof(saved.target) - 1] = '\0';
+        saved.set_on[sizeof(saved.set_on) - 1] = '\0';
+        saved.text[sizeof(saved.text) - 1] = '\0';
+        days_publish(&saved);
+        ESP_LOGI(TAG, "days: cached target %s", saved.target[0] ? saved.target : "unset");
+    }
+}
+
+typedef struct {
+    char data[DAYS_RESPONSE_MAX];
+    size_t len;
+    bool overflow;
+} days_rx_t;
+
+static days_rx_t s_days_rx;
+static esp_http_client_handle_t s_days_http;
+
+static esp_err_t days_http_evt(esp_http_client_event_t *e) {
+    days_rx_t *rx = e->user_data;
+    if (e->event_id != HTTP_EVENT_ON_DATA || !rx || e->data_len <= 0) return ESP_OK;
+    size_t room = sizeof(rx->data) - 1 - rx->len;
+    size_t n = (size_t)e->data_len;
+    if (n > room) { n = room; rx->overflow = true; }
+    if (n) {
+        memcpy(rx->data + rx->len, e->data, n);
+        rx->len += n;
+        rx->data[rx->len] = '\0';
+    }
+    return ESP_OK;
+}
+
+static bool days_fetch(void) {
+    s_days_rx.len = 0;
+    s_days_rx.overflow = false;
+    s_days_rx.data[0] = '\0';
+
+    if (!s_days_http) {
+        char url[224];
+        size_t base_len = strlen(BROKER_URL);
+        snprintf(url, sizeof(url), "%s%scountdown", BROKER_URL,
+                 (base_len && BROKER_URL[base_len - 1] == '/') ? "" : "/");
+        esp_http_client_config_t cfg = {
+            .url = url,
+            .crt_bundle_attach = esp_crt_bundle_attach,
+            .timeout_ms = 12000,
+            .event_handler = days_http_evt,
+            .user_data = &s_days_rx,
+            .keep_alive_enable = true,
+            .max_redirection_count = 5,
+        };
+        s_days_http = esp_http_client_init(&cfg);
+        if (!s_days_http) return false;
+    } else {
+        esp_http_client_set_url(s_days_http, "/countdown");
+    }
+
+    char auth[96];
+    snprintf(auth, sizeof(auth), "Bearer %.72s", BROKER_TOKEN);
+    esp_http_client_set_header(s_days_http, "Authorization", auth);
+    esp_http_client_set_method(s_days_http, HTTP_METHOD_GET);
+
+    esp_err_t err = esp_http_client_perform(s_days_http);
+    int status = esp_http_client_get_status_code(s_days_http);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "days: %s (HTTP %d) - redial next time",
+                 esp_err_to_name(err), status);
+        esp_http_client_close(s_days_http);
+        return false;
+    }
+    if (status != 200 || s_days_rx.overflow) {
+        ESP_LOGW(TAG, "days: HTTP %d, response %s", status,
+                 s_days_rx.overflow ? "too large" : "rejected");
+        return false;
+    }
+
+    cJSON *root = cJSON_Parse(s_days_rx.data);
+    cJSON *date = root ? cJSON_GetObjectItem(root, "d") : NULL;
+    cJSON *text = root ? cJSON_GetObjectItem(root, "t") : NULL;
+    cJSON *set  = root ? cJSON_GetObjectItem(root, "s") : NULL;
+    if (!root || !cJSON_IsString(date) || !cJSON_IsString(text) ||
+        !cJSON_IsString(set)) {
+        ESP_LOGW(TAG, "days: malformed broker response");
+        if (root) cJSON_Delete(root);
+        return false;
+    }
+
+    days_blob_t next = { .ver = DAYS_BLOB_VER };
+    snprintf(next.target, sizeof(next.target), "%.10s", date->valuestring);
+    snprintf(next.set_on, sizeof(next.set_on), "%.10s", set->valuestring);
+    snprintf(next.text, sizeof(next.text), "%.48s", text->valuestring);
+    /* The broker already folds to ASCII; keep a hostile or stale deployment
+     * from putting unsupported glyphs into the cube's subset fonts anyway. */
+    for (char *p = next.text; *p; p++) {
+        if ((unsigned char)*p < 0x20 || (unsigned char)*p > 0x7E) *p = '?';
+    }
+    cJSON_Delete(root);
+
+    days_publish(&next);
+    store_save("days", &next, sizeof(next));
+    ESP_LOGI(TAG, "days: synced %s, %u B", next.target[0] ? next.target : "unset",
+             (unsigned)s_days_rx.len);
+    return true;
+}
+
+static void days_service(void) {
+    if (!s_wifi_up || ble_prov_active() || BROKER_URL[0] == '\0' ||
+        BROKER_TOKEN[0] == '\0') return;
+
+    int64_t t = now_ms();
+    bool forced = __atomic_exchange_n(&s_req_days_fetch, false, __ATOMIC_ACQ_REL);
+    bool daily = !s_days_last_ok_ms || t - s_days_last_ok_ms >= DAYS_FETCH_MS;
+    if (!forced && !daily) return;
+    if (!forced && s_days_last_attempt_ms &&
+        t - s_days_last_attempt_ms < DAYS_RETRY_MS) return;
+
+    s_days_last_attempt_ms = t;
+    __atomic_store_n(&s_days_fetching, true, __ATOMIC_RELEASE);
+    bool ok = days_fetch();
+    __atomic_store_n(&s_days_fetching, false, __ATOMIC_RELEASE);
+    if (ok) s_days_last_ok_ms = t;
+}
+
 /* The network task.
  *
  * Once polled a stand-in "speech to text" endpoint every 45 s to characterise
@@ -1011,14 +1179,17 @@ static void net_task(void *arg) {
     while (1) {
         xEventGroupWaitBits(s_evt, WIFI_CONNECTED_BIT, pdFALSE, pdTRUE, portMAX_DELAY);
 
-        /* Wallpapers are this task's only remaining job. Off the main loop, so
-         * a slow download cannot stall button handling or the app switcher. */
+        /* Small broker state first so opening DAYS does not wait behind a
+         * several-hundred-KB wallpaper. Both stay off the main loop, so a slow
+         * request cannot stall button handling or the app switcher. */
+        days_service();
         wall_service();
 
         /* A wallpaper request breaks the wait, so pressing Fetch acts now
          * instead of sitting until the next cycle. */
         int period = s_doze ? (10 * 60 * 1000) : HTTPS_PERIOD_MS;
-        for (int w = 0; w < period / 100 && !s_req_wallpaper; w++) {
+        for (int w = 0; w < period / 100 && !s_req_wallpaper &&
+                        !__atomic_load_n(&s_req_days_fetch, __ATOMIC_ACQUIRE); w++) {
             vTaskDelay(pdMS_TO_TICKS(100));
         }
     }
@@ -1281,6 +1452,14 @@ static void rotation_apply(int r) {
         esp_lcd_touch_set_mirror_y(tp, s_rot_tbl[r].my);
     }
     lv_obj_invalidate(lv_screen_active());       /* old frame is now scrambled */
+    /* Repaint HERE, while the panel is dark. The fade used to guess at the
+     * repaint with a fixed delay, which was wrong in both directions: the lock
+     * screen can take several hundred ms (a 480x480 wallpaper re-decode when the
+     * cache has evicted it) so the black-out read as the screen power-cycling —
+     * and a screen slower than the guess had the ramp reveal a half-painted
+     * frame, which is the banding this exists to hide. Rendering synchronously
+     * makes the dark window exactly one repaint, whatever that costs today. */
+    lv_refr_now(NULL);
     bsp_display_unlock();
     rot_fade_end();
 
@@ -1572,8 +1751,9 @@ static void rot_fade_end(void) {
     lv_anim_set_exec_cb(&a, rot_fade_exec);
     lv_anim_set_completed_cb(&a, rot_fade_done);
     lv_anim_set_values(&a, 0, s_rot_fade_to);
-    lv_anim_set_delay(&a, 70);           /* let the repaint land in the dark */
-    lv_anim_set_duration(&a, 260);
+    /* No delay: rotation_apply() rendered synchronously, so the frame is already
+     * on the glass when this starts. */
+    lv_anim_set_duration(&a, 180);
     lv_anim_set_path_cb(&a, lv_anim_path_ease_out);
     lv_anim_start(&a);
     bsp_display_unlock();
@@ -2112,6 +2292,7 @@ static void act_rest_cb(lv_event_t *e) { pet_rest(); }
  * rebound to volume, it is the only way home. */
 static void gesture_home_cb(lv_event_t *e) {
     if (lv_indev_get_gesture_dir(lv_indev_active()) == LV_DIR_TOP) {
+        s_app_slide = true;              /* answer the finger with motion */
         app_request(APP_DRAWER);
     }
 }
@@ -2532,6 +2713,7 @@ static void refr_ready_cb(lv_event_t *e) {
 }
 
 static lv_obj_t *s_cfg_wall_pool, *s_cfg_wall_state, *s_cfg_wall_bar, *s_cfg_wall_sub;
+static lv_obj_t *s_cfg_days_val;
 static lv_obj_t *s_cfg_rot_val;
 static lv_obj_t *s_cfg_rot_sw, *s_cfg_rot_btn;
 static lv_obj_t *s_cfg_bright_val;
@@ -2545,6 +2727,7 @@ static lv_obj_t *s_cfg_sys_val;
 static lv_obj_t *s_cfg_log;
 
 #define CFG_ACCENT_WALL 0x22D3EE
+#define CFG_ACCENT_DAYS 0x8B7CF6
 #define CFG_ACCENT_DISP 0xA78BFA
 #define CFG_ACCENT_BATT 0x34D399
 #define CFG_ACCENT_NET  0x60A5FA
@@ -2697,6 +2880,12 @@ static void cfg_fetch_cb(lv_event_t *e) {
     s_req_wallpaper = true;          /* the network task breaks its wait on this */
 }
 
+static void cfg_days_fetch_cb(lv_event_t *e) {
+    (void)e;
+    __atomic_store_n(&s_req_days_fetch, true, __ATOMIC_RELEASE);
+    if (s_cfg_days_val) lv_label_set_text(s_cfg_days_val, "refresh queued...");
+}
+
 static void cfg_ble_cb(lv_event_t *e) {
     /* Flags only. Starting a session tears the Wi-Fi driver down, which is
      * far too much to do inside an LVGL callback. */
@@ -2823,6 +3012,27 @@ static void cfg_timer_cb(lv_timer_t *t) {
         lv_label_set_text_fmt(s_cfg_wall_sub, "on screen  %s / Unsplash", s_wall_credit);
     } else {
         lv_label_set_text(s_cfg_wall_sub, "");
+    }
+
+    /* ---- days ---- */
+    days_blob_t days;
+    days_snapshot(&days, NULL);
+    bool days_queued = __atomic_load_n(&s_req_days_fetch, __ATOMIC_ACQUIRE);
+    bool days_fetching = __atomic_load_n(&s_days_fetching, __ATOMIC_ACQUIRE);
+    char days_status[96];
+    if (days_fetching) {
+        snprintf(days_status, sizeof(days_status), "refreshing countdown...");
+    } else if (days_queued) {
+        snprintf(days_status, sizeof(days_status), "refresh queued...");
+    } else if (days.target[0]) {
+        snprintf(days_status, sizeof(days_status),
+                 "target  %s\nready  /  daily auto-refresh", days.target);
+    } else {
+        snprintf(days_status, sizeof(days_status),
+                 "no countdown saved\nset one at the /days web page");
+    }
+    if (strcmp(lv_label_get_text(s_cfg_days_val), days_status) != 0) {
+        lv_label_set_text(s_cfg_days_val, days_status);
     }
 
     /* ---- display ---- */
@@ -2988,6 +3198,12 @@ static void build_control_app(lv_obj_t *scr) {
     cfg_button(c, LV_SYMBOL_DOWNLOAD "  Fetch new wallpaper",
                CFG_ACCENT_WALL, cfg_fetch_cb);
 
+    /* ---- days ---- */
+    c = cfg_card(col, "DAYS", CFG_ACCENT_DAYS);
+    s_cfg_days_val = cfg_text(c, 0xC7D2E0);
+    cfg_button(c, LV_SYMBOL_REFRESH "  Refresh countdown",
+               CFG_ACCENT_DAYS, cfg_days_fetch_cb);
+
     /* ---- display ---- */
     c = cfg_card(col, "DISPLAY", CFG_ACCENT_DISP);
     s_cfg_rot_val = cfg_text(c, 0xC7D2E0);
@@ -3092,10 +3308,11 @@ static void build_control_app(lv_obj_t *scr) {
 #define POMO_DIM_PCT     12        /* of the user's brightness, not of full     */
 #define POMO_DIM_FLOOR   3         /* still legible across the room             */
 #define POMO_MOTION_TH   2600      /* ~0.16 g of movement counts as "handled"  */
-#define POMO_DONE_MS     7000      /* how long the finish screen lingers       */
 
 /* Clockwise from the top edge, matching the layout on screen. */
 static const uint8_t s_pomo_min[POMO_SLOTS] = { 60, 10, 5, 30 };
+
+#define POMO_TAP_GRACE_MS 1200   /* DONE ignores the tap that *ended* near zero */
 
 typedef enum { POMO_IDLE = 0, POMO_RUN, POMO_PAUSE, POMO_DONE } pomo_state_t;
 
@@ -3118,6 +3335,7 @@ static int      s_acc_ref_x, s_acc_ref_y, s_acc_ref_z;
 /* widgets */
 static lv_obj_t *s_pomo_dial[POMO_SLOTS];
 static lv_obj_t *s_pomo_clock, *s_pomo_word, *s_pomo_ring, *s_pomo_arc, *s_pomo_fill;
+static lv_obj_t *s_pomo_tick, *s_pomo_hint;   /* the DONE state: green check + tap hint */
 static int s_pomo_drawn_rot = -1;
 
 typedef struct {
@@ -3201,8 +3419,11 @@ static int32_t pomo_edge_angle(int i) {
 }
 
 static void pomo_build_dial(lv_obj_t *scr) {
-    static const lv_coord_t dx[POMO_SLOTS] = {   0,  176,    0, -176 };
-    static const lv_coord_t dy[POMO_SLOTS] = { -176,   0,  176,    0 };
+    /* Radius 160, not 176: at 176 a label's outer edge sat 50 px from the
+     * glass, inside the ~55 px band the curved cover clips (HARDWARE.md), and
+     * the top read as crowded. 160 puts it 66 px clear. */
+    static const lv_coord_t dx[POMO_SLOTS] = {   0,  160,    0, -160 };
+    static const lv_coord_t dy[POMO_SLOTS] = { -160,   0,  160,    0 };
 
     for (int i = 0; i < POMO_SLOTS; i++) {
         lv_obj_t *l = lv_label_create(scr);
@@ -3242,15 +3463,24 @@ static void pomo_refresh(void) {
          * "below" the clock in screen space, swung round into the digits as soon
          * as the cube was turned. The offsets have to rotate with the content,
          * so the stack keeps reading clock-then-word whichever way is up. */
-        static const lv_coord_t cx[4] = {   0, -14,   0,  14 };
-        static const lv_coord_t cy[4] = { -14,   0,  14,   0 };
-        static const lv_coord_t wx[4] = {   0,  52,   0, -52 };
-        static const lv_coord_t wy[4] = {  52,   0, -52,   0 };
+        /* The digits sit dead centre now, so only the word's offset needs to
+         * rotate with the cube. The zero table is kept (rather than dropping the
+         * align call) so a future nudge is a table edit, not a re-derivation. */
+        static const lv_coord_t cx[4] = {   0,   0,   0,   0 };
+        static const lv_coord_t cy[4] = {   0,   0,   0,   0 };
+        static const lv_coord_t wx[4] = {   0,  58,   0, -58 };
+        static const lv_coord_t wy[4] = {  58,   0, -58,   0 };
+
+        static const lv_coord_t hx[4] = {   0,  86,   0, -86 };
+        static const lv_coord_t hy[4] = {  86,   0, -86,   0 };
 
         lv_obj_set_style_transform_rotation(s_pomo_clock, counter, 0);
         lv_obj_set_style_transform_rotation(s_pomo_word, counter, 0);
+        lv_obj_set_style_transform_rotation(s_pomo_tick, counter, 0);
+        lv_obj_set_style_transform_rotation(s_pomo_hint, counter, 0);
         lv_obj_align(s_pomo_clock, LV_ALIGN_CENTER, cx[wr], cy[wr]);
         lv_obj_align(s_pomo_word,  LV_ALIGN_CENTER, wx[wr], wy[wr]);
+        lv_obj_align(s_pomo_hint,  LV_ALIGN_CENTER, hx[wr], hy[wr]);
 
         /* keep the depleting ring starting from world-up, not screen-up */
         lv_arc_set_rotation(s_pomo_arc,  (270 - 90 * wr + 360) % 360);
@@ -3285,11 +3515,27 @@ static void pomo_refresh(void) {
         int64_t age = now_ms() - s_pomo_done_at;
         int k = (int)((age / 40) % 50);
         int w = 8 + (k < 25 ? k : 50 - k) / 2;
+        /* The check replaces the digits — 00:00 is a number, DONE is a state.
+         * The hint waits out the tap grace so it never invites a tap that would
+         * be swallowed. Every flag flip is change-gated: this block runs every
+         * tick and the setters invalidate whether or not anything moved. */
+        if (!lv_obj_has_flag(s_pomo_clock, LV_OBJ_FLAG_HIDDEN))
+            lv_obj_add_flag(s_pomo_clock, LV_OBJ_FLAG_HIDDEN);
+        if (lv_obj_has_flag(s_pomo_tick, LV_OBJ_FLAG_HIDDEN))
+            lv_obj_remove_flag(s_pomo_tick, LV_OBJ_FLAG_HIDDEN);
+        if (age > POMO_TAP_GRACE_MS && lv_obj_has_flag(s_pomo_hint, LV_OBJ_FLAG_HIDDEN))
+            lv_obj_remove_flag(s_pomo_hint, LV_OBJ_FLAG_HIDDEN);
         lv_obj_add_flag(s_pomo_fill, LV_OBJ_FLAG_HIDDEN);
         lv_obj_set_style_arc_width(s_pomo_arc, w, LV_PART_MAIN);
         lv_arc_set_bg_angles(s_pomo_arc, 0, 360);
         lv_obj_set_style_arc_color(s_pomo_arc, lv_color_hex(0x35C759), LV_PART_MAIN);
     } else {
+        if (lv_obj_has_flag(s_pomo_clock, LV_OBJ_FLAG_HIDDEN))
+            lv_obj_remove_flag(s_pomo_clock, LV_OBJ_FLAG_HIDDEN);
+        if (!lv_obj_has_flag(s_pomo_tick, LV_OBJ_FLAG_HIDDEN))
+            lv_obj_add_flag(s_pomo_tick, LV_OBJ_FLAG_HIDDEN);
+        if (!lv_obj_has_flag(s_pomo_hint, LV_OBJ_FLAG_HIDDEN))
+            lv_obj_add_flag(s_pomo_hint, LV_OBJ_FLAG_HIDDEN);
         /* Elapsed time fills clockwise from the top in green, deepening from
          * near-black to vivid as the session runs out. Green is the AMOLED's
          * strongest primary and it has 6 bits in RGB565 against 5 for the
@@ -3350,6 +3596,15 @@ static void pomo_tap_cb(lv_event_t *e) {
     case POMO_IDLE:  pomo_begin(pomo_top_edge(), true); break;
     case POMO_RUN:   pomo_set_running(false, "tap");     break;
     case POMO_PAUSE: pomo_set_running(true,  "tap");     break;
+    case POMO_DONE:
+        /* The finish screen is persistent now, so a tap is how the next session
+         * starts — with whatever duration is at the top, same as idle. The
+         * grace period exists because someone tapping to pause right as the
+         * timer hits zero would otherwise launch a fresh session unseen. */
+        if (now_ms() - s_pomo_done_at > POMO_TAP_GRACE_MS) {
+            pomo_begin(pomo_top_edge(), true);
+        }
+        break;
     default: break;
     }
 }
@@ -3398,22 +3653,57 @@ static void build_pomo_app(lv_obj_t *scr) {
     pomo_build_dial(scr);
 
     s_pomo_clock = lv_label_create(scr);
-    lv_obj_set_size(s_pomo_clock, 300, 90);
+    /* Height must equal the font's line_height (55 for hud_clock_76): LVGL lays
+     * text from the top of the box, so any excess height floats the glyphs above
+     * the box centre — and the pivot and align both speak in box coordinates.
+     * A 90 px box put the digits 17.5 px high of where "centred" claimed. */
+    lv_obj_set_size(s_pomo_clock, 300, 55);
     lv_obj_set_style_text_font(s_pomo_clock, &hud_clock_76, 0);
     lv_obj_set_style_text_align(s_pomo_clock, LV_TEXT_ALIGN_CENTER, 0);
     lv_obj_set_style_transform_pivot_x(s_pomo_clock, 150, 0);
-    lv_obj_set_style_transform_pivot_y(s_pomo_clock, 45, 0);
+    lv_obj_set_style_transform_pivot_y(s_pomo_clock, 27, 0);
     lv_label_set_text(s_pomo_clock, "00:00");
-    lv_obj_align(s_pomo_clock, LV_ALIGN_CENTER, 0, -14);
+    lv_obj_align(s_pomo_clock, LV_ALIGN_CENTER, 0, 0);
 
     s_pomo_word = lv_label_create(scr);
-    lv_obj_set_size(s_pomo_word, 300, 26);
+    lv_obj_set_size(s_pomo_word, 300, 20);           /* = hud_text_18 line box */
     lv_obj_set_style_text_font(s_pomo_word, &hud_text_18, 0);
     lv_obj_set_style_text_align(s_pomo_word, LV_TEXT_ALIGN_CENTER, 0);
     lv_obj_set_style_transform_pivot_x(s_pomo_word, 150, 0);
-    lv_obj_set_style_transform_pivot_y(s_pomo_word, 13, 0);
+    lv_obj_set_style_transform_pivot_y(s_pomo_word, 10, 0);
     lv_label_set_text(s_pomo_word, "");
-    lv_obj_align(s_pomo_word, LV_ALIGN_CENTER, 0, 52);
+    lv_obj_align(s_pomo_word, LV_ALIGN_CENTER, 0, 58);
+
+    /* DONE-state widgets. The check sits dead centre where the digits were, so
+     * it needs no offset table — rotation spins it about its own middle. It is
+     * montserrat_36 because that is the compiled-in font carrying LV_SYMBOL_OK
+     * (the hud fonts are ASCII-only), scaled 1.5x to the digits' visual weight.
+     * The hint rides 86 px world-below, past the DONE word at 58. */
+    s_pomo_tick = lv_label_create(scr);
+    lv_obj_set_size(s_pomo_tick, 60, 36);
+    lv_obj_set_style_text_font(s_pomo_tick, &lv_font_montserrat_36, 0);
+    lv_obj_set_style_text_align(s_pomo_tick, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_style_text_color(s_pomo_tick, lv_color_hex(0x35C759), 0);
+    lv_obj_set_style_transform_pivot_x(s_pomo_tick, 30, 0);
+    lv_obj_set_style_transform_pivot_y(s_pomo_tick, 18, 0);
+    lv_obj_set_style_transform_scale_x(s_pomo_tick, 384, 0);
+    lv_obj_set_style_transform_scale_y(s_pomo_tick, 384, 0);
+    lv_label_set_text(s_pomo_tick, LV_SYMBOL_OK);
+    lv_obj_align(s_pomo_tick, LV_ALIGN_CENTER, 0, 0);
+    lv_obj_add_flag(s_pomo_tick, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_remove_flag(s_pomo_tick, LV_OBJ_FLAG_CLICKABLE);
+
+    s_pomo_hint = lv_label_create(scr);
+    lv_obj_set_size(s_pomo_hint, 300, 20);
+    lv_obj_set_style_text_font(s_pomo_hint, &hud_text_18, 0);
+    lv_obj_set_style_text_align(s_pomo_hint, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_style_text_color(s_pomo_hint, lv_color_hex(0x7A8BA5), 0);
+    lv_obj_set_style_transform_pivot_x(s_pomo_hint, 150, 0);
+    lv_obj_set_style_transform_pivot_y(s_pomo_hint, 10, 0);
+    lv_label_set_text(s_pomo_hint, "TAP TO START ANOTHER");
+    lv_obj_align(s_pomo_hint, LV_ALIGN_CENTER, 0, 86);
+    lv_obj_add_flag(s_pomo_hint, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_remove_flag(s_pomo_hint, LV_OBJ_FLAG_CLICKABLE);
 
     lv_obj_add_event_cb(scr, gesture_home_cb, LV_EVENT_GESTURE, NULL);
     lv_obj_add_flag(scr, LV_OBJ_FLAG_CLICKABLE);
@@ -3496,11 +3786,15 @@ static void pomo_poll(int64_t t) {
     } else if (s_pomo_state == POMO_PAUSE) {
         lv_display_trigger_activity(NULL);
     } else if (s_pomo_state == POMO_DONE) {
+        /* DONE is persistent, on purpose: the finish screen keeps the panel on —
+         * always-on or not — until a tap starts the next session or the user
+         * navigates away. It used to retire to the lock screen after 7 s, which
+         * meant the one glance that mattered ("did it finish?") usually found a
+         * clock. This only pins the screen while FOCUS is the active app:
+         * pomo_poll() returns early on every other screen, so a finished session
+         * left in the background changes nothing there. The inactivity dim still
+         * applies, which is what makes indefinitely-on affordable on an AMOLED. */
         lv_display_trigger_activity(NULL);
-        if (t - s_pomo_done_at > POMO_DONE_MS) {
-            s_pomo_state = POMO_IDLE;
-            app_request(APP_LOCK);                /* settle into the clock */
-        }
     }
 
     /* --- dim when nothing is happening, wake on touch or movement --- */
@@ -3530,6 +3824,299 @@ static void pomo_poll(int64_t t) {
         ESP_LOGI(TAG, "pomodoro: %s (panel %d%%)",
                  want_dim ? "dimmed" : "undimmed", want_dim ? dim : lvl);
     }
+}
+
+/* ---------------- DAYS: one beautiful answer to "how long?" ---------------- */
+
+static lv_obj_t *s_days_today, *s_days_time, *s_days_num, *s_days_unit;
+static lv_obj_t *s_days_bar, *s_days_start, *s_days_target;
+static lv_obj_t *s_days_card, *s_days_text, *s_days_sync;
+static uint32_t s_days_painted_ver = UINT32_MAX;
+static int s_days_painted_day = INT32_MIN;
+static int s_days_painted_minute = -1;
+static int s_days_painted_progress = -1;
+static uint32_t s_days_painted_accent;
+
+static bool days_parse_ymd(const char *s, int *year, int *month, int *day) {
+    int y, m, d, n = 0;
+    if (!s || strlen(s) != 10 ||
+        sscanf(s, "%4d-%2d-%2d%n", &y, &m, &d, &n) != 3 || n != 10) return false;
+    static const uint8_t mdays[] = { 31,28,31,30,31,30,31,31,30,31,30,31 };
+    if (y < 1970 || y > 9999 || m < 1 || m > 12 || d < 1) return false;
+    int max = mdays[m - 1];
+    if (m == 2 && ((y % 4 == 0 && y % 100 != 0) || y % 400 == 0)) max = 29;
+    if (d > max) return false;
+    if (year) *year = y;
+    if (month) *month = m;
+    if (day) *day = d;
+    return true;
+}
+
+/* Gregorian civil date -> monotonically increasing day number. Unlike mktime,
+ * this does not turn a DST transition into a 23/25-hour "day". */
+static int64_t days_civil_index(int y, unsigned m, unsigned d) {
+    y -= m <= 2;
+    int era = (y >= 0 ? y : y - 399) / 400;
+    unsigned yoe = (unsigned)(y - era * 400);
+    unsigned shifted_month = (unsigned)((int)m + (m > 2 ? -3 : 9));
+    unsigned doy = (153 * shifted_month + 2) / 5 + d - 1;
+    unsigned doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    return (int64_t)era * 146097 + doe;
+}
+
+static void days_date_short(const char *date, char *out, size_t cap, bool year) {
+    static const char *mon[] = {
+        "JAN", "FEB", "MAR", "APR", "MAY", "JUN",
+        "JUL", "AUG", "SEP", "OCT", "NOV", "DEC"
+    };
+    int y, m, d;
+    if (!days_parse_ymd(date, &y, &m, &d)) {
+        snprintf(out, cap, "--");
+    } else if (year) {
+        snprintf(out, cap, "%s %d %d", mon[m - 1], d, y);
+    } else {
+        snprintf(out, cap, "%s %d", mon[m - 1], d);
+    }
+}
+
+static uint32_t color_mix(uint32_t a, uint32_t b, int p) {
+    p = clampi(p, 0, 100);
+    int ar = (a >> 16) & 0xFF, ag = (a >> 8) & 0xFF, ab = a & 0xFF;
+    int br = (b >> 16) & 0xFF, bg = (b >> 8) & 0xFF, bb = b & 0xFF;
+    return (uint32_t)(ar + (br - ar) * p / 100) << 16 |
+           (uint32_t)(ag + (bg - ag) * p / 100) << 8 |
+           (uint32_t)(ab + (bb - ab) * p / 100);
+}
+
+/* Cool cyan at the beginning, violet through the middle, then amber/coral as
+ * the date gets close. The number and bar always share this exact colour. */
+static uint32_t days_accent(int progress) {
+    if (progress < 55) return color_mix(0x22D3EE, 0x8B7CF6, progress * 100 / 55);
+    if (progress < 85) return color_mix(0x8B7CF6, 0xF59E0B,
+                                        (progress - 55) * 100 / 30);
+    return color_mix(0xF59E0B, 0xFF453A, (progress - 85) * 100 / 15);
+}
+
+static void days_label_text(lv_obj_t *label, const char *text) {
+    if (label && strcmp(lv_label_get_text(label), text) != 0) {
+        lv_label_set_text(label, text);
+    }
+}
+
+static void days_refresh(void) {
+    if (!s_days_num) return;
+
+    time_t now;
+    struct tm ti = {0};
+    time(&now);
+    localtime_r(&now, &ti);
+    bool clock_ok = ti.tm_year >= (2024 - 1900);
+    int today = clock_ok ? (int)days_civil_index(ti.tm_year + 1900,
+                                                 (unsigned)ti.tm_mon + 1,
+                                                 (unsigned)ti.tm_mday) : INT32_MIN;
+
+    days_blob_t data;
+    uint32_t version;
+    days_snapshot(&data, &version);
+
+    int ty, tm, td, sy, sm, sd;
+    bool have_target = days_parse_ymd(data.target, &ty, &tm, &td);
+    bool have_set = days_parse_ymd(data.set_on, &sy, &sm, &sd);
+    int target = have_target ? (int)days_civil_index(ty, (unsigned)tm, (unsigned)td) : 0;
+    int set_on = have_set ? (int)days_civil_index(sy, (unsigned)sm, (unsigned)sd) : today;
+
+    int remaining = (clock_ok && have_target) ? target - today : 0;
+    int total = (have_set && have_target) ? target - set_on : 0;
+    int progress = 0;
+    if (clock_ok && have_target) {
+        if (remaining <= 0) progress = 100;
+        else if (total > 0) progress = clampi((today - set_on) * 100 / total, 0, 100);
+    }
+    uint32_t accent = days_accent(progress);
+
+    /* The data/date branch repaints only when either actually changed. Time is
+     * minute-granular, so this screen is truly static between minute ticks. */
+    if (version != s_days_painted_ver || today != s_days_painted_day) {
+        char number[16], unit[24], start[28], target_text[32];
+        snprintf(number, sizeof(number), "%d", abs(remaining));
+        if (!clock_ok) snprintf(unit, sizeof(unit), "SETTING CLOCK");
+        else if (!have_target) snprintf(unit, sizeof(unit), "NO DATE YET");
+        else if (remaining == 0) snprintf(unit, sizeof(unit), "TODAY");
+        else if (remaining == 1) snprintf(unit, sizeof(unit), "DAY TO GO");
+        else if (remaining > 1) snprintf(unit, sizeof(unit), "DAYS TO GO");
+        else if (remaining == -1) snprintf(unit, sizeof(unit), "DAY AGO");
+        else snprintf(unit, sizeof(unit), "DAYS AGO");
+
+        char short_date[20];
+        days_date_short(data.set_on, short_date, sizeof(short_date), false);
+        snprintf(start, sizeof(start), "START %s", short_date);
+        days_date_short(data.target, short_date, sizeof(short_date), true);
+        snprintf(target_text, sizeof(target_text), "TARGET %s", short_date);
+
+        days_label_text(s_days_num, number);
+        days_label_text(s_days_unit, unit);
+        days_label_text(s_days_start, have_set ? start : "");
+        days_label_text(s_days_target, have_target ? target_text : "");
+        days_label_text(s_days_text, data.text[0] ? data.text
+                         : "SET A DATE AND A MESSAGE FROM THE DAYS WEB PAGE");
+        s_days_painted_ver = version;
+        s_days_painted_day = today;
+    }
+
+    if (clock_ok && ti.tm_hour * 60 + ti.tm_min != s_days_painted_minute) {
+        static const char *wday[] = { "SUN", "MON", "TUE", "WED", "THU", "FRI", "SAT" };
+        static const char *mon[] = { "JAN", "FEB", "MAR", "APR", "MAY", "JUN",
+                                     "JUL", "AUG", "SEP", "OCT", "NOV", "DEC" };
+        char date[28], clock[8];
+        snprintf(date, sizeof(date), "%s  %s %d", wday[ti.tm_wday], mon[ti.tm_mon], ti.tm_mday);
+        snprintf(clock, sizeof(clock), "%02d:%02d", ti.tm_hour, ti.tm_min);
+        days_label_text(s_days_today, date);
+        days_label_text(s_days_time, clock);
+        s_days_painted_minute = ti.tm_hour * 60 + ti.tm_min;
+    }
+
+    if (progress != s_days_painted_progress) {
+        lv_bar_set_value(s_days_bar, progress, LV_ANIM_ON);
+        s_days_painted_progress = progress;
+    }
+    if (accent != s_days_painted_accent) {
+        lv_color_t c = lv_color_hex(accent);
+        lv_obj_set_style_text_color(s_days_num, c, 0);
+        lv_obj_set_style_text_color(s_days_unit, c, 0);
+        lv_obj_set_style_bg_color(s_days_bar, c, LV_PART_INDICATOR);
+        lv_obj_set_style_border_color(s_days_card, c, 0);
+        s_days_painted_accent = accent;
+    }
+    days_label_text(s_days_sync,
+                    __atomic_load_n(&s_days_fetching, __ATOMIC_ACQUIRE) ? "SYNCING..." :
+                    (have_target ? "TAP TO REFRESH" : "SET IT AT /DAYS"));
+}
+
+static void days_timer_cb(lv_timer_t *timer) {
+    (void)timer;
+    days_refresh();
+}
+
+static void days_tap_cb(lv_event_t *e) {
+    (void)e;
+    __atomic_store_n(&s_req_days_fetch, true, __ATOMIC_RELEASE);
+    days_label_text(s_days_sync, "SYNCING...");
+}
+
+static void build_days_app(lv_obj_t *scr) {
+    lv_obj_set_style_bg_color(scr, lv_color_hex(0x03060A), 0);
+    lv_obj_set_style_pad_all(scr, 0, 0);
+    lv_obj_remove_flag(scr, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(scr, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(scr, days_tap_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_add_event_cb(scr, gesture_home_cb, LV_EVENT_GESTURE, NULL);
+
+    /* The header is deliberately asymmetric: today's date gets visual weight,
+     * while the clock is smaller and tucked into the opposite corner. Both stay
+     * inside the 58..422 px safe column. */
+    s_days_today = lv_label_create(scr);
+    lv_obj_set_width(s_days_today, 245);
+    lv_obj_set_style_text_font(s_days_today, &lv_font_montserrat_20, 0);
+    lv_obj_set_style_text_color(s_days_today, lv_color_hex(0xE8EDF5), 0);
+    lv_label_set_text(s_days_today, "TODAY");
+    lv_obj_set_pos(s_days_today, 64, 46);
+
+    s_days_time = lv_label_create(scr);
+    lv_obj_set_width(s_days_time, 100);
+    lv_obj_set_style_text_font(s_days_time, &hud_text_18, 0);
+    lv_obj_set_style_text_align(s_days_time, LV_TEXT_ALIGN_RIGHT, 0);
+    lv_obj_set_style_text_color(s_days_time, lv_color_hex(0x718096), 0);
+    lv_label_set_text(s_days_time, "--:--");
+    lv_obj_set_pos(s_days_time, 316, 48);
+
+    lv_obj_t *eyebrow = lv_label_create(scr);
+    lv_obj_set_width(eyebrow, CONTENT_W);
+    lv_obj_set_style_text_font(eyebrow, &hud_text_18, 0);
+    lv_obj_set_style_text_align(eyebrow, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_style_text_letter_space(eyebrow, 4, 0);
+    lv_obj_set_style_text_color(eyebrow, lv_color_hex(0x536176), 0);
+    lv_label_set_text(eyebrow, "DAYS UNTIL");
+    lv_obj_align(eyebrow, LV_ALIGN_TOP_MID, 0, 92);
+
+    s_days_num = lv_label_create(scr);
+    lv_obj_set_size(s_days_num, CONTENT_W, 84);
+    lv_obj_set_style_text_font(s_days_num, &hud_clock_76, 0);
+    lv_obj_set_style_text_align(s_days_num, LV_TEXT_ALIGN_CENTER, 0);
+    lv_label_set_text(s_days_num, "0");
+    lv_obj_align(s_days_num, LV_ALIGN_TOP_MID, 0, 121);
+
+    s_days_unit = lv_label_create(scr);
+    lv_obj_set_width(s_days_unit, CONTENT_W);
+    lv_obj_set_style_text_font(s_days_unit, &hud_text_18, 0);
+    lv_obj_set_style_text_align(s_days_unit, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_style_text_letter_space(s_days_unit, 3, 0);
+    lv_label_set_text(s_days_unit, "NO DATE YET");
+    lv_obj_align(s_days_unit, LV_ALIGN_TOP_MID, 0, 207);
+
+    s_days_bar = lv_bar_create(scr);
+    lv_obj_set_size(s_days_bar, 330, 14);
+    lv_bar_set_range(s_days_bar, 0, 100);
+    lv_bar_set_value(s_days_bar, 0, LV_ANIM_OFF);
+    lv_obj_set_style_radius(s_days_bar, 7, 0);
+    lv_obj_set_style_radius(s_days_bar, 7, LV_PART_INDICATOR);
+    lv_obj_set_style_bg_color(s_days_bar, lv_color_hex(0x121A25), 0);
+    lv_obj_set_style_bg_opa(s_days_bar, LV_OPA_COVER, 0);
+    lv_obj_align(s_days_bar, LV_ALIGN_TOP_MID, 0, 254);
+
+    s_days_start = lv_label_create(scr);
+    lv_obj_set_width(s_days_start, 150);
+    lv_obj_set_style_text_color(s_days_start, lv_color_hex(0x5D6B80), 0);
+    lv_obj_set_style_text_font(s_days_start, &lv_font_montserrat_14, 0);
+    lv_label_set_text(s_days_start, "");
+    lv_obj_set_pos(s_days_start, 75, 280);
+
+    s_days_target = lv_label_create(scr);
+    lv_obj_set_width(s_days_target, 210);
+    lv_obj_set_style_text_align(s_days_target, LV_TEXT_ALIGN_RIGHT, 0);
+    lv_obj_set_style_text_color(s_days_target, lv_color_hex(0x8492A6), 0);
+    lv_obj_set_style_text_font(s_days_target, &lv_font_montserrat_14, 0);
+    lv_label_set_text(s_days_target, "");
+    lv_obj_set_pos(s_days_target, 195, 280);
+
+    s_days_card = lv_obj_create(scr);
+    lv_obj_remove_style_all(s_days_card);
+    lv_obj_set_size(s_days_card, CONTENT_W, 98);
+    lv_obj_set_style_radius(s_days_card, 24, 0);
+    lv_obj_set_style_bg_color(s_days_card, lv_color_hex(0x0B1018), 0);
+    lv_obj_set_style_bg_opa(s_days_card, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_width(s_days_card, 1, 0);
+    lv_obj_set_style_border_opa(s_days_card, 105, 0);
+    lv_obj_remove_flag(s_days_card, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_remove_flag(s_days_card, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_align(s_days_card, LV_ALIGN_TOP_MID, 0, 316);
+
+    s_days_text = lv_label_create(s_days_card);
+    lv_obj_set_width(s_days_text, 316);
+    lv_obj_set_style_text_font(s_days_text, &lv_font_montserrat_20, 0);
+    lv_obj_set_style_text_align(s_days_text, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_style_text_color(s_days_text, lv_color_hex(0xE8EDF5), 0);
+    lv_obj_set_style_text_line_space(s_days_text, 7, 0);
+    lv_label_set_long_mode(s_days_text, LV_LABEL_LONG_WRAP);
+    lv_label_set_text(s_days_text, "SET A DATE AND A MESSAGE FROM THE DAYS WEB PAGE");
+    lv_obj_center(s_days_text);
+
+    s_days_sync = lv_label_create(scr);
+    lv_obj_set_width(s_days_sync, CONTENT_W);
+    lv_obj_set_style_text_font(s_days_sync, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_align(s_days_sync, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_style_text_letter_space(s_days_sync, 2, 0);
+    lv_obj_set_style_text_color(s_days_sync, lv_color_hex(0x536176), 0);
+    lv_label_set_text(s_days_sync, "SYNCING...");
+    lv_obj_align(s_days_sync, LV_ALIGN_BOTTOM_MID, 0, -44);
+
+    s_days_painted_ver = UINT32_MAX;
+    s_days_painted_day = INT32_MIN;
+    s_days_painted_minute = -1;
+    s_days_painted_progress = -1;
+    s_days_painted_accent = 0;
+    __atomic_store_n(&s_req_days_fetch, true, __ATOMIC_RELEASE);
+    days_refresh();                         /* cached value, before the GET */
+    s_app_timer = lv_timer_create(days_timer_cb, 1000, NULL);
 }
 
 /* ---------------- MUSIC: a Spotify remote ----------------
@@ -4937,7 +5524,7 @@ static void sp_gesture_cb(lv_event_t *e) {
         /* Back before home, matching what the right key does through app_back():
          * from a sub-scene the swipe pops it rather than leaving the app. */
         if (picker) sp_show_devices(false);
-        else        app_request(APP_DRAWER);
+        else        { s_app_slide = true; app_request(APP_DRAWER); }
         return;
     }
     if (picker) return;          /* a flick here belongs to the list */
@@ -5501,6 +6088,7 @@ static const app_def_t s_apps[APP_COUNT] = {
     [APP_PET]    = { "PIP",    "pet",    ICON_PETS,      0xF59E0B, build_pet_app,    pet_save },
 #endif
     [APP_MUSIC]  = { "MUSIC",  "music",  ICON_MUSIC,     0x1DB954, build_music_app,  NULL      },
+    [APP_DAYS]   = { "DAYS",   "days",   ICON_EVENT,     0x8B7CF6, build_days_app,   NULL      },
     /* Red, and not the amber the app itself still uses for a running session:
      * PIP directly above it is 0xF59E0B, and two ambers side by side in a 2x2
      * made the tiles hard to tell apart at a glance. */
@@ -6764,6 +7352,10 @@ static void app_action(void) {
             ESP_LOGI(TAG, "pomodoro: cancelled");
         }
         break;
+    case APP_DAYS:
+        /* Hold right = refresh now. */
+        __atomic_store_n(&s_req_days_fetch, true, __ATOMIC_RELEASE);
+        break;
     default:                                        /* drawer: step through apps */
         for (int n = 0; n < APP_COUNT; n++) {   /* step past any compiled-out app */
             drawer_pick = (drawer_pick + 1) % APP_COUNT;
@@ -6807,6 +7399,7 @@ static void app_open(int idx) {
     s_ch_wrap = NULL;
     s_cfg_wall_pool = NULL; s_cfg_wall_state = NULL;
     s_cfg_wall_bar = NULL; s_cfg_wall_sub = NULL;
+    s_cfg_days_val = NULL;
     s_cfg_rot_val = NULL; s_cfg_vol_val = NULL;
     s_cfg_rot_sw = NULL; s_cfg_rot_btn = NULL; s_cfg_bright_val = NULL;
     s_cfg_batt_bar = NULL;
@@ -6818,10 +7411,23 @@ static void app_open(int idx) {
     s_sp_btn_dev = NULL; s_sp_devpanel = NULL; s_sp_devlist = NULL;
     s_sp_btn_prev = NULL; s_sp_btn_next = NULL; s_sp_btn_like = NULL;
     s_sp_vol_bar = NULL; s_sp_vol_icon = NULL;
+    /* s_sp_spin was added without a row here and dangled after MUSIC closed —
+     * sp_art_clear() runs from the lock card's transport buttons too, so every
+     * skip from the lock screen flipped a flag bit inside freed, recycled LVGL
+     * memory. The symptom was nowhere near the cause: the lock screen's own
+     * widgets misbehaving (dead gestures) after MUSIC had been opened once.
+     * When adding a MUSIC widget static, its NULL row here is part of the
+     * change, not an optional extra. */
+    s_sp_spin = NULL; s_sp_chip = NULL;
     s_sp_scr = NULL; s_sp_bg_drawn = 0;
     s_pomo_clock = NULL; s_pomo_word = NULL;
+    s_pomo_tick = NULL; s_pomo_hint = NULL;
     s_pomo_ring = NULL; s_pomo_arc = NULL; s_pomo_fill = NULL;
     for (int i = 0; i < POMO_SLOTS; i++) s_pomo_dial[i] = NULL;
+    s_days_today = NULL; s_days_time = NULL; s_days_num = NULL;
+    s_days_unit = NULL; s_days_bar = NULL; s_days_start = NULL;
+    s_days_target = NULL; s_days_card = NULL; s_days_text = NULL;
+    s_days_sync = NULL;
     s_lock_time = NULL; s_lock_date = NULL; s_lock_batt = NULL;
     s_lock_sweep = NULL; s_lock_batt_arc = NULL;
     s_lock_np = NULL; s_lock_np_art = NULL; s_lock_np_ph = NULL;
@@ -6841,13 +7447,29 @@ static void app_open(int idx) {
      * 16 bytes, which wedged the flush path and starved the idle task. */
     lv_obj_t *old_scr = lv_screen_active();
     lv_obj_t *scr = lv_obj_create(NULL);
-    lv_screen_load(scr);
-    if (old_scr && old_scr != scr) lv_obj_delete(old_scr);
+    /* The swipe-up switch animates the old screen sliding off the top with the
+     * new one already built beneath — which keeps both trees alive for the
+     * 220 ms. That is the pattern the comment above forbids, re-validated
+     * deliberately: the 16-byte incident predates the LVGL DIRAM win, and the
+     * floor is ~80 KB now against ~5 KB per screen. The "opened ..." line below
+     * logs free heap on every switch, so a regression here is measured rather
+     * than felt. Everything else keeps the free-first order.
+     *
+     * Timers and widget pointers were already nulled above, so a stray tap into
+     * the outgoing screen during the slide finds guards, not dangling state. */
+    bool slide = s_app_slide && old_scr && old_scr != scr;
+    s_app_slide = false;
+    if (!slide) {
+        lv_screen_load(scr);
+        if (old_scr && old_scr != scr) lv_obj_delete(old_scr);
+    }
 
     if (app_enabled(idx))             s_apps[idx].build(scr);
     else if (idx == APP_LOCK)         build_lock_screen(scr);
     else                              build_drawer(scr);
     s_app = idx;
+
+    if (slide) lv_screen_load_anim(scr, LV_SCR_LOAD_ANIM_OUT_TOP, 220, 0, true);
 
     bsp_display_unlock();
 
@@ -6988,6 +7610,7 @@ void app_main(void) {
     }
 
     sd_init();
+    days_load();
     rtc_init();
     pmu_init();
     battery_poll();

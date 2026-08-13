@@ -33,9 +33,10 @@ and not PSRAM, is what decides whether a feature fits. Facet is built around it:
 
 | App | What it does | Hold right key |
 |---|---|---|
-| **CONTROL** | Settings and diagnostics in one scrolling column of cards: wallpaper pool with a live download bar, rotation calibration, battery and drain rate, network, system counters | Fetch a new wallpaper |
+| **CONTROL** | Settings and diagnostics in one scrolling column of cards: wallpaper pool, manual DAYS refresh, rotation calibration, battery and drain rate, network, system counters | Fetch a new wallpaper |
+| **MUSIC** | A direct Spotify remote with cover art, queue lookahead, device transfer and volume controls | Play / pause |
 | **FOCUS** | A Pomodoro timer you drive by turning the cube. Rotate to pick 60/30/10/5 and start; lay it flat to pause | Cancel the session |
-| **PIP** | A virtual pet on a tiny planet — wanders, stargazes, dances, naps | Play with it |
+| **DAYS** | A minimal countdown: today, time, days remaining, message and a colour-changing progress bar. Edit it from the broker's `/days` page. | Refresh now |
 
 Sound is authored, not sampled — see
 [assets/sounds/CREDITS.md](assets/sounds/CREDITS.md).

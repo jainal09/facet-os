@@ -198,8 +198,10 @@ CONFIG_LV_USE_LODEPNG=y
 # LVGL's image cache defaults to ZERO, which means a file-backed image is
 # re-decoded for every partial draw strip — 15 full PNG decodes per frame with
 # 32-row buffers, so the wallpaper painted band by band like dial-up.
-# 3 MB of cache lives in PSRAM and holds the decoded 480x480 bitmap resident.
-CONFIG_LV_CACHE_DEF_SIZE=3145728
+# 5 MB of cache lives in PSRAM: the decoded 480x480 wallpaper stays resident
+# even while album covers churn through, so a rotation on the lock screen never
+# pays a mid-blackout PNG re-decode.
+CONFIG_LV_CACHE_DEF_SIZE=5242880
 CONFIG_LV_IMAGE_HEADER_CACHE_DEF_CNT=8
 
 #### Bluetooth LE — on-demand Wi-Fi provisioning from a phone (main/ble_prov.c)

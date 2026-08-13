@@ -167,7 +167,7 @@ different times, one of which learned about a later flag.
 | lock screen, screen on | tap | drawer (home), never back to the previous app |
 | lock screen | right hold | toggle always-on (desk clock) |
 | FOCUS, session running | `lv_display_trigger_activity()` each tick | never idles out; dims via brightness instead |
-| FOCUS, session finished | `POMO_DONE_MS` elapsed | lock screen |
+| FOCUS, session finished | — | stays put: DONE holds the screen on (always-on or not) until a tap starts the next session or the user navigates away |
 
 **The invariant everything rests on: the panel only ever sleeps from the lock
 screen.** Nothing enforces it. It holds because auto-lock always moves to
@@ -308,9 +308,43 @@ mysteriously losing minutes, nowhere near the pause that caused it.
 
 The helper is guarded on current state, so a transition that does not apply is a
 no-op. That is what lets the two triggers coexist: a session paused by tap is not
-disturbed by the cube then being set down. `POMO_DONE` ignores taps entirely,
-because the finish screen retires itself and a stray tap would otherwise start a
-whole new session.
+disturbed by the cube then being set down.
+
+**The finish screen is persistent.** It used to retire to the lock screen after
+7 s, which meant the glance that mattered — "did it finish?" — usually found a
+clock. Now DONE shows a green check where the digits were, and after a short
+grace reveals "TAP TO START ANOTHER"; a tap begins a new session with whatever
+duration is at the top, exactly like idle. The grace period exists because a tap
+meant to *pause* can land just as the timer hits zero, and it doubles as the
+hint's reveal delay so the screen never invites a tap it would swallow. The
+panel stays on regardless of the always-on setting — but only while FOCUS is the
+active app, since `pomo_poll()` returns early everywhere else — and the
+inactivity dim still applies, which is what makes indefinitely-on affordable on
+an AMOLED.
+
+## DAYS: remote editing, local-first display
+
+The editor lives at the broker's `/days` page because a native date picker and
+real keyboard are better tools than a 480 px touch panel. The page sends an
+authenticated date and 48-character message to `/countdown`; the server stores
+one small JSON document with temp-file-plus-rename replacement. The public page
+contains no saved state and every state read or write still requires the device
+bearer.
+
+The cube loads its own fixed-size DAYS blob from the app store at boot, so
+opening the tile never waits for the network. A dedicated HTTP client in the
+existing network task refreshes that blob on app open, from either the DAYS
+screen or its CONTROL card, and once every 24 hours (with a 15-minute retry
+after failure). It is deliberately
+separate from Spotify's client because `esp_http_client` handles are mutable and
+must stay task-owned.
+
+The screen recomputes the remaining whole calendar days locally at midnight.
+Civil-date arithmetic avoids the 23/25-hour discontinuity at daylight-saving
+transitions. Progress runs from the date the countdown was saved to the target;
+its bar and headline interpolate from cyan through violet and amber to coral as
+the target approaches. Today, local time, the target, and the saved message all
+remain useful when the broker is unavailable.
 
 ## MUSIC: a remote for whatever is already playing
 
