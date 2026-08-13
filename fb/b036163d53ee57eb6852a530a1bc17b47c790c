@@ -1,0 +1,51 @@
+broker/static/days.html
+  s_57e4cf4a7836a6::t_6d4861156b4693 1-18,20-125
+  s_84909056732f4f::t_5187d716a31958 19
+broker/main.go
+  s_84909056732f4f::t_409f5bc89524be 3-4,19-21
+  s_57e4cf4a7836a6::t_8f7c69b1d21245 152-153
+  s_84909056732f4f::t_d8874a4ce94a71 22
+broker/countdown.go
+  s_84909056732f4f::t_8519ff962f93d6 77,96,99-101,105-116,120,134-137
+  s_57e4cf4a7836a6::t_a8a05f01b5906a 1-76,78-95,97-98,102-104,117-119,121-133,138-139
+broker/README.md
+  s_84909056732f4f::t_78d85db0fd168d 3-4,12,17-19,36-41,52-54,63-64
+broker/Dockerfile
+  s_84909056732f4f::t_394d05ce7a3970 12-14,17-19
+.gitignore
+  s_ccdd329d5d5f6c::t_dd6c8a4615348d 34
+broker/countdown_test.go
+  s_84909056732f4f::t_8519ff962f93d6 1-82
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.22",
+  "base_commit_sha": "fbb036163d53ee57eb6852a530a1bc17b47c790c",
+  "prompts": {},
+  "sessions": {
+    "s_57e4cf4a7836a6": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "79540328-5c96-430d-b4c5-de35687f549e",
+        "model": "claude-fable-5"
+      },
+      "human_author": "Jainal Gosaliya <jainal09gosalia@gmail.com>"
+    },
+    "s_84909056732f4f": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019ffb48-0122-7890-b574-8e1110771bf8",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "Jainal Gosaliya <jainal09gosalia@gmail.com>"
+    },
+    "s_ccdd329d5d5f6c": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "d2df3d37-ef18-494e-92e2-186fbc38ea5c",
+        "model": "claude-fable-5"
+      },
+      "human_author": "Jainal Gosaliya <jainal09gosalia@gmail.com>"
+    }
+  }
+}
