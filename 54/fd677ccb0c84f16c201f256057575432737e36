@@ -1,0 +1,23 @@
+main/main.c
+  s_54cf510ef6c1ff::t_e14c2f33fb7c9c 378-380,6862,6865-6870,6872,6897,6913,7928-7929,7932-7933,7937,8342-8349,8660-8661,8669-8674
+  s_54cf510ef6c1ff::t_5389c8e2a39970 7467-7469
+  s_54cf510ef6c1ff::t_e8e1e5a91158b6 6885-6889
+  s_54cf510ef6c1ff::t_65d310541ac17d 7689-7691,7972-7973,7975
+  s_54cf510ef6c1ff::t_4403587219a338 8675-8676
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.23",
+  "base_commit_sha": "54fd677ccb0c84f16c201f256057575432737e36",
+  "prompts": {},
+  "sessions": {
+    "s_54cf510ef6c1ff": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a03033-aac1-7af2-8caa-c65b85c1592a",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "Jainal Gosaliya <jainal09gosalia@gmail.com>"
+    }
+  }
+}
