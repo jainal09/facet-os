@@ -1,0 +1,25 @@
+main/main.c
+  s_54cf510ef6c1ff::t_e4159a4d88440b 3405-3406
+  s_54cf510ef6c1ff::t_a8174b00ac9cc8 3412
+  s_54cf510ef6c1ff::t_8a08d91e8b9686 269,6997-6999,7013-7014,7025,7453-7458
+  s_54cf510ef6c1ff::t_82ef64558b2055 7459
+docs/ARCHITECTURE.md
+  s_54cf510ef6c1ff::t_8a08d91e8b9686 610-615
+  s_54cf510ef6c1ff::t_e4159a4d88440b 276-278
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.23",
+  "base_commit_sha": "a08f1e145dd528f3d5442f289c11e87eb8f41716",
+  "prompts": {},
+  "sessions": {
+    "s_54cf510ef6c1ff": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a03033-aac1-7af2-8caa-c65b85c1592a",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "Jainal Gosaliya <jainal09gosalia@gmail.com>"
+    }
+  }
+}
