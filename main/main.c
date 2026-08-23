@@ -42,6 +42,7 @@
 #include "esp_lcd_touch.h"
 #include "esp_lcd_panel_ops.h"
 #include "esp_pm.h"
+#include "esp_private/esp_clk.h"
 #include "esp_sntp.h"
 #include "esp_task_wdt.h"
 #include "esp_app_desc.h"
@@ -56,6 +57,7 @@
 /* not pulled in by lvgl.h — needed to invalidate a decoded image whose file
  * changed underneath it (the wallpaper is always the same path) */
 #include "src/misc/cache/instance/lv_image_cache.h"
+#include "src/draw/lv_image_decoder_private.h"
 #include "bsp/esp-bsp.h"
 #include "ml_draw_buf_cfg.h"
 
@@ -73,6 +75,7 @@ static const char *TAG = "funnel";
 #define WALLPAPER_PERIOD_MS (6 * 60 * 60 * 1000)
 
 #define STATS_PERIOD_MS   (15 * 1000)
+#define PERF_PERIOD_MS    (3 * 1000)
 #define BATTERY_PERIOD_MS (2 * 1000)
 #define HTTPS_PERIOD_MS   (45 * 1000)
 #define PET_TICK_MS       (180 * 1000)  /* one stat point of decay (~5 h to empty) */
@@ -133,10 +136,6 @@ static lv_timer_t  *s_app_timer;             /* owned by the running app */
 /* Switching is always deferred to the main task: tearing a screen down from
  * inside one of its own touch callbacks would free the object mid-event. */
 static void app_request(int idx) { s_req_app = idx; }
-/* One-shot: the next app switch animates the outgoing screen sliding off the
- * top. Set only by the swipe-up-home gestures, so every other switch — keys,
- * lock, drawer taps — stays an instant cut. */
-static bool s_app_slide;
 
 /* 0 when not associated. Worth having on the status line: a bulk transfer that
  * stalls for 12 s is a link symptom, and this board can sit on a range extender
@@ -163,6 +162,36 @@ static lv_obj_t *s_scr_pet;
 
 static volatile uint32_t s_refr_count;
 static volatile uint32_t s_last_fps_x10;
+
+/* Short-window renderer telemetry.  The 15-second UI number above is useful
+ * for a quiet status screen, but it hides frame-time spikes and used to count
+ * refresh checks that drew nothing.  These counters are updated only on actual
+ * LVGL render/flush events and reported in one aggregated log line, so the
+ * profiler itself does not turn a smooth gesture into a stream of UART stalls. */
+typedef struct {
+    uint32_t redraws;
+    uint32_t render_us_sum;
+    uint32_t render_us_max;
+    uint32_t interval_count;
+    uint32_t interval_us_sum;
+    uint32_t interval_us_max;
+    uint32_t flushes;
+    uint32_t pixels;
+    uint32_t submit_us_sum;
+    uint32_t submit_us_max;
+    uint32_t wait_count;
+    uint32_t wait_us_sum;
+    uint32_t wait_us_max;
+    uint16_t cpu_mhz_min;
+    uint16_t cpu_mhz_max;
+} render_perf_t;
+
+static portMUX_TYPE s_perf_mux = portMUX_INITIALIZER_UNLOCKED;
+static render_perf_t s_render_perf;
+static int64_t s_perf_render_started_us;
+static int64_t s_perf_last_render_us;
+static int64_t s_perf_flush_started_us;
+static int64_t s_perf_wait_started_us;
 
 /* shared state */
 static volatile int  s_batt_pct = -1;       /* -1 = no battery present */
@@ -253,8 +282,10 @@ static lv_image_dsc_t s_sp_art_dsc;      /* points into s_sp_art_buf + header */
 static bool broker_fetch(const char *path, const char *xname, const char *xval,
                          uint8_t *buf, size_t cap, size_t *out_len);
 
-static lv_obj_t *s_lock_time, *s_lock_date, *s_lock_batt;
-static lv_obj_t *s_lock_sweep, *s_lock_batt_arc;
+static lv_obj_t *s_lock_time, *s_lock_date, *s_lock_meridiem;
+static lv_obj_t *s_lock_batt, *s_lock_charge;
+static lv_obj_t *s_lock_ring, *s_lock_batt_arc;
+static uint8_t s_lock_charge_phase, s_lock_charge_div;
 
 /* Now-playing panel on the lock screen. Hidden unless Spotify actually has an
  * active device, so the screen stays as sparse as it was whenever there is
@@ -262,14 +293,22 @@ static lv_obj_t *s_lock_sweep, *s_lock_batt_arc;
  * wallpaper download and an album-art download must not overlap, because the
  * wallpaper fetch is already the largest transient consumer of internal SRAM on
  * this board and the margin is thinner than it has ever been. */
-static lv_obj_t *s_lock_np, *s_lock_np_art, *s_lock_np_ph, *s_lock_np_track;
+static lv_obj_t *s_lock_np;
+static lv_obj_t *s_lock_np_art, *s_lock_np_ph, *s_lock_np_track;
 static lv_obj_t *s_lock_np_prev, *s_lock_np_play, *s_lock_np_next;
+static lv_obj_t *s_lock_np_drag_img;
+static lv_draw_buf_t *s_lock_np_snapshot;
+static char s_lock_np_snapshot_track[26];
+static uint8_t s_lock_np_snapshot_state;
 static volatile bool s_lock_np_up;
 static uint32_t s_lock_np_bg;    /* last scrim colour, 0 = unset */
 static bool s_lock_np_off;       /* stays dismissed until MUSIC is opened */
 static int64_t s_lock_swipe_at;  /* lock_tap_cb ignores a click in a swipe's shadow */
+static bool s_lock_pointer_down, s_lock_dragging, s_lock_drag_active;
+static bool s_lock_drag_moved;
+static int16_t s_lock_drag_start_x, s_lock_drag_start_y;
+static int16_t s_lock_drag_origin_x, s_lock_drag_x;
 static lv_obj_t *s_lock_rule;    /* divider under the clock; moves with it */
-static int s_sweep_deg;
 
 /* App state store + power state — defined further down, used from above */
 /* Known-network table lives further down with the other credential code, but
@@ -1360,6 +1399,8 @@ static int s_rot_votes;
  * consumer that still needs live orientation when the panel is pinned. */
 static volatile bool s_autorot = true;   /* volatile: LVGL task writes, main reads */
 static volatile bool s_req_autorot_save;
+static volatile bool s_clock_24 = true;
+static volatile bool s_req_clock_save;
 /* The orientation to hold when autorotate is off. Without persisting this, a
  * reboot lands back at native 0 with the switch still reading OFF and — since
  * the calibration button fades out in that state — no way at all to get back. */
@@ -1496,6 +1537,16 @@ static void autorot_save(void) {
     }
 }
 
+static void clock_pref_save(void) {
+    if (ble_prov_nvs_blocked()) return;
+    nvs_handle_t h;
+    if (nvs_open("cfg", NVS_READWRITE, &h) == ESP_OK) {
+        nvs_set_i32(h, "clock24", s_clock_24 ? 1 : 0);
+        nvs_commit(h);
+        nvs_close(h);
+    }
+}
+
 /* Both display-orientation settings, on one handle: this runs once at boot. */
 static void rot_off_load(void) {
     nvs_handle_t h;
@@ -1504,6 +1555,7 @@ static void rot_off_load(void) {
     if (nvs_get_i32(h, "rotcfg", &v) == ESP_OK) s_rot_cfg = (int)(v & 7);
     if (nvs_get_i32(h, "autorot", &v) == ESP_OK) s_autorot = (v != 0);
     if (nvs_get_i32(h, "rothold", &v) == ESP_OK) s_rot_held = (int)(v & 3);
+    if (nvs_get_i32(h, "clock24", &v) == ESP_OK) s_clock_24 = (v != 0);
     nvs_close(h);
 }
 
@@ -1756,6 +1808,26 @@ static void rot_fade_end(void) {
     lv_anim_set_path_cb(&a, lv_anim_path_ease_out);
     lv_anim_start(&a);
     bsp_display_unlock();
+}
+
+/* Navigation is always deferred to the main task, so it can afford a very
+ * short hardware fade-out without blocking touch handling.  The new screen is
+ * then rendered completely at brightness zero and shares rot_fade_end()'s
+ * non-blocking reveal. */
+static bool nav_fade_begin(void) {
+    if (!s_screen_on || s_bright_applied <= 0) return false;
+    if (!ui_lock()) return false;
+
+    int from = s_bright_applied;
+    if (s_rot_fade_to == 0) s_rot_fade_to = from;
+    lv_anim_delete(&s_rot_fade_to, rot_fade_exec);
+    bsp_display_unlock();
+
+    for (int step = 4; step >= 0; step--) {
+        bright_apply((from * step) / 5);
+        if (step) vTaskDelay(pdMS_TO_TICKS(8));
+    }
+    return true;
 }
 
 /* ---------------- screen switching ---------------- */
@@ -2291,7 +2363,6 @@ static void act_rest_cb(lv_event_t *e) { pet_rest(); }
  * rebound to volume, it is the only way home. */
 static void gesture_home_cb(lv_event_t *e) {
     if (lv_indev_get_gesture_dir(lv_indev_active()) == LV_DIR_TOP) {
-        s_app_slide = true;              /* answer the finger with motion */
         app_request(APP_DRAWER);
     }
 }
@@ -2707,14 +2778,152 @@ static void sfx_play(sfx_id_t id) {
  * and shows what it just changed to. Nothing here is decorative.
  */
 
-static void refr_ready_cb(lv_event_t *e) {
-    s_refr_count++;
+static void render_perf_cb(lv_event_t *e) {
+    lv_event_code_t code = lv_event_get_code(e);
+    int64_t now_us = esp_timer_get_time();
+
+    switch (code) {
+    case LV_EVENT_RENDER_START: {
+        uint16_t mhz = (uint16_t)(esp_clk_cpu_freq() / 1000000);
+        s_perf_render_started_us = now_us;
+
+        taskENTER_CRITICAL(&s_perf_mux);
+        if (s_perf_last_render_us) {
+            uint32_t us = (uint32_t)(now_us - s_perf_last_render_us);
+            s_render_perf.interval_count++;
+            s_render_perf.interval_us_sum += us;
+            if (us > s_render_perf.interval_us_max) s_render_perf.interval_us_max = us;
+        }
+        s_perf_last_render_us = now_us;
+        if (!s_render_perf.cpu_mhz_min || mhz < s_render_perf.cpu_mhz_min) {
+            s_render_perf.cpu_mhz_min = mhz;
+        }
+        if (mhz > s_render_perf.cpu_mhz_max) s_render_perf.cpu_mhz_max = mhz;
+        taskEXIT_CRITICAL(&s_perf_mux);
+        break;
+    }
+    case LV_EVENT_RENDER_READY: {
+        uint32_t us = (uint32_t)(now_us - s_perf_render_started_us);
+        taskENTER_CRITICAL(&s_perf_mux);
+        s_render_perf.redraws++;
+        s_render_perf.render_us_sum += us;
+        if (us > s_render_perf.render_us_max) s_render_perf.render_us_max = us;
+        s_refr_count++;
+        taskEXIT_CRITICAL(&s_perf_mux);
+        break;
+    }
+    case LV_EVENT_FLUSH_START: {
+        const lv_area_t *area = lv_event_get_param(e);
+        s_perf_flush_started_us = now_us;
+        taskENTER_CRITICAL(&s_perf_mux);
+        s_render_perf.flushes++;
+        if (area) s_render_perf.pixels += (uint32_t)lv_area_get_size(area);
+        taskEXIT_CRITICAL(&s_perf_mux);
+        break;
+    }
+    case LV_EVENT_FLUSH_FINISH: {
+        uint32_t us = (uint32_t)(now_us - s_perf_flush_started_us);
+        taskENTER_CRITICAL(&s_perf_mux);
+        s_render_perf.submit_us_sum += us;
+        if (us > s_render_perf.submit_us_max) s_render_perf.submit_us_max = us;
+        taskEXIT_CRITICAL(&s_perf_mux);
+        break;
+    }
+    case LV_EVENT_FLUSH_WAIT_START:
+        s_perf_wait_started_us = now_us;
+        break;
+    case LV_EVENT_FLUSH_WAIT_FINISH: {
+        uint32_t us = (uint32_t)(now_us - s_perf_wait_started_us);
+        taskENTER_CRITICAL(&s_perf_mux);
+        s_render_perf.wait_count++;
+        s_render_perf.wait_us_sum += us;
+        if (us > s_render_perf.wait_us_max) s_render_perf.wait_us_max = us;
+        taskEXIT_CRITICAL(&s_perf_mux);
+        break;
+    }
+    default:
+        break;
+    }
+}
+
+static void render_perf_report(int app) {
+    render_perf_t p;
+    taskENTER_CRITICAL(&s_perf_mux);
+    p = s_render_perf;
+    memset(&s_render_perf, 0, sizeof(s_render_perf));
+    s_perf_last_render_us = 0;
+    taskEXIT_CRITICAL(&s_perf_mux);
+
+    if (!p.redraws) return;
+    uint32_t render_avg = p.render_us_sum / p.redraws;
+    uint32_t interval_avg = p.interval_count
+                          ? p.interval_us_sum / p.interval_count : 0;
+    uint32_t wait_avg = p.wait_count ? p.wait_us_sum / p.wait_count : 0;
+    uint32_t submit_avg = p.flushes ? p.submit_us_sum / p.flushes : 0;
+    ESP_LOGI(TAG,
+             "render perf: app=%d cpu=%u-%uMHz redraws=%u interval=%u.%ums avg/%u.%ums max "
+             "render=%u.%ums avg/%u.%ums max flushes=%u pixels/frame=%u "
+             "submit=%u.%ums avg/%u.%ums max wait=%u.%ums avg/%u.%ums max",
+             app, p.cpu_mhz_min, p.cpu_mhz_max, p.redraws,
+             interval_avg / 1000, (interval_avg % 1000) / 100,
+             p.interval_us_max / 1000, (p.interval_us_max % 1000) / 100,
+             render_avg / 1000, (render_avg % 1000) / 100,
+             p.render_us_max / 1000, (p.render_us_max % 1000) / 100,
+             p.flushes, p.pixels / p.redraws,
+             submit_avg / 1000, (submit_avg % 1000) / 100,
+             p.submit_us_max / 1000, (p.submit_us_max % 1000) / 100,
+             wait_avg / 1000, (wait_avg % 1000) / 100,
+             p.wait_us_max / 1000, (p.wait_us_max % 1000) / 100);
+}
+
+/* LVGL setters invalidate even when a value is unchanged.  In a content-sized
+ * card that also means a fresh layout pass for the whole scrolling column. */
+static bool label_set_changed(lv_obj_t *lbl, const char *s) {
+    if (!lbl) return false;
+    const char *cur = lv_label_get_text(lbl);
+    if (cur && strcmp(cur, s) == 0) return false;
+    lv_label_set_text(lbl, s);
+    return true;
+}
+
+static void label_set_fmt_changed(lv_obj_t *lbl, const char *fmt, ...) {
+    if (!lbl) return;
+    char buf[256];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(buf, sizeof(buf), fmt, ap);
+    va_end(ap);
+    label_set_changed(lbl, buf);
+}
+
+static void obj_set_hidden_changed(lv_obj_t *obj, bool hidden) {
+    if (!obj || lv_obj_has_flag(obj, LV_OBJ_FLAG_HIDDEN) == hidden) return;
+    if (hidden) lv_obj_add_flag(obj, LV_OBJ_FLAG_HIDDEN);
+    else        lv_obj_remove_flag(obj, LV_OBJ_FLAG_HIDDEN);
+}
+
+static void bar_set_changed(lv_obj_t *bar, int value) {
+    if (bar && lv_bar_get_value(bar) != value) {
+        lv_bar_set_value(bar, value, LV_ANIM_OFF);
+    }
+}
+
+static void bg_color_set_changed(lv_obj_t *obj, lv_color_t color, lv_part_t part) {
+    if (obj && !lv_color_eq(lv_obj_get_style_bg_color(obj, part), color)) {
+        lv_obj_set_style_bg_color(obj, color, part);
+    }
+}
+
+static void text_color_set_changed(lv_obj_t *obj, lv_color_t color) {
+    if (obj && !lv_color_eq(lv_obj_get_style_text_color(obj, 0), color)) {
+        lv_obj_set_style_text_color(obj, color, 0);
+    }
 }
 
 static lv_obj_t *s_cfg_wall_pool, *s_cfg_wall_state, *s_cfg_wall_bar, *s_cfg_wall_sub;
 static lv_obj_t *s_cfg_days_val;
 static lv_obj_t *s_cfg_rot_val;
-static lv_obj_t *s_cfg_rot_sw, *s_cfg_rot_btn;
+static lv_obj_t *s_cfg_rot_sw, *s_cfg_rot_btn, *s_cfg_time_sw;
 static lv_obj_t *s_cfg_bright_val;
 static lv_obj_t *s_cfg_vol_val;
 static lv_obj_t *s_cfg_batt_bar, *s_cfg_batt_val, *s_cfg_batt_sub;
@@ -2902,6 +3111,12 @@ static void cfg_autorot_cb(lv_event_t *e) {
     ESP_LOGI(TAG, "autorotate %s", s_autorot ? "ON" : "OFF");
 }
 
+static void cfg_clock_cb(lv_event_t *e) {
+    s_clock_24 = lv_obj_has_state(lv_event_get_target(e), LV_STATE_CHECKED);
+    s_req_clock_save = true;
+    ESP_LOGI(TAG, "lock clock %s", s_clock_24 ? "24-hour" : "12-hour");
+}
+
 /* Same shape as cfg_vol_cb and for the same three reasons: the label is only
  * rewritten on release, because resizing it mid-drag re-lays out the card and
  * moves the slider under the finger; the panel write is left to the main loop,
@@ -2950,8 +3165,7 @@ static void cfg_timer_cb(lv_timer_t *t) {
 
     /* ---- wallpaper ---- */
     int have = __builtin_popcount(s_wall_have);
-    lv_label_set_text_fmt(s_cfg_wall_pool, "pool  %d / %d   /   new one every 6 h",
-                          have, WALL_SLOTS);
+    label_set_fmt_changed(s_cfg_wall_pool, "%d / %d wallpapers ready", have, WALL_SLOTS);
 
     /* clear a finished result after a few seconds so the card returns to rest */
     if ((s_dl_state == DL_OK || s_dl_state == DL_FAIL) &&
@@ -2961,56 +3175,56 @@ static void cfg_timer_cb(lv_timer_t *t) {
 
     switch (s_dl_state) {
     case DL_QUERY:
-        lv_obj_remove_flag(s_cfg_wall_bar, LV_OBJ_FLAG_HIDDEN);
-        lv_bar_set_value(s_cfg_wall_bar, 0, LV_ANIM_OFF);
-        lv_obj_set_style_bg_color(s_cfg_wall_bar, lv_color_hex(CFG_ACCENT_WALL),
-                                  LV_PART_INDICATOR);
-        lv_obj_set_style_text_color(s_cfg_wall_state, lv_color_hex(CFG_ACCENT_WALL), 0);
-        lv_label_set_text(s_cfg_wall_state, "asking unsplash...");
+        obj_set_hidden_changed(s_cfg_wall_bar, false);
+        bar_set_changed(s_cfg_wall_bar, 0);
+        bg_color_set_changed(s_cfg_wall_bar, lv_color_hex(CFG_ACCENT_WALL),
+                             LV_PART_INDICATOR);
+        text_color_set_changed(s_cfg_wall_state, lv_color_hex(CFG_ACCENT_WALL));
+        label_set_changed(s_cfg_wall_state, "asking unsplash...");
         break;
     case DL_IMAGE:
-        lv_obj_remove_flag(s_cfg_wall_bar, LV_OBJ_FLAG_HIDDEN);
-        lv_bar_set_value(s_cfg_wall_bar, s_dl_pct, LV_ANIM_OFF);
-        lv_obj_set_style_bg_color(s_cfg_wall_bar, lv_color_hex(CFG_ACCENT_WALL),
-                                  LV_PART_INDICATOR);
-        lv_obj_set_style_text_color(s_cfg_wall_state, lv_color_hex(CFG_ACCENT_WALL), 0);
+        obj_set_hidden_changed(s_cfg_wall_bar, false);
+        bar_set_changed(s_cfg_wall_bar, s_dl_pct);
+        bg_color_set_changed(s_cfg_wall_bar, lv_color_hex(CFG_ACCENT_WALL),
+                             LV_PART_INDICATOR);
+        text_color_set_changed(s_cfg_wall_state, lv_color_hex(CFG_ACCENT_WALL));
         if (s_dl_total > 0) {
-            lv_label_set_text_fmt(s_cfg_wall_state, "downloading  %d%%   %d KB",
+            label_set_fmt_changed(s_cfg_wall_state, "downloading  %d%%   %d KB",
                                   s_dl_pct, s_dl_kb);
         } else {
-            lv_label_set_text_fmt(s_cfg_wall_state, "downloading  %d KB", s_dl_kb);
+            label_set_fmt_changed(s_cfg_wall_state, "downloading  %d KB", s_dl_kb);
         }
         break;
     case DL_OK:
-        lv_obj_remove_flag(s_cfg_wall_bar, LV_OBJ_FLAG_HIDDEN);
-        lv_bar_set_value(s_cfg_wall_bar, 100, LV_ANIM_OFF);
-        lv_obj_set_style_bg_color(s_cfg_wall_bar, lv_color_hex(0x35C759),
-                                  LV_PART_INDICATOR);
-        lv_obj_set_style_text_color(s_cfg_wall_state, lv_color_hex(0x35C759), 0);
-        lv_label_set_text_fmt(s_cfg_wall_state, LV_SYMBOL_OK "  saved  /  %d KB", s_dl_kb);
+        obj_set_hidden_changed(s_cfg_wall_bar, false);
+        bar_set_changed(s_cfg_wall_bar, 100);
+        bg_color_set_changed(s_cfg_wall_bar, lv_color_hex(0x35C759),
+                             LV_PART_INDICATOR);
+        text_color_set_changed(s_cfg_wall_state, lv_color_hex(0x35C759));
+        label_set_fmt_changed(s_cfg_wall_state, LV_SYMBOL_OK "  saved  /  %d KB", s_dl_kb);
         break;
     case DL_FAIL:
-        lv_obj_remove_flag(s_cfg_wall_bar, LV_OBJ_FLAG_HIDDEN);
-        lv_bar_set_value(s_cfg_wall_bar, 100, LV_ANIM_OFF);
-        lv_obj_set_style_bg_color(s_cfg_wall_bar, lv_color_hex(0xFF453A),
-                                  LV_PART_INDICATOR);
-        lv_obj_set_style_text_color(s_cfg_wall_state, lv_color_hex(0xFF453A), 0);
-        lv_label_set_text(s_cfg_wall_state, LV_SYMBOL_WARNING "  fetch failed");
+        obj_set_hidden_changed(s_cfg_wall_bar, false);
+        bar_set_changed(s_cfg_wall_bar, 100);
+        bg_color_set_changed(s_cfg_wall_bar, lv_color_hex(0xFF453A),
+                             LV_PART_INDICATOR);
+        text_color_set_changed(s_cfg_wall_state, lv_color_hex(0xFF453A));
+        label_set_changed(s_cfg_wall_state, LV_SYMBOL_WARNING "  fetch failed");
         break;
     default:
-        lv_obj_add_flag(s_cfg_wall_bar, LV_OBJ_FLAG_HIDDEN);
-        lv_obj_set_style_text_color(s_cfg_wall_state, lv_color_hex(0x64748B), 0);
-        lv_label_set_text(s_cfg_wall_state,
-                          s_req_wallpaper ? "queued..." : "idle");
+        obj_set_hidden_changed(s_cfg_wall_bar, true);
+        text_color_set_changed(s_cfg_wall_state, lv_color_hex(0x64748B));
+        label_set_changed(s_cfg_wall_state,
+                          s_req_wallpaper ? "queued..." : "refreshes every 6 hours");
         break;
     }
 
     if (s_dl_theme[0] && s_dl_state != DL_IDLE) {
-        lv_label_set_text_fmt(s_cfg_wall_sub, "theme  %s", s_dl_theme);
+        label_set_fmt_changed(s_cfg_wall_sub, "theme  %s", s_dl_theme);
     } else if (s_wall_credit[0]) {
-        lv_label_set_text_fmt(s_cfg_wall_sub, "on screen  %s / Unsplash", s_wall_credit);
+        label_set_fmt_changed(s_cfg_wall_sub, "on screen  %s / Unsplash", s_wall_credit);
     } else {
-        lv_label_set_text(s_cfg_wall_sub, "");
+        label_set_changed(s_cfg_wall_sub, "");
     }
 
     /* ---- days ---- */
@@ -3030,12 +3244,10 @@ static void cfg_timer_cb(lv_timer_t *t) {
         snprintf(days_status, sizeof(days_status),
                  "no countdown saved\nset one at the /days web page");
     }
-    if (strcmp(lv_label_get_text(s_cfg_days_val), days_status) != 0) {
-        lv_label_set_text(s_cfg_days_val, days_status);
-    }
+    label_set_changed(s_cfg_days_val, days_status);
 
     /* ---- display ---- */
-    lv_label_set_text_fmt(s_cfg_rot_val,
+    label_set_fmt_changed(s_cfg_rot_val,
                           "orientation  %d deg   %s\ncalibration  %d / %d  %s\naccel  %d  %d  %d",
                           s_rot * 90,
                           !s_imu     ? "no sensor" :
@@ -3058,23 +3270,23 @@ static void cfg_timer_cb(lv_timer_t *t) {
 
     /* ---- battery ---- */
     int pct = s_batt_pct;
-    lv_bar_set_value(s_cfg_batt_bar, pct < 0 ? 100 : pct, LV_ANIM_OFF);
-    lv_obj_set_style_bg_color(s_cfg_batt_bar,
+    bar_set_changed(s_cfg_batt_bar, pct < 0 ? 100 : pct);
+    bg_color_set_changed(s_cfg_batt_bar,
         lv_color_hex(pct < 0 ? 0x4A9EFF
                     : pct >= 50 ? 0x35C759
                     : pct >= 20 ? 0xFFB020 : 0xFF453A), LV_PART_INDICATOR);
     if (pct < 0) {
-        lv_label_set_text(s_cfg_batt_val, "external power");
+        label_set_changed(s_cfg_batt_val, "external power");
     } else {
-        lv_label_set_text_fmt(s_cfg_batt_val, "%d%%   %d mV%s", pct, s_batt_mv,
+        label_set_fmt_changed(s_cfg_batt_val, "%d%%   %d mV%s", pct, s_batt_mv,
                               s_batt_charging ? "   " LV_SYMBOL_CHARGE " charging" : "");
     }
     int drain = battery_drain_mv_h();
     if (drain > 0) {
-        lv_label_set_text_fmt(s_cfg_batt_sub, "drain  %d mV/h   /   %s", drain,
+        label_set_fmt_changed(s_cfg_batt_sub, "drain  %d mV/h   /   %s", drain,
                               s_doze ? "dozing" : "active");
     } else {
-        lv_label_set_text_fmt(s_cfg_batt_sub, "drain  measuring...   /   %s",
+        label_set_fmt_changed(s_cfg_batt_sub, "drain  measuring...   /   %s",
                               s_doze ? "dozing" : "active");
     }
 
@@ -3089,7 +3301,7 @@ static void cfg_timer_cb(lv_timer_t *t) {
          * typographic character would render as an empty box. */
         static const char *ble_st[] = {
             "idle", "waiting for phone", "phone connected", "ready",
-            "credentials taken", "closing", "error",
+            "wi-fi received", "finishing", "could not connect",
         };
         static int  last_key = -1;
         bool act = ble_prov_active();
@@ -3104,55 +3316,78 @@ static void cfg_timer_cb(lv_timer_t *t) {
                                   st <= BLE_PROV_ERR ? ble_st[st] : "idle");
                 lv_obj_remove_flag(s_cfg_ble_code, LV_OBJ_FLAG_HIDDEN);
                 lv_label_set_text(lv_obj_get_child(s_cfg_ble_btn, 0),
-                                  LV_SYMBOL_CLOSE "  Stop pairing");
+                                  LV_SYMBOL_CLOSE "  Stop Wi-Fi setup");
             } else {
                 /* The join happens after the radio is down, so this card is
                  * where the result shows — the phone cannot be told. */
                 lv_label_set_text(s_cfg_ble_val,
                                   s_wifi_torn_down ? "restoring wi-fi" :
-                                  s_wifi_up        ? "wi-fi connected"
-                                                   : "pair to set up wi-fi");
+                                  s_wifi_up        ? "wi-fi connected\n"
+                                                     "tap below to change network"
+                                                   : "tap below to set up wi-fi");
                 lv_obj_add_flag(s_cfg_ble_code, LV_OBJ_FLAG_HIDDEN);
                 lv_label_set_text(lv_obj_get_child(s_cfg_ble_btn, 0),
-                                  LV_SYMBOL_BLUETOOTH "  Pair with phone");
+                                  "Set up / change Wi-Fi");
             }
         }
         /* The code itself changes only per session, but it is cheap to keep in
          * step and it must be right the moment the card is built. */
-        if (act) lv_label_set_text_fmt(s_cfg_ble_code, "CODE  %s", ble_prov_code());
+        if (act) label_set_fmt_changed(s_cfg_ble_code, "CODE  %s", ble_prov_code());
     }
 
     /* ---- network ---- */
     wifi_ap_record_t ap;
-    int rssi = (esp_wifi_sta_get_ap_info(&ap) == ESP_OK) ? ap.rssi : 0;
-    lv_label_set_text_fmt(s_cfg_net_val,
-                          "%s%s\nip  %s\nsignal  %d dBm",
+    bool have_ap = esp_wifi_sta_get_ap_info(&ap) == ESP_OK;
+    int rssi = have_ap ? ap.rssi : 0;
+    const char *strength = !have_ap  ? "-" :
+                           rssi >= -50 ? "excellent" :
+                           rssi >= -60 ? "good" :
+                           rssi >= -70 ? "fair" : "weak";
+    label_set_fmt_changed(s_cfg_net_val,
+                          "%s%s\nip  %s\nsignal  %s",
                           s_wifi_up ? LV_SYMBOL_OK "  " : "",
                           s_wifi_up ? s_ssid : (s_wifi_disabled ? "wi-fi off" : "offline"),
                           s_ip[0] ? s_ip : "-",
-                          rssi);
+                          strength);
 
     /* ---- system ---- */
-    lv_label_set_text_fmt(s_cfg_sys_val,
-                          "uptime  %lu s\n"
+    unsigned long up_s = (unsigned long)(now_ms() / 1000);
+    char uptime[20];
+    if (up_s < 60) {
+        snprintf(uptime, sizeof(uptime), "%lus", up_s);
+    } else if (up_s < 3600) {
+        snprintf(uptime, sizeof(uptime), "%lum %02lus", up_s / 60, up_s % 60);
+    } else if (up_s < 86400) {
+        snprintf(uptime, sizeof(uptime), "%luh %02lum", up_s / 3600,
+                 (up_s / 60) % 60);
+    } else {
+        snprintf(uptime, sizeof(uptime), "%lud %02luh", up_s / 86400,
+                 (up_s / 3600) % 24);
+    }
+    size_t psram_total = heap_caps_get_total_size(MALLOC_CAP_SPIRAM);
+    size_t psram_free = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
+    unsigned psram_used_x10 = (unsigned)(((psram_total - psram_free) * 10) / (1024 * 1024));
+    unsigned psram_total_x10 = (unsigned)((psram_total * 10) / (1024 * 1024));
+    label_set_fmt_changed(s_cfg_sys_val,
+                          "uptime  %s\n"
                           "render  %u.%u fps\n"
-                          "heap  %u KB free  /  %u KB min\n"
-                          "psram  %lu KB free\n"
+                          "memory  %u KB available\n"
+                          "psram  %u.%u MB used  /  %u.%u MB\n"
                           "sdcard  %s  /  %lu log rows\n"
-                          "idf  %s",
-                          (unsigned long)(now_ms() / 1000),
+                          "firmware  %s",
+                          uptime,
                           (unsigned)(s_last_fps_x10 / 10), (unsigned)(s_last_fps_x10 % 10),
                           (unsigned)(hp_free() / 1024),
-                          (unsigned)(hp_min() / 1024),
-                          (unsigned long)(heap_caps_get_free_size(MALLOC_CAP_SPIRAM) / 1024),
+                          psram_used_x10 / 10, psram_used_x10 % 10,
+                          psram_total_x10 / 10, psram_total_x10 % 10,
                           s_sd_ok ? "mounted" : "none", (unsigned long)s_tele_rows,
-                          IDF_VER);
+                          esp_app_get_description()->version);
 
     if (s_log_mtx && xSemaphoreTake(s_log_mtx, pdMS_TO_TICKS(20)) == pdTRUE) {
         char buf[LOG_LINES * sizeof(s_log[0]) + 8];
         snprintf(buf, sizeof(buf), "%s\n%s\n%s", s_log[0], s_log[1], s_log[2]);
         xSemaphoreGive(s_log_mtx);
-        lv_label_set_text(s_cfg_log, buf);
+        label_set_changed(s_cfg_log, buf);
     }
 }
 
@@ -3218,6 +3453,8 @@ static void build_control_app(lv_obj_t *scr) {
 
     s_cfg_rot_sw = cfg_switch(c, "Auto-rotate", CFG_ACCENT_DISP,
                               s_autorot, cfg_autorot_cb);
+    s_cfg_time_sw = cfg_switch(c, "24-hour time", CFG_ACCENT_DISP,
+                               s_clock_24, cfg_clock_cb);
     /* No IMU, no autorotate — a switch that cannot do anything is worse than one
      * that plainly looks dead, which is how MUSIC renders an unavailable
      * transport control too. LV_STATE_DISABLED alone is not enough: the indev
@@ -3256,16 +3493,17 @@ static void build_control_app(lv_obj_t *scr) {
     lv_obj_set_style_bg_color(s_cfg_batt_bar, lv_color_hex(0x1E293B), 0);
     s_cfg_batt_sub = cfg_text(c, 0x64748B);
 
-    /* ---- pair ---- */
-    /* Directly above NETWORK: pairing is what you reach for when the readout
-     * below it says "offline". */
-    c = cfg_card(col, "PAIR", CFG_ACCENT_NET);
+    /* ---- wi-fi setup ---- */
+    /* Directly above NETWORK: setup is what you reach for when the readout
+     * below says "offline" or you want to change networks. BLE is only the
+     * transport, so the user-facing wording names the task instead. */
+    c = cfg_card(col, "WI-FI SETUP", CFG_ACCENT_NET);
     s_cfg_ble_val  = cfg_text(c, 0xC7D2E0);
     s_cfg_ble_code = cfg_text(c, 0x60A5FA);
     lv_obj_set_style_text_font(s_cfg_ble_code, &hud_text_18, 0);
     lv_obj_set_style_text_letter_space(s_cfg_ble_code, 4, 0);
     lv_obj_add_flag(s_cfg_ble_code, LV_OBJ_FLAG_HIDDEN);
-    s_cfg_ble_btn = cfg_button(c, LV_SYMBOL_BLUETOOTH "  Pair with phone",
+    s_cfg_ble_btn = cfg_button(c, "Set up / change Wi-Fi",
                                CFG_ACCENT_NET, cfg_ble_cb);
 
     /* ---- network ---- */
@@ -5364,6 +5602,7 @@ static void sp_art_clear(void) {
 }
 
 static void sp_play_cb(lv_event_t *e) {
+    if (s_lock_np && now_ms() - s_lock_swipe_at < 500) return;
     s_sp_playing = !s_sp_playing;
     if (s_sp_btn_play_lbl) {
         lv_label_set_text(s_sp_btn_play_lbl, s_sp_playing ? LV_SYMBOL_PAUSE : LV_SYMBOL_PLAY);
@@ -5371,11 +5610,13 @@ static void sp_play_cb(lv_event_t *e) {
     sp_send(s_sp_playing ? SP_CMD_PLAY : SP_CMD_PAUSE);
 }
 static void sp_next_cb(lv_event_t *e) {
+    if (s_lock_np && now_ms() - s_lock_swipe_at < 500) return;
     if (s_sp_no_next) return;
     sp_art_clear();
     sp_send(SP_CMD_NEXT);
 }
 static void sp_prev_cb(lv_event_t *e) {
+    if (s_lock_np && now_ms() - s_lock_swipe_at < 500) return;
     if (s_sp_no_prev) return;
     sp_art_clear();
     sp_send(SP_CMD_PREV);
@@ -5390,19 +5631,6 @@ static void sp_shuf_cb(lv_event_t *e) {
  * background rather than a tint on a small glyph — that was too subtle to read.
  * Unavailable is a third state, drawn dimmer than off and not clickable, so a tap
  * cannot fire a request Spotify would reject. */
-/* lv_label_set_text() has no equality short-circuit — set_text_internal() always
- * reallocates, re-measures and invalidates, and on a SCROLL_CIRCULAR label it
- * re-runs the scroll setup. Rewriting unchanged text on a 400 ms tick therefore
- * buys a needless flush every tick, which costs frames and, because continuous
- * flushes are exactly what widens the panel-IO lock race in pitfall #13, makes a
- * freeze more likely rather than merely wasting cycles. */
-static void label_set_changed(lv_obj_t *lbl, const char *s) {
-    if (!lbl) return;
-    const char *cur = lv_label_get_text(lbl);
-    if (cur && strcmp(cur, s) == 0) return;
-    lv_label_set_text(lbl, s);
-}
-
 static void sp_style_toggle(lv_obj_t *lbl, bool on, bool avail,
                             uint32_t accent, const char *glyph)
 {
@@ -5524,7 +5752,7 @@ static void sp_gesture_cb(lv_event_t *e) {
         /* Back before home, matching what the right key does through app_back():
          * from a sub-scene the swipe pops it rather than leaving the app. */
         if (picker) sp_show_devices(false);
-        else        { s_app_slide = true; app_request(APP_DRAWER); }
+        else        app_request(APP_DRAWER);
         return;
     }
     if (picker) return;          /* a flick here belongs to the list */
@@ -5997,6 +6225,12 @@ static void build_music_app(lv_obj_t *scr) {
     s_sp_btn_next = sp_round_btn(scr, LV_SYMBOL_NEXT, &lv_font_montserrat_36,
                                  386, 386, 96, sp_next_cb, 0x334155, 0x141B26);
 
+    /* The title chip is created after the left rail and its edge can overlap the
+     * device circle by a few pixels. Raise the whole button, not just its glyph,
+     * so the ring and icon both remain intact. Do this before the picker is
+     * created, because that full-screen scene must still sit above everything. */
+    if (s_sp_btn_dev) lv_obj_move_foreground(lv_obj_get_parent(s_sp_btn_dev));
+
     /* Device picker, full-screen over the top. Same shape as the Wi-Fi app's
      * sub-scene so the right key pops it the same way. */
     s_sp_devpanel = lv_obj_create(scr);
@@ -6266,13 +6500,11 @@ static void rtc_store(void) {
  * cannot show.
  */
 
-/* A pool, not a single file.
- *
- * One wallpaper meant every unlock showed the same picture until the next
- * download — four images a day, and the device looked static. The card has
- * 32 GB, so keep WALL_SLOTS of them (~400 KB each) and pick a random one every
- * time the lock screen is built. Downloads then only control how fast the pool
- * turns over, not how much variety you see.
+/* A pool, not a single file.  One slot is selected per boot and kept hot in
+ * LVGL's decoded-image cache.  Picking a different compressed 480x480 PNG on
+ * every lock made home -> lock spend 700-950 ms on decode behind a black panel;
+ * changing the picture at boot preserves variety without putting that cost in
+ * a gesture.
  */
 #define UNSPLASH_JSON   WALL_DIR "/rnd.json"
 
@@ -6336,7 +6568,14 @@ static int wall_first_empty(void) {
  * variety quickly, then recycle at random once the pool is complete. */
 static int wall_target_slot(void) {
     int empty = wall_first_empty();
-    return empty >= 0 ? empty : (int)(esp_random() % WALL_SLOTS);
+    if (empty >= 0) return empty;
+
+    /* Do not replace the session's hot wallpaper underneath the cache. */
+    for (int tries = 0; tries < 8; tries++) {
+        int pick = (int)(esp_random() % WALL_SLOTS);
+        if (pick != s_wall_slot || WALL_SLOTS == 1) return pick;
+    }
+    return (s_wall_slot + 1) % WALL_SLOTS;
 }
 
 /* A slot to display, avoiding an immediate repeat of the one already up. */
@@ -6350,6 +6589,34 @@ static int wall_display_slot(void) {
         return pick;
     }
     return wall_first_empty() == 0 ? -1 : __builtin_ctz(s_wall_have);
+}
+
+/* Pay the one unavoidable PNG decode during boot, before input polling starts,
+ * rather than after the user presses Lock.  Closing releases our reference but
+ * leaves the decoded buffer in LVGL's LRU cache. */
+static void wall_cache_prime(void) {
+    if (!s_sd_ok || !lv_display_get_default()) return;
+
+    int slot = wall_display_slot();
+    if (slot < 0) return;
+
+    char lvpath[72];
+    wall_lv(slot, lvpath, sizeof(lvpath));
+    int64_t t0 = esp_timer_get_time();
+    if (!ui_lock()) return;
+
+    lv_image_decoder_dsc_t dsc;
+    lv_result_t res = lv_image_decoder_open(&dsc, lvpath, NULL);
+    if (res == LV_RESULT_OK) lv_image_decoder_close(&dsc);
+    bsp_display_unlock();
+
+    if (res == LV_RESULT_OK) {
+        s_wall_slot = slot;
+        ESP_LOGI(TAG, "wallpaper slot %d primed in %lld ms", slot,
+                 (long long)((esp_timer_get_time() - t0) / 1000));
+    } else {
+        ESP_LOGW(TAG, "wallpaper slot %d failed to prime", slot);
+    }
 }
 
 static esp_err_t dl_evt(esp_http_client_event_t *e) {
@@ -6746,6 +7013,7 @@ static void sd_init(void) {
         store_init_dirs();
         remove(WALLPAPER_OLD);          /* pre-pool single wallpaper */
         wall_scan();
+        wall_cache_prime();
     } else {
         ESP_LOGW(TAG, "no microSD (%s) — telemetry disabled", esp_err_to_name(err));
     }
@@ -6869,8 +7137,9 @@ static int battery_drain_mv_h(void) {
  * minute locks, and once locked the backlight drops after fifteen seconds —
  * unless desk-clock mode is on, which suppresses the sleep entirely.
  *
- * Deliberately text-light: clock, date, battery, nothing else. Desk-clock mode
- * is signalled by the sweep ring turning amber rather than by a status line.
+ * The wallpaper, clock, date and battery gauge are the permanent visual core.
+ * When Spotify is active, the album art and complete transport remain available
+ * in a fixed card below them. Desk-clock mode colours the base ring amber.
  */
 
 static bool s_always_on;
@@ -6886,14 +7155,103 @@ static void time_sync_start(void) {
 
 static int s_lock_slow;
 
-/* Everything that is not the sweep. Called directly when the screen is built
- * so the readouts are correct on the very first frame — a persistent "slow"
- * counter used to make a freshly rebuilt lock screen skip its first update,
- * which is how the placeholder text kept reappearing. */
-/* Driven from lock_refresh() at 1 Hz rather than from a timer of its own. The
- * sweep already invalidates this screen every 40 ms, so the cost that matters is
- * not how often this runs but whether it touches widgets when nothing changed —
- * hence label_set_changed() and the visibility check. */
+/* Called directly when the screen is built so the readouts are correct on the
+ * very first frame — a persistent "slow" counter used to make a freshly rebuilt
+ * lock screen skip its first update, which is how the placeholder text kept
+ * reappearing. */
+/* Driven from lock_refresh() at 1 Hz rather than from a timer of its own. */
+static void lock_clock_layout(void) {
+    if (!s_lock_time) return;
+    int y = s_lock_np_up ? -140 : -18;
+    lv_obj_align(s_lock_time, LV_ALIGN_CENTER, s_clock_24 ? 0 : -22, y);
+    if (s_lock_meridiem && !s_clock_24) {
+        lv_obj_align_to(s_lock_meridiem, s_lock_time, LV_ALIGN_OUT_RIGHT_MID, 8, 2);
+    }
+}
+
+static uint8_t lock_snapshot_state(void) {
+    bool art_ok = s_sp_art_ready && s_sp_art_id[0] &&
+                  strcmp(s_sp_art_id, s_sp_track_id) == 0;
+    return (s_sp_playing ? 1u : 0u) |
+           (art_ok ? 2u : 0u) |
+           (s_sp_no_prev ? 4u : 0u) |
+           (s_sp_no_next ? 8u : 0u);
+}
+
+static void lock_snapshot_clear(void) {
+    if (s_lock_np_drag_img) {
+        lv_obj_add_flag(s_lock_np_drag_img, LV_OBJ_FLAG_HIDDEN);
+        lv_image_set_src(s_lock_np_drag_img, NULL);
+    }
+    if (s_lock_np_snapshot) {
+        lv_draw_buf_destroy(s_lock_np_snapshot);
+        s_lock_np_snapshot = NULL;
+    }
+    s_lock_np_snapshot_track[0] = '\0';
+    s_lock_np_snapshot_state = 0;
+}
+
+/* LVGL can render snapshots into ARGB8888, but its RGB565A8 snapshot target is
+ * intentionally disabled. Convert once after capture instead: the resulting
+ * image keeps the rounded/translucent alpha plane while cutting source traffic
+ * by 25% and using the renderer's dedicated RGB565 + A8 blend path. */
+static lv_draw_buf_t *lock_snapshot_compact(lv_draw_buf_t *src) {
+    if (!src) return NULL;
+    uint32_t w = src->header.w;
+    uint32_t h = src->header.h;
+    lv_draw_buf_t *dst = lv_draw_buf_create(w, h, LV_COLOR_FORMAT_RGB565A8,
+                                            LV_STRIDE_AUTO);
+    if (!dst) return src;                    /* ARGB fallback is still functional */
+
+    uint8_t *alpha = dst->data + dst->header.stride * h;
+    uint32_t alpha_stride = dst->header.stride / 2;
+    for (uint32_t y = 0; y < h; y++) {
+        const lv_color32_t *s = (const lv_color32_t *)(src->data +
+                                                       src->header.stride * y);
+        uint16_t *d = (uint16_t *)(dst->data + dst->header.stride * y);
+        uint8_t *a = alpha + alpha_stride * y;
+        for (uint32_t x = 0; x < w; x++) {
+            d[x] = (uint16_t)(((uint16_t)(s[x].red   >> 3) << 11) |
+                              ((uint16_t)(s[x].green >> 2) << 5)  |
+                              ((uint16_t)(s[x].blue  >> 3)));
+            a[x] = s[x].alpha;
+        }
+    }
+    lv_draw_buf_destroy(src);
+    return dst;
+}
+
+/* Flatten the expensive widget subtree once. During a drag LVGL then has one
+ * alpha bitmap to composite, rather than re-rendering the rounded card, decoded
+ * album art, text and three large controls for every pointer sample. */
+static bool lock_snapshot_capture(void) {
+    if (!s_lock_np || !s_lock_np_drag_img || !s_lock_np_up) return false;
+
+    uint8_t state = lock_snapshot_state();
+    if (s_lock_np_snapshot && state == s_lock_np_snapshot_state &&
+        strcmp(s_lock_np_snapshot_track, s_sp_track_id) == 0) {
+        return true;
+    }
+
+    int64_t started = now_ms();
+    lock_snapshot_clear();
+    lv_obj_update_layout(s_lock_np);
+    lv_draw_buf_t *argb = lv_snapshot_take(s_lock_np, LV_COLOR_FORMAT_ARGB8888);
+    if (!argb) {
+        ESP_LOGE(TAG, "lock: card snapshot allocation/render failed");
+        return false;
+    }
+    s_lock_np_snapshot = lock_snapshot_compact(argb);
+    lv_image_set_src(s_lock_np_drag_img, s_lock_np_snapshot);
+    snprintf(s_lock_np_snapshot_track, sizeof(s_lock_np_snapshot_track), "%s",
+             s_sp_track_id);
+    s_lock_np_snapshot_state = state;
+    ESP_LOGI(TAG, "lock: card snapshot ready in %lld ms (%u bytes PSRAM free)",
+             (long long)(now_ms() - started),
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
+    return true;
+}
+
 static void lock_np_refresh(void) {
     if (!s_lock_np) return;
 
@@ -6914,7 +7272,7 @@ static void lock_np_refresh(void) {
          * clock has nothing below it worth protecting, so it yields. */
         lv_obj_set_style_text_font(s_lock_time,
                                    show ? &hud_clock_48 : &hud_clock_76, 0);
-        lv_obj_align(s_lock_time, LV_ALIGN_CENTER, 0, show ? -140 : -18);
+        lock_clock_layout();
         lv_obj_align(s_lock_date, LV_ALIGN_CENTER, 0, show ? -104 :  46);
         if (s_lock_rule) {
             if (show) lv_obj_add_flag(s_lock_rule, LV_OBJ_FLAG_HIDDEN);
@@ -6940,6 +7298,8 @@ static void lock_np_refresh(void) {
     } else if (!art_ok && !lv_obj_has_flag(s_lock_np_art, LV_OBJ_FLAG_HIDDEN)) {
         lv_obj_add_flag(s_lock_np_art, LV_OBJ_FLAG_HIDDEN);
     }
+
+    if (!s_lock_pointer_down && !s_lock_drag_active) lock_snapshot_capture();
 }
 
 static void lock_refresh(void) {
@@ -6952,77 +7312,248 @@ static void lock_refresh(void) {
     localtime_r(&now, &ti);
 
     if (ti.tm_year < (2024 - 1900)) {
-        lv_label_set_text(s_lock_time, "00:00");
-        lv_label_set_text(s_lock_date, "");
+        bool clock_changed = label_set_changed(s_lock_time, "00:00");
+        label_set_changed(s_lock_date, "");
+        obj_set_hidden_changed(s_lock_meridiem, true);
+        if (clock_changed) lock_clock_layout();
     } else {
-        char hm[8], date[40];
-        strftime(hm, sizeof(hm), "%H:%M", &ti);
+        char hm[8], ap[4], date[40];
+        strftime(hm, sizeof(hm), s_clock_24 ? "%H:%M" : "%I:%M", &ti);
+        if (!s_clock_24 && hm[0] == '0') memmove(hm, hm + 1, strlen(hm));
         strftime(date, sizeof(date), "%a %d %b", &ti);
         for (char *p = date; *p; p++) *p = toupper((unsigned char)*p);
-        lv_label_set_text(s_lock_time, hm);
-        lv_label_set_text(s_lock_date, date);
+        bool clock_changed = label_set_changed(s_lock_time, hm);
+        label_set_changed(s_lock_date, date);
+        if (s_clock_24) {
+            obj_set_hidden_changed(s_lock_meridiem, true);
+        } else {
+            strftime(ap, sizeof(ap), "%p", &ti);
+            label_set_changed(s_lock_meridiem, ap);
+            obj_set_hidden_changed(s_lock_meridiem, false);
+        }
+        if (clock_changed) lock_clock_layout();
         s_time_synced = true;
     }
 
     int pct = s_batt_pct;
+    int arc_end;
+    lv_color_t arc_color;
     if (pct < 0) {
-        lv_label_set_text(s_lock_batt, "EXT PWR");
-        lv_arc_set_bg_angles(s_lock_batt_arc, 130, 380);
-        lv_obj_set_style_arc_color(s_lock_batt_arc, lv_color_hex(0x22D3EE), LV_PART_MAIN);
+        label_set_changed(s_lock_batt, "EXT PWR");
+        arc_end = 360;
+        arc_color = lv_color_hex(s_batt_charging ? 0x22C55E : 0x22D3EE);
     } else {
-        lv_label_set_text_fmt(s_lock_batt, "%s%d%%", s_batt_charging ? "+" : "", pct);
-        lv_arc_set_bg_angles(s_lock_batt_arc, 130, 130 + (250 * pct) / 100);
-        lv_obj_set_style_arc_color(s_lock_batt_arc,
-            lv_color_hex(pct >= 50 ? 0x22D3EE : (pct >= 20 ? 0xF59E0B : 0xEF4444)),
-            LV_PART_MAIN);
+        label_set_fmt_changed(s_lock_batt, "%d%%", pct);
+        /* A real 360-degree gauge: at 100% the ring is actually complete.
+         * The previous 250-degree maximum looked like a partially charged
+         * battery even while the label said 100%. */
+        arc_end = (360 * pct) / 100;
+        arc_color = lv_color_hex(s_batt_charging ? 0x22C55E
+                                  : (pct >= 50 ? 0x22D3EE
+                                     : (pct >= 20 ? 0xF59E0B : 0xEF4444)));
+    }
+    bool charge_was_hidden = s_lock_charge &&
+                             lv_obj_has_flag(s_lock_charge, LV_OBJ_FLAG_HIDDEN);
+    obj_set_hidden_changed(s_lock_charge, !s_batt_charging);
+    if (!s_batt_charging) {
+        s_lock_charge_phase = s_lock_charge_div = 0;
+        if (s_lock_charge &&
+            lv_obj_get_style_text_opa(s_lock_charge, 0) != LV_OPA_COVER) {
+            lv_obj_set_style_text_opa(s_lock_charge, LV_OPA_COVER, 0);
+        }
+    } else if (charge_was_hidden) {
+        s_lock_charge_phase = s_lock_charge_div = 0;
+        lv_obj_set_style_text_opa(s_lock_charge, 96, 0);
+    }
+    if (lv_arc_get_bg_angle_start(s_lock_batt_arc) != 0 ||
+        lv_arc_get_bg_angle_end(s_lock_batt_arc) != arc_end) {
+        lv_arc_set_bg_angles(s_lock_batt_arc, 0, arc_end);
+    }
+    if (!lv_color_eq(lv_obj_get_style_arc_color(s_lock_batt_arc, LV_PART_MAIN),
+                     arc_color)) {
+        lv_obj_set_style_arc_color(s_lock_batt_arc, arc_color, LV_PART_MAIN);
     }
 
-    /* the only desk-clock indicator: amber sweep instead of cyan */
-    if (s_lock_sweep) {
-        lv_obj_set_style_arc_color(s_lock_sweep,
-            lv_color_hex(s_always_on ? 0xF59E0B : 0x22D3EE), LV_PART_MAIN);
+    /* Always-on mode is a persistent amber base ring. It changes only when the
+     * mode changes, rather than spending every frame on decorative motion. */
+    if (s_lock_ring) {
+        lv_color_t ring_color = lv_color_hex(s_always_on ? 0x7A4B0C : 0x123A52);
+        if (!lv_color_eq(lv_obj_get_style_arc_color(s_lock_ring, LV_PART_MAIN),
+                         ring_color)) {
+            lv_obj_set_style_arc_color(s_lock_ring, ring_color, LV_PART_MAIN);
+        }
+    }
+}
+
+/* The live card subtree measured 130-140 ms per translated frame because LVGL
+ * rebuilt its rounded scrim, art, text and controls on every pointer sample.
+ * During a swipe we move the flattened snapshot instead. It is still the whole
+ * card under the finger, but the renderer has one prepared pixel layer to draw. */
+#define LOCK_SWIPE_THRESHOLD 72
+#define LOCK_SWIPE_OFFSCREEN 460
+
+static void lock_drag_apply(int distance) {
+    if (!s_lock_np_drag_img) return;
+    distance = clampi(distance, 0, LOCK_SWIPE_OFFSCREEN);
+    s_lock_drag_x = (int16_t)distance;
+    int x = s_lock_drag_origin_x - distance;
+    if (lv_obj_get_x(s_lock_np_drag_img) != x) lv_obj_set_x(s_lock_np_drag_img, x);
+}
+
+static void lock_drag_anim_exec(void *obj, int32_t distance) {
+    if ((lv_obj_t *)obj == s_lock_np_drag_img) lock_drag_apply((int)distance);
+}
+
+static void lock_drag_restore(lv_anim_t *a) {
+    (void)a;
+    if (s_lock_np_drag_img) lv_obj_add_flag(s_lock_np_drag_img, LV_OBJ_FLAG_HIDDEN);
+    if (s_lock_np && s_lock_np_up && !s_lock_np_off) {
+        lv_obj_remove_flag(s_lock_np, LV_OBJ_FLAG_HIDDEN);
+    }
+    s_lock_drag_active = false;
+    s_lock_drag_x = 0;
+}
+
+static void lock_drag_dismissed(lv_anim_t *a) {
+    (void)a;
+    s_lock_np_off = true;
+    s_lock_drag_active = false;
+    s_lock_drag_x = 0;
+    lock_np_refresh();
+    lock_snapshot_clear();
+    ESP_LOGI(TAG, "lock: now-playing dismissed by swipe");
+}
+
+static bool lock_drag_begin(void) {
+    if (!lock_snapshot_capture() || !s_lock_np_drag_img || !s_lock_np) return false;
+
+    lv_obj_update_layout(s_lock_np);
+    s_lock_drag_origin_x = lv_obj_get_x(s_lock_np);
+    lv_obj_set_pos(s_lock_np_drag_img, s_lock_drag_origin_x, lv_obj_get_y(s_lock_np));
+    lv_obj_move_foreground(s_lock_np_drag_img);
+    lv_obj_remove_flag(s_lock_np_drag_img, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_flag(s_lock_np, LV_OBJ_FLAG_HIDDEN);
+    s_lock_drag_active = true;
+    lock_drag_apply(0);
+    return true;
+}
+
+static void lock_drag_finish(void) {
+    if (!s_lock_np || !s_lock_drag_active || !s_lock_np_drag_img) return;
+
+    bool dismiss = s_lock_drag_x >= LOCK_SWIPE_THRESHOLD;
+    ESP_LOGI(TAG, "lock: right-to-left swipe release distance=%d %s",
+             s_lock_drag_x, dismiss ? "dismiss" : "snap-back");
+
+    lv_anim_t a;
+    lv_anim_init(&a);
+    lv_anim_set_var(&a, s_lock_np_drag_img);
+    lv_anim_set_exec_cb(&a, lock_drag_anim_exec);
+    lv_anim_set_values(&a, s_lock_drag_x,
+                       dismiss ? LOCK_SWIPE_OFFSCREEN : 0);
+    lv_anim_set_duration(&a, dismiss ? 170 : 160);
+    lv_anim_set_path_cb(&a, dismiss ? lv_anim_path_ease_in
+                                     : lv_anim_path_ease_out);
+    lv_anim_set_completed_cb(&a, dismiss ? lock_drag_dismissed
+                                         : lock_drag_restore);
+    if (dismiss) s_lock_swipe_at = now_ms();
+    if (!dismiss && s_lock_drag_x == 0) lock_drag_restore(NULL);
+    else lv_anim_start(&a);
+}
+
+/* Sample the pointer from the 60 Hz lock timer instead of relying on a gesture
+ * event.  Gesture events arrive only after the threshold has already been
+ * crossed, which made the panel feel dead until it suddenly disappeared. */
+static void lock_drag_poll(void) {
+    lv_indev_t *pointer = NULL;
+    for (lv_indev_t *in = lv_indev_get_next(NULL); in; in = lv_indev_get_next(in)) {
+        if (lv_indev_get_type(in) == LV_INDEV_TYPE_POINTER) {
+            pointer = in;
+            break;
+        }
+    }
+    if (!pointer) return;
+
+    bool down = lv_indev_get_state(pointer) == LV_INDEV_STATE_PRESSED;
+    lv_point_t pt;
+    lv_indev_get_point(pointer, &pt);
+
+    if (down && !s_lock_pointer_down) {
+        s_lock_pointer_down = true;
+        s_lock_dragging = false;
+        s_lock_drag_moved = false;
+
+        lv_area_t card;
+        bool on_card = false;
+        if (s_lock_np) {
+            lv_obj_get_coords(s_lock_np, &card);
+            on_card = pt.x >= card.x1 && pt.x <= card.x2 &&
+                      pt.y >= card.y1 && pt.y <= card.y2;
+        }
+        if (s_lock_np_up && s_lock_np && on_card && !s_lock_np_off &&
+            !s_lock_drag_active) {
+            s_lock_dragging = true;
+            s_lock_drag_start_x = pt.x;
+            s_lock_drag_start_y = pt.y;
+            s_lock_drag_x = 0;
+        }
+    }
+
+    if (down && s_lock_dragging) {
+        /* Only a horizontally dominant right-to-left motion commits the drag.
+         * A vertical or rightward start is cancelled, so touching elsewhere or
+         * scrolling a finger around the panel cannot move the card. */
+        int distance = s_lock_drag_start_x - pt.x;
+        int vertical = abs(pt.y - s_lock_drag_start_y);
+        if (!s_lock_drag_active) {
+            if ((distance < -12) || (vertical > 12 && vertical > distance)) {
+                s_lock_dragging = false;
+            } else if (distance >= 4 && distance >= vertical) {
+                if (!lock_drag_begin()) s_lock_dragging = false;
+            }
+        }
+        if (s_lock_drag_active) {
+            if (distance < 0) distance = 0;
+            if (distance > LOCK_SWIPE_OFFSCREEN) distance = LOCK_SWIPE_OFFSCREEN;
+            lock_drag_apply(distance);
+        }
+        if (s_lock_drag_active && distance >= 8) {
+            s_lock_drag_moved = true;
+            s_lock_swipe_at = now_ms();    /* suppress the release's CLICKED */
+        }
+    }
+
+    if (!down && s_lock_pointer_down) {
+        s_lock_pointer_down = false;
+        if (s_lock_drag_active) lock_drag_finish();
+        s_lock_dragging = false;
+        s_lock_drag_moved = false;
     }
 }
 
 static void lock_timer_cb(lv_timer_t *t) {
     if (!s_lock_time || !s_screen_on) return;      /* no flushes while dozing */
 
-    s_sweep_deg = (s_sweep_deg + 3) % 360;
-    lv_arc_set_rotation(s_lock_sweep, s_sweep_deg);
+    lock_drag_poll();
 
-    if (s_lock_slow++ % 25) return;                /* the rest at ~1 Hz */
+    /* The charging cue is a restrained two-second pulse on the 20 px bolt only.
+     * It makes active charging unmistakable without animating the screen-sized
+     * battery ring or invalidating the wallpaper. */
+    if (s_batt_charging && s_lock_charge &&
+        !lv_obj_has_flag(s_lock_charge, LV_OBJ_FLAG_HIDDEN) &&
+        ++s_lock_charge_div >= 4) {
+        s_lock_charge_div = 0;
+        s_lock_charge_phase = (s_lock_charge_phase + 1) & 31;
+        int triangle = s_lock_charge_phase < 16
+                     ? s_lock_charge_phase : 31 - s_lock_charge_phase;
+        lv_opa_t opa = (lv_opa_t)(96 + triangle * 10);
+        if (lv_obj_get_style_text_opa(s_lock_charge, 0) != opa) {
+            lv_obj_set_style_text_opa(s_lock_charge, opa, 0);
+        }
+    }
+
+    if (s_lock_slow++ % 60) return;                /* readouts at ~1 Hz */
     lock_refresh();
-}
-
-/* The panel sits along the bottom edge, so a swipe pushes it away like a phone
- * sheet. It stays away until MUSIC is opened; lock/home cycles are not playback
- * intent and must not resurrect controls the user explicitly dismissed. */
-static void lock_gesture_cb(lv_event_t *e) {
-    lv_indev_t *indev = lv_indev_active();
-    lv_dir_t d = lv_indev_get_gesture_dir(indev);
-
-    /* Claim the touch FIRST. A drag still delivers CLICKED on release and a click
-     * here means "go home", so any early return lets a swipe navigate away —
-     * which is exactly what happened: swipes kept landing as "screen tapped ->
-     * home" with not one gesture logged. A swipe is never a tap. */
-    lv_indev_wait_release(indev);
-    s_lock_swipe_at = now_ms();
-
-    if (!s_sp_have_state || !s_sp_track[0]) return;
-
-    if (s_lock_np_off) return;
-    s_lock_np_off = true;
-
-    /* Repaint HERE, not on the next tick. lock_np_refresh() otherwise runs at
-     * ~1 Hz (s_lock_slow % 25 inside a 40 ms timer), so a dismissal could take a
-     * full second to become visible — which feels precisely like the swipe was
-     * not registered, and invites a second one. That is almost certainly what
-     * "2 out of 6 registers" actually was: not lost gestures, lost feedback.
-     *
-     * Safe to call directly: a gesture callback runs on the LVGL task, so the
-     * lock is already held. */
-    lock_np_refresh();
-    ESP_LOGI(TAG, "lock: now-playing dismissed (dir=%d)", (int)d);
 }
 
 static void lock_tap_cb(lv_event_t *e) {
@@ -7062,6 +7593,7 @@ static void lock_tap_cb(lv_event_t *e) {
  * wake. Without this, tapping a cube on the desk to see the time would drop you
  * into an app. */
 static void lock_np_tap_cb(lv_event_t *e) {
+    if (now_ms() - s_lock_swipe_at < 500) return;
     if (!s_screen_on) {
         s_req_wake = true;
         return;
@@ -7077,9 +7609,17 @@ static void build_lock_screen(lv_obj_t *scr) {
     lv_obj_set_style_bg_color(scr, lv_color_hex(0x000000), 0);
     lv_obj_set_style_bg_grad_dir(scr, LV_GRAD_DIR_NONE, 0);
 
-    /* A different one from the pool on every build, so locking the device
-     * twice in a row does not show the same picture twice. */
-    int slot = s_sd_ok ? wall_display_slot() : -1;
+    /* Reuse the slot primed during boot.  A cache hit is what keeps the panel's
+     * hidden render short enough that the black navigation interval feels like
+     * a transition rather than a freeze. */
+    int slot = -1;
+    if (s_sd_ok) {
+        if (s_wall_slot >= 0 && (s_wall_have & (1u << s_wall_slot))) {
+            slot = s_wall_slot;
+        } else {
+            slot = wall_display_slot();
+        }
+    }
     if (slot >= 0) {
         char lvpath[72];
         wall_lv(slot, lvpath, sizeof(lvpath));
@@ -7114,15 +7654,15 @@ static void build_lock_screen(lv_obj_t *scr) {
     }
 
     /* HUD rings. A 430 px circle on a 480 px square clears the corner radius. */
-    lv_obj_t *ring = lv_arc_create(scr);
-    lv_obj_set_size(ring, 430, 430);
-    lv_obj_center(ring);
-    lv_obj_remove_style(ring, NULL, LV_PART_KNOB);
-    lv_obj_remove_flag(ring, LV_OBJ_FLAG_CLICKABLE);
-    lv_obj_set_style_arc_width(ring, 2, LV_PART_MAIN);
-    lv_obj_set_style_arc_width(ring, 0, LV_PART_INDICATOR);
-    lv_obj_set_style_arc_color(ring, lv_color_hex(0x123A52), LV_PART_MAIN);
-    lv_arc_set_bg_angles(ring, 0, 360);
+    s_lock_ring = lv_arc_create(scr);
+    lv_obj_set_size(s_lock_ring, 430, 430);
+    lv_obj_center(s_lock_ring);
+    lv_obj_remove_style(s_lock_ring, NULL, LV_PART_KNOB);
+    lv_obj_remove_flag(s_lock_ring, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_set_style_arc_width(s_lock_ring, 2, LV_PART_MAIN);
+    lv_obj_set_style_arc_width(s_lock_ring, 0, LV_PART_INDICATOR);
+    lv_obj_set_style_arc_color(s_lock_ring, lv_color_hex(0x123A52), LV_PART_MAIN);
+    lv_arc_set_bg_angles(s_lock_ring, 0, 360);
 
     lv_obj_t *ring2 = lv_arc_create(scr);
     lv_obj_set_size(ring2, 372, 372);
@@ -7142,23 +7682,21 @@ static void build_lock_screen(lv_obj_t *scr) {
     lv_obj_set_style_arc_width(s_lock_batt_arc, 6, LV_PART_MAIN);
     lv_obj_set_style_arc_width(s_lock_batt_arc, 0, LV_PART_INDICATOR);
     lv_obj_set_style_arc_color(s_lock_batt_arc, lv_color_hex(0x22D3EE), LV_PART_MAIN);
-    lv_arc_set_bg_angles(s_lock_batt_arc, 130, 180);
-
-    s_lock_sweep = lv_arc_create(scr);
-    lv_obj_set_size(s_lock_sweep, 402, 402);
-    lv_obj_center(s_lock_sweep);
-    lv_obj_remove_style(s_lock_sweep, NULL, LV_PART_KNOB);
-    lv_obj_remove_flag(s_lock_sweep, LV_OBJ_FLAG_CLICKABLE);
-    lv_obj_set_style_arc_width(s_lock_sweep, 3, LV_PART_MAIN);
-    lv_obj_set_style_arc_width(s_lock_sweep, 0, LV_PART_INDICATOR);
-    lv_obj_set_style_arc_color(s_lock_sweep, lv_color_hex(0x22D3EE), LV_PART_MAIN);
-    lv_arc_set_bg_angles(s_lock_sweep, 0, 42);
+    lv_arc_set_rotation(s_lock_batt_arc, 270);       /* gauge starts at 12 o'clock */
+    lv_arc_set_bg_angles(s_lock_batt_arc, 0, 0);
 
     s_lock_time = lv_label_create(scr);
     lv_obj_set_style_text_font(s_lock_time, &hud_clock_76, 0);
     lv_obj_set_style_text_color(s_lock_time, lv_color_hex(0xE8FBFF), 0);
     lv_label_set_text(s_lock_time, "--:--");
     lv_obj_align(s_lock_time, LV_ALIGN_CENTER, 0, -18);
+
+    s_lock_meridiem = lv_label_create(scr);
+    lv_obj_set_style_text_font(s_lock_meridiem, &hud_text_18, 0);
+    lv_obj_set_style_text_color(s_lock_meridiem, lv_color_hex(0x5FD3EC), 0);
+    lv_obj_set_style_text_letter_space(s_lock_meridiem, 2, 0);
+    lv_label_set_text(s_lock_meridiem, "");
+    lv_obj_add_flag(s_lock_meridiem, LV_OBJ_FLAG_HIDDEN);
 
     s_lock_rule = lv_obj_create(scr);
     lv_obj_remove_style_all(s_lock_rule);
@@ -7184,11 +7722,24 @@ static void build_lock_screen(lv_obj_t *scr) {
     lv_label_set_text(s_lock_batt, "");
     lv_obj_align(s_lock_batt, LV_ALIGN_TOP_MID, 0, TOP_MARGIN + 12);
 
+    s_lock_charge = lv_label_create(scr);
+    lv_obj_set_style_text_font(s_lock_charge, &lv_font_montserrat_20, 0);
+    lv_obj_set_style_text_color(s_lock_charge, lv_color_hex(0x22C55E), 0);
+    lv_label_set_text(s_lock_charge, LV_SYMBOL_CHARGE);
+    lv_obj_align(s_lock_charge, LV_ALIGN_TOP_MID, 52, TOP_MARGIN + 13);
+    lv_obj_add_flag(s_lock_charge, LV_OBJ_FLAG_HIDDEN);
+
     lv_obj_add_flag(scr, LV_OBJ_FLAG_CLICKABLE);
     lv_obj_add_event_cb(scr, lock_tap_cb, LV_EVENT_CLICKED, NULL);
-    lv_obj_add_event_cb(scr, lock_gesture_cb, LV_EVENT_GESTURE, NULL);
 
     s_lock_slow = 0;
+    s_lock_pointer_down = false;
+    s_lock_dragging = false;
+    s_lock_drag_active = false;
+    s_lock_drag_moved = false;
+    s_lock_charge_phase = s_lock_charge_div = 0;
+    s_lock_drag_start_x = s_lock_drag_start_y = 0;
+    s_lock_drag_origin_x = s_lock_drag_x = 0;
     lock_refresh();                       /* correct on the first frame */
     /* Now-playing panel, in the band between the date and the inner ring —
      * y 326..436, the only clear space on this screen. It sits on a scrim because
@@ -7245,7 +7796,14 @@ static void build_lock_screen(lv_obj_t *scr) {
     s_lock_np_next = sp_round_btn(s_lock_np, LV_SYMBOL_NEXT, &lv_font_montserrat_36,
                                   300, 172, 76, sp_next_cb, 0x334155, 0x141B26);
 
-    s_app_timer = lv_timer_create(lock_timer_cb, 40, NULL);   /* drives the sweep */
+    /* Hidden until a horizontal drag commits. This sibling displays the
+     * flattened card while the live, interactive subtree is temporarily hidden. */
+    s_lock_np_drag_img = lv_image_create(scr);
+    lv_obj_remove_flag(s_lock_np_drag_img, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_flag(s_lock_np_drag_img, LV_OBJ_FLAG_HIDDEN);
+
+    lock_np_refresh();
+    s_app_timer = lv_timer_create(lock_timer_cb, 16, NULL);   /* pointer sampling */
 }
 
 static void lock_engage(void) {
@@ -7264,7 +7822,7 @@ static void always_on_toggle(void) {
     ESP_LOGI(TAG, "always-on %s", s_always_on ? "ON" : "OFF");
 
     if (!ui_lock()) return;
-    lock_refresh();                          /* recolours the sweep ring */
+    lock_refresh();                          /* recolours the base ring */
 
     lv_obj_t *toast = lv_label_create(lv_screen_active());
     lv_obj_set_style_text_font(toast, &hud_text_18, 0);
@@ -7351,9 +7909,11 @@ static void app_action(void) {
 
 /* ---------------- app switching ---------------- */
 
-/* Runs on the main task with the LVGL lock held. The outgoing screen is freed
- * by lv_screen_load_anim(auto_del), so only one app's widgets exist at a time
- * (plus the incoming one during the 120 ms cross-fade). */
+/* Runs on the main task.  Navigation is rendered with the AMOLED at brightness
+ * zero, then revealed through the panel's brightness register.  A software
+ * slide has to redraw both 480x480 screens through 32-row buffers and exposes
+ * those bands; the hardware fade makes the same partial pipeline atomic to the
+ * eye while retaining the one-screen-at-a-time memory bound. */
 static void app_open(int idx) {
     static int64_t last_switch;
     int64_t t0 = esp_timer_get_time();
@@ -7369,7 +7929,11 @@ static void app_open(int idx) {
         s_req_ble_off = true;
     }
 
-    if (!ui_lock()) return;
+    bool reveal = nav_fade_begin();
+    if (!ui_lock()) {
+        if (reveal) rot_fade_end();
+        return;
+    }
 
     /* let the outgoing app flush its state before its widgets disappear */
     if (s_app >= 0 && s_app < APP_COUNT && s_apps[s_app].save) {
@@ -7384,7 +7948,8 @@ static void app_open(int idx) {
     s_cfg_wall_bar = NULL; s_cfg_wall_sub = NULL;
     s_cfg_days_val = NULL;
     s_cfg_rot_val = NULL; s_cfg_vol_val = NULL;
-    s_cfg_rot_sw = NULL; s_cfg_rot_btn = NULL; s_cfg_bright_val = NULL;
+    s_cfg_rot_sw = NULL; s_cfg_rot_btn = NULL; s_cfg_time_sw = NULL;
+    s_cfg_bright_val = NULL;
     s_cfg_batt_bar = NULL;
     s_cfg_batt_val = NULL; s_cfg_batt_sub = NULL;
     s_cfg_net_val = NULL; s_cfg_sys_val = NULL; s_cfg_log = NULL;
@@ -7411,39 +7976,34 @@ static void app_open(int idx) {
     s_days_unit = NULL; s_days_bar = NULL; s_days_start = NULL;
     s_days_target = NULL; s_days_card = NULL; s_days_text = NULL;
     s_days_sync = NULL;
-    s_lock_time = NULL; s_lock_date = NULL; s_lock_batt = NULL;
-    s_lock_sweep = NULL; s_lock_batt_arc = NULL;
-    s_lock_np = NULL; s_lock_np_art = NULL; s_lock_np_ph = NULL;
+    lock_snapshot_clear();
+    s_lock_time = NULL; s_lock_date = NULL; s_lock_meridiem = NULL;
+    s_lock_batt = NULL;
+    s_lock_charge = NULL; s_lock_ring = NULL; s_lock_batt_arc = NULL;
+    s_lock_np = NULL;
+    s_lock_np_art = NULL; s_lock_np_ph = NULL;
     s_lock_np_track = NULL; s_lock_np_prev = NULL; s_lock_np_play = NULL;
     s_lock_np_next = NULL;
+    s_lock_np_drag_img = NULL;
     /* Must clear, not just null: wall_service() runs on the network task and would
      * otherwise keep suppressing wallpaper downloads forever after the lock screen
      * is torn down, with nothing left on screen to explain why. */
     s_lock_np_up = false;
     s_lock_np_bg = 0;
+    s_lock_pointer_down = false;
+    s_lock_dragging = false;
+    s_lock_drag_active = false;
+    s_lock_drag_moved = false;
+    s_lock_charge_phase = s_lock_charge_div = 0;
+    s_lock_drag_origin_x = s_lock_drag_x = 0;
     s_lock_rule = NULL;
 
-    /* Free the outgoing app BEFORE building the next one. A cross-fade with
-     * auto_del keeps both alive at once, and that peak drove internal heap to
-     * 16 bytes, which wedged the flush path and starved the idle task. */
+    /* Free the outgoing app BEFORE building the next one. Keeping both alive
+     * once drove internal heap to 16 bytes, wedging the flush path. */
     lv_obj_t *old_scr = lv_screen_active();
     lv_obj_t *scr = lv_obj_create(NULL);
-    /* The swipe-up switch animates the old screen sliding off the top with the
-     * new one already built beneath — which keeps both trees alive for the
-     * 220 ms. That is the pattern the comment above forbids, re-validated
-     * deliberately: the 16-byte incident predates the LVGL DIRAM win, and the
-     * floor is ~80 KB now against ~5 KB per screen. The "opened ..." line below
-     * logs free heap on every switch, so a regression here is measured rather
-     * than felt. Everything else keeps the free-first order.
-     *
-     * Timers and widget pointers were already nulled above, so a stray tap into
-     * the outgoing screen during the slide finds guards, not dangling state. */
-    bool slide = s_app_slide && old_scr && old_scr != scr;
-    s_app_slide = false;
-    if (!slide) {
-        lv_screen_load(scr);
-        if (old_scr && old_scr != scr) lv_obj_delete(old_scr);
-    }
+    lv_screen_load(scr);
+    if (old_scr && old_scr != scr) lv_obj_delete(old_scr);
 
     if (app_enabled(idx))             s_apps[idx].build(scr);
     else if (idx == APP_LOCK)         build_lock_screen(scr);
@@ -7457,9 +8017,13 @@ static void app_open(int idx) {
         ESP_LOGI(TAG, "lock: now-playing dismissal cleared by MUSIC");
     }
 
-    if (slide) lv_screen_load_anim(scr, LV_SCR_LOAD_ANIM_OUT_TOP, 220, 0, true);
+    /* Force all 15 strips through the panel while it is black.  The first
+     * brightness command in the reveal drains the final queued DMA transfer,
+     * so no half-painted frame can become visible. */
+    lv_refr_now(NULL);
 
     bsp_display_unlock();
+    if (reveal) rot_fade_end();
 
     ESP_LOGI(TAG, "opened %s in %lld ms (internal free %u)",
              (idx >= 0 && idx < APP_COUNT) ? s_apps[idx].name
@@ -7560,7 +8124,10 @@ void app_main(void) {
         .tear_avoid_mode = ESP_LV_ADAPTER_TEAR_AVOID_MODE_NONE,
         .touch_flags = { .swap_xy = 1, .mirror_x = 0, .mirror_y = 1 },
     };
-    disp_cfg.lv_adapter_cfg.stack_in_psram = true;
+    /* Rendering is the latency-critical path.  Keeping the LVGL worker's hot
+     * call frames in 40 MHz PSRAM made every large redraw pay external-memory
+     * latency; the 8 KB internal stack is a better use of the recovered SRAM. */
+    disp_cfg.lv_adapter_cfg.stack_in_psram = false;
 
     lv_display_t *disp = bsp_display_start_with_config(&disp_cfg);
     if (!disp) {
@@ -7571,7 +8138,7 @@ void app_main(void) {
         log_mem("display-up");
 
         if (ui_lock()) {
-            lv_display_add_event_cb(disp, refr_ready_cb, LV_EVENT_REFR_READY, NULL);
+            lv_display_add_event_cb(disp, render_perf_cb, LV_EVENT_ALL, NULL);
 
             /* LVGL only emits a gesture once the finger has travelled 50 px AND
              * held a velocity of 3 — defaults tuned for a phone. On this panel
@@ -7629,7 +8196,7 @@ void app_main(void) {
         xTaskCreate(net_task, "net", 8192, NULL, 5, NULL);
     }
 
-    int64_t last_stats = now_ms();
+    int64_t last_stats = now_ms(), last_perf = now_ms();
     int64_t last_batt = 0, last_imu = 0, last_pet = now_ms(), last_pet_save = now_ms();
     int64_t last_tele = now_ms(), last_rejoin = now_ms(), last_sp_poll = 0;
     uint32_t last_refr = 0;
@@ -7812,6 +8379,11 @@ void app_main(void) {
         if (s_req_autorot_save && !ble_prov_nvs_blocked()) {
             s_req_autorot_save = false;
             autorot_save();
+        }
+
+        if (s_req_clock_save && !ble_prov_nvs_blocked()) {
+            s_req_clock_save = false;
+            clock_pref_save();
         }
 
         if (s_req_ble_on) {
@@ -8028,6 +8600,11 @@ void app_main(void) {
                 s_batt_mv_first = s_batt_mv;
                 s_batt_t_first = now_ms();
             }
+        }
+
+        if (t - last_perf >= PERF_PERIOD_MS) {
+            last_perf = t;
+            render_perf_report(s_app);
         }
 
         if (t - last_stats >= STATS_PERIOD_MS) {

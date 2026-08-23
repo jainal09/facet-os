@@ -16,7 +16,8 @@ CONFIG_SPIRAM_MODE_OCT=y
 # you get "boot: Loaded app from partition" and then nothing at all, no crash
 # dump, and esptool can't sync either. Only a true power cycle clears it.
 # We don't need the bandwidth: draw buffers live in internal SRAM, and PSRAM
-# only holds LVGL objects, TLS buffers and the LVGL task stack.
+# only holds LVGL objects and TLS buffers.  The latency-critical LVGL task stack
+# is kept in internal SRAM by app_main().
 CONFIG_SPIRAM_SPEED_40M=y
 CONFIG_SPIRAM_USE_MALLOC=y
 CONFIG_SPIRAM_TRY_ALLOCATE_WIFI_LWIP=y
@@ -60,6 +61,9 @@ CONFIG_LV_OBJ_STYLE_CACHE=y
 # 2 draw units (vendor value): 1 unit + LV_USE_OS stalls LVGL9 render dispatch
 # after the first frame (measured fps=0.0 across all 1-unit builds)
 CONFIG_LV_DRAW_SW_DRAW_UNIT_CNT=2
+# Drawer tiles use an 18 px glow around a 34 px radius.  Cache that 52 px
+# corner mask (2.7 KB) instead of re-blurring it for every redraw/transition.
+CONFIG_LV_DRAW_SW_SHADOW_CACHE_SIZE=52
 # Measured 2026-08-12: this flag copies LVGL's hot drawing code into internal RAM
 # and costs 104,880 bytes of DIRAM to do it — 40% of the entire pool, and more
 # than four times what the Wi-Fi TX-buffer trim won. Turning it off moves that
@@ -203,6 +207,10 @@ CONFIG_LV_USE_LODEPNG=y
 # pays a mid-blackout PNG re-decode.
 CONFIG_LV_CACHE_DEF_SIZE=5242880
 CONFIG_LV_IMAGE_HEADER_CACHE_DEF_CNT=8
+# Lock-screen playback is flattened once into a PSRAM-backed ARGB snapshot while
+# dragging. Moving that single layer is substantially cheaper than rebuilding
+# the art/text/button subtree at every pointer sample.
+CONFIG_LV_USE_SNAPSHOT=y
 
 #### Bluetooth LE — on-demand Wi-Fi provisioning from a phone (main/ble_prov.c)
 # BLE and Wi-Fi cannot both be initialised on this board: BLE costs 23-26.5 KB
