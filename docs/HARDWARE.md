@@ -426,6 +426,14 @@ are rebound to volume.
   warns "the charger is enabled when an adapter is inserted". Driving a charge
   limit from CV rather than from the enable bit is the robust choice, and even
   CV is re-checked every poll rather than written once at boot.
+- **`reg 0x01` lags a CV change — do not read charge state straight after
+  writing `0x64`.** Raising the cap to start a top-up and then testing
+  bits[2:0] on the next poll returned the *previous* cycle's `100` (done), which
+  looked exactly like "the charge finished instantly" and cancelled the request
+  0.8 s after it was armed. Wait for `charging` (bits[6:5] == 01) to actually
+  appear before believing a subsequent `done`. Raising the cap does reliably
+  restart charging, including from a latched done state — verified on hardware
+  going 4.0 V -> 4.2 V at 4177 mV.
 - **`isVbusIn()` is a trap; use `0x00` bit 5.** `XPowersLib`'s `isVbusIn()` ANDs
   VBUS-good with *not in VINDPM*, so a drooping supply reports "unplugged" while
   plugged, and its `getVbusVoltage()` then returns 0. Bit 5 alone is the honest
@@ -459,7 +467,7 @@ are rebound to volume.
 - **A charge cap makes the gauge worse, and the one-shot is the cure.** Capped at
   4.1 V the cell never reaches a full charge, so the coulomb counter never gets
   the complete cycle it needs to re-learn and the voltage cross-check above stops
-  being a fallback — it becomes the primary reading. CONTROL's "CHARGE FULL ONCE"
+  being a fallback — it becomes the primary reading. CONTROL's "CHARGE TO 100% ONCE"
   exists as much for the gauge as for the trip you are packing for.
 
 ## 7b. Power management and idle drain

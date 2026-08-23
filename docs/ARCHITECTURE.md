@@ -781,8 +781,26 @@ show an improvement over an hour.
 
 A cube on a desk is a cell held at 4.2 V forever, which is the fastest way to
 wear one out — roughly 300-500 cycles there against 1200-2000 at 4.0 V. CONTROL
-offers three charge targets: **full 4.2 V**, **balanced 4.1 V** (the default,
-~85-90%) and **max lifespan 4.0 V** (~75-80%).
+offers three charge targets, stated to the user as **100%**, **85%** (the
+default) and **75%** — internally 4.2 V, 4.1 V and 4.0 V.
+
+The control reads **"charge limit  85%"** with a one-line reason under it
+("stops early, less battery wear"). Three labelling attempts got there, and the
+failures are the useful part:
+
+- **"balanced 4.1V"** — asks the reader to learn a mapping before the setting
+  means anything. Volts are an implementation detail; keep them in the log line.
+- **"charge to 85%"** — states a number without saying it is a *ceiling* or why
+  anyone would want one. A setting that needs a manual is mislabelled.
+- The slider originally ran Full→Lifespan, so **dragging right lowered the
+  target**. Right-means-more is not negotiable on a control sitting under a
+  percentage; `chg_mode_to_slider()` inverts at the UI boundary rather than
+  renumbering the enum, which would change the meaning of a stored `chgmode`.
+
+Also: `cfg_slider` adds 18 px of invisible hit area below its track and
+`cfg_button` adds 6 px above itself, which is more than the card's 14 px gutter —
+finishing a drag near the bottom of the slider fired the button underneath. Any
+button placed under a slider in a card needs an extra `margin_top`.
 
 **The PMU does all of it.** Facet writes one register — the CV target, `0x64` —
 and the AXP2101 runs the cycle itself: charge, terminate, open BATFET so the
@@ -805,7 +823,7 @@ Three consequences worth knowing:
   discharge, and under bypass the only drain is self-discharge. The setting takes
   effect from the next charge onward.
 
-"CHARGE FULL ONCE" arms a single 4.2 V cycle that reverts itself at charge-done
+"CHARGE TO 100% ONCE" arms a single 4.2 V cycle that reverts itself at charge-done
 and survives a reboot. It is also the only way to re-calibrate the fuel gauge,
 which needs a complete cycle it otherwise never gets.
 

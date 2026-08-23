@@ -222,6 +222,8 @@ static volatile bool s_screen_on = true;
 typedef enum { CHG_FULL = 0, CHG_BALANCED = 1, CHG_LIFESPAN = 2 } chg_mode_t;
 static volatile int  s_chg_mode = CHG_BALANCED;
 static volatile bool s_chg_once;            /* one-shot: charge to full this once */
+static volatile bool s_chg_once_seen;       /* current flowed since it was armed */
+static volatile int  s_chg_once_idle;       /* polls at "done" without charging */
 static volatile bool s_req_chg_save;
 
 /* Read from the PMU status bytes battery_poll() already fetches. s_vbus is
@@ -2196,15 +2198,20 @@ static void scene_tap_cb(lv_event_t *e) {
     }
 }
 
-/* swipe: up = jump, left/right = dash, down = home */
+static bool home_gesture_from_bottom(lv_indev_t *indev);
+
+/* swipe: up = jump, left/right = dash; bottom-edge up = home */
 static void pet_gesture_cb(lv_event_t *e) {
-    switch (lv_indev_get_gesture_dir(lv_indev_active())) {
-    case LV_DIR_BOTTOM:
-        app_request(APP_DRAWER);
-        break;
+    lv_indev_t *indev = lv_indev_active();
+    switch (lv_indev_get_gesture_dir(indev)) {
     case LV_DIR_TOP:
-        set_act(ACT_JUMP, 34);
-        say("hop!");
+        if (home_gesture_from_bottom(indev)) {
+            lv_indev_wait_release(indev);
+            app_request(APP_DRAWER);
+        } else {
+            set_act(ACT_JUMP, 34);
+            say("hop!");
+        }
         break;
     case LV_DIR_LEFT:
         walk_to(WALK_MIN_X);
@@ -2463,13 +2470,34 @@ static void act_feed_cb(lv_event_t *e) { pet_feed(); }
 static void act_play_cb(lv_event_t *e) { pet_play(); }
 static void act_rest_cb(lv_event_t *e) { pet_rest(); }
 
-/* swipe down on a sub-screen returns home */
-/* Swipe UP from the bottom edge, like a phone. LV_DIR_TOP is the direction the
- * finger travelled, not the edge it started from. Shared by every app screen, so
+/* The home gesture must originate in the bottom 72 px. LVGL reports only the
+ * direction once a gesture is recognised, so an upward drag from either side
+ * otherwise looks identical to an iPhone-style bottom-edge swipe. Capture the
+ * press globally on the pointer indev; that works even when the first touched
+ * object is a slider, button, or scrolling card rather than the screen itself. */
+#define HOME_GESTURE_EDGE_Y (480 - 72)
+static int s_touch_start_y = -1;
+
+static void touch_origin_cb(lv_event_t *e) {
+    lv_indev_t *indev = lv_event_get_user_data(e);
+    if (!indev) return;
+    lv_point_t point;
+    lv_indev_get_point(indev, &point);
+    s_touch_start_y = point.y;
+}
+
+static bool home_gesture_from_bottom(lv_indev_t *indev) {
+    return indev && s_touch_start_y >= HOME_GESTURE_EDGE_Y &&
+           lv_indev_get_gesture_dir(indev) == LV_DIR_TOP;
+}
+
+/* Swipe UP from the bottom edge, like a phone. Shared by every app screen, so
  * home is one gesture everywhere — and in MUSIC, where all three keys are
  * rebound to volume, it is the only way home. */
 static void gesture_home_cb(lv_event_t *e) {
-    if (lv_indev_get_gesture_dir(lv_indev_active()) == LV_DIR_TOP) {
+    lv_indev_t *indev = lv_indev_active();
+    if (home_gesture_from_bottom(indev)) {
+        lv_indev_wait_release(indev);
         app_request(APP_DRAWER);
     }
 }
@@ -3034,7 +3062,7 @@ static lv_obj_t *s_cfg_rot_sw, *s_cfg_rot_btn, *s_cfg_time_sw;
 static lv_obj_t *s_cfg_bright_val;
 static lv_obj_t *s_cfg_vol_val;
 static lv_obj_t *s_cfg_batt_bar, *s_cfg_batt_val, *s_cfg_batt_sub;
-static lv_obj_t *s_cfg_care_val, *s_cfg_care_sld, *s_cfg_care_btn;
+static lv_obj_t *s_cfg_care_val, *s_cfg_care_sub, *s_cfg_care_sld, *s_cfg_care_btn;
 static lv_obj_t *s_cfg_net_val;
 static lv_obj_t *s_cfg_ble_val;
 static lv_obj_t *s_cfg_ble_code;
@@ -3225,28 +3253,58 @@ static void cfg_clock_cb(lv_event_t *e) {
     ESP_LOGI(TAG, "lock clock %s", s_clock_24 ? "24-hour" : "12-hour");
 }
 
-static const char *chg_mode_name(int mode) {
+/* Stated as a percentage, not as volts and not as a mode name. The percentage
+ * is the number printed two lines above it in this same card, and the one every
+ * other device states; "balanced 4.1V" asks the reader to learn a mapping first.
+ * Volts are what we actually write — the percentages are the standard Li-ion
+ * curve, and they line up with what the readout shows once a capped cell
+ * settles (4.10 V reads ~87%, 4.00 V ~77%). */
+static int chg_mode_pct(int mode) {
     switch (mode) {
-        case CHG_LIFESPAN: return "max lifespan  4.0V";
-        case CHG_BALANCED: return "balanced  4.1V";
-        default:           return "full  4.2V";
+        case CHG_LIFESPAN: return 75;
+        case CHG_BALANCED: return 85;
+        default:           return 100;
     }
 }
+
+/* One line saying what the limit buys you. A bare "85%" states a number without
+ * saying it is a ceiling or why anyone would want one; the percentage alone
+ * needed a manual, which is the definition of the wrong label. Kept under ~34
+ * characters so it stays one montserrat_20 line — cfg_text wraps, and a label
+ * that grows a second line re-lays out the card under the finger. */
+static const char *chg_mode_hint(int mode) {
+    switch (mode) {
+        case CHG_LIFESPAN: return "stops earliest, least wear";
+        case CHG_BALANCED: return "stops early, less battery wear";
+        default:           return "no limit, most battery wear";
+    }
+}
+
+/* The enum ascends by how protective the mode is; the slider has to ascend by
+ * how much charge you get, because right-means-more is not negotiable on a
+ * control that sits directly under a percentage. Converted at the UI boundary
+ * rather than by renumbering the enum, which would silently change the meaning
+ * of an already-stored "chgmode". */
+static int chg_mode_to_slider(int mode) { return CHG_LIFESPAN - mode; }
+static int chg_slider_to_mode(int val)  { return CHG_LIFESPAN - val; }
 
 /* Three stops on a slider rather than three buttons: it inherits the 76 px
  * touch sizing and the widened hit area that this panel needs, and a row of
  * buttons would have to fight the card's flex column for width. Label on
  * release only, for the reason cfg_vol_cb spells out above. */
 static void cfg_care_cb(lv_event_t *e) {
-    s_chg_mode = clampi((int)lv_slider_get_value(lv_event_get_target(e)),
-                        CHG_FULL, CHG_LIFESPAN);
+    int val = clampi((int)lv_slider_get_value(lv_event_get_target(e)),
+                     CHG_FULL, CHG_LIFESPAN);
+    s_chg_mode = chg_slider_to_mode(val);
     if (lv_event_get_code(e) != LV_EVENT_RELEASED) return;
 
     if (s_cfg_care_val) {
-        lv_label_set_text_fmt(s_cfg_care_val, "charge to  %s", chg_mode_name(s_chg_mode));
+        lv_label_set_text_fmt(s_cfg_care_val, "charge limit  %d%%",
+                              chg_mode_pct(s_chg_mode));
     }
+    if (s_cfg_care_sub) lv_label_set_text(s_cfg_care_sub, chg_mode_hint(s_chg_mode));
     s_req_chg_save = true;
-    ESP_LOGI(TAG, "battery care -> %s", chg_mode_name(s_chg_mode));
+    ESP_LOGI(TAG, "battery care -> charge to %d%%", chg_mode_pct(s_chg_mode));
 }
 
 /* Arms a single full charge, which reverts itself at charge-done. It is also
@@ -3254,6 +3312,8 @@ static void cfg_care_cb(lv_event_t *e) {
  * across a complete cycle, and a capped cube never gives it one. */
 static void cfg_care_once_cb(lv_event_t *e) {
     s_chg_once = !s_chg_once;
+    s_chg_once_seen = false;
+    s_chg_once_idle = 0;
     s_req_chg_save = true;
     ESP_LOGI(TAG, "one-shot full charge %s", s_chg_once ? "ARMED" : "cancelled");
 }
@@ -3437,10 +3497,18 @@ static void cfg_timer_cb(lv_timer_t *t) {
     }
     if (s_cfg_care_val) {
         if (s_chg_once) {
-            label_set_changed(s_cfg_care_val, "charging to full once, then back");
+            label_set_changed(s_cfg_care_val, "charging to 100% once");
         } else {
-            label_set_fmt_changed(s_cfg_care_val, "charge to  %s",
-                                  chg_mode_name(s_chg_mode));
+            label_set_fmt_changed(s_cfg_care_val, "charge limit  %d%%",
+                                  chg_mode_pct(s_chg_mode));
+        }
+    }
+    if (s_cfg_care_sub) {
+        if (s_chg_once) {
+            label_set_fmt_changed(s_cfg_care_sub, "then back to the %d%% limit",
+                                  chg_mode_pct(s_chg_mode));
+        } else {
+            label_set_changed(s_cfg_care_sub, chg_mode_hint(s_chg_mode));
         }
     }
     if (s_cfg_care_btn) {
@@ -3560,11 +3628,12 @@ static void build_control_app(lv_obj_t *scr) {
     lv_label_set_text(title, "CONTROL");
     lv_obj_align(title, LV_ALIGN_TOP_MID, 0, TOP_MARGIN);
 
-    /* The scroll column stays inside the corner radius: 364 wide is safe all
-     * the way down to y=436, where the arc has only cut ~22 px off each side. */
+    /* Use the same panel-safe width as the keyboard. At y=436 its centred
+     * x=28..452 footprint still clears the rounded corners, while the extra
+     * 60 px makes the intentionally thick sliders look proportional. */
     lv_obj_t *col = lv_obj_create(scr);
     lv_obj_remove_style_all(col);
-    lv_obj_set_size(col, CONTENT_W, 372);
+    lv_obj_set_size(col, KB_W, 372);
     lv_obj_align(col, LV_ALIGN_TOP_MID, 0, 64);
     lv_obj_set_flex_flow(col, LV_FLEX_FLOW_COLUMN);
     lv_obj_set_style_pad_row(col, 12, 0);
@@ -3653,11 +3722,22 @@ static void build_control_app(lv_obj_t *scr) {
 
     s_cfg_care_val = cfg_text(c, 0xC7D2E0);
     lv_obj_set_height(s_cfg_care_val, 26);     /* one montserrat_20 line, uncl'd */
-    lv_label_set_text_fmt(s_cfg_care_val, "charge to  %s", chg_mode_name(s_chg_mode));
-    s_cfg_care_sld = cfg_slider(c, CHG_FULL, CHG_LIFESPAN, s_chg_mode,
+    lv_label_set_text_fmt(s_cfg_care_val, "charge limit  %d%%",
+                          chg_mode_pct(s_chg_mode));
+    s_cfg_care_sub = cfg_text(c, 0x64748B);
+    lv_obj_set_height(s_cfg_care_sub, 26);     /* one montserrat_20 line, uncl'd */
+    lv_label_set_text(s_cfg_care_sub, chg_mode_hint(s_chg_mode));
+    s_cfg_care_sld = cfg_slider(c, CHG_FULL, CHG_LIFESPAN,
+                                chg_mode_to_slider(s_chg_mode),
                                 CFG_ACCENT_BATT, 0xA7F3D0, cfg_care_cb);
-    s_cfg_care_btn = cfg_button(c, "CHARGE FULL ONCE", CFG_ACCENT_BATT,
+    s_cfg_care_btn = cfg_button(c, "CHARGE TO 100% ONCE", CFG_ACCENT_BATT,
                                 cfg_care_once_cb);
+    /* The card's 14 px gutter is not enough under a slider. cfg_slider adds
+     * CFG_EXT_CLICK (18 px) of invisible hit area below the track and cfg_button
+     * adds 6 px above itself, so the two touch targets overlapped and finishing
+     * a drag near the bottom of the track fired the button. 14 + 18 clears both
+     * with room to spare. */
+    lv_obj_set_style_margin_top(s_cfg_care_btn, 18, 0);
 
     /* ---- wi-fi setup ---- */
     /* Directly above NETWORK: setup is what you reach for when the readout
@@ -5914,7 +5994,7 @@ static void sp_gesture_cb(lv_event_t *e) {
     /* Every direction below acts once per touch. */
     lv_indev_wait_release(indev);
 
-    if (d == LV_DIR_TOP) {
+    if (d == LV_DIR_TOP && home_gesture_from_bottom(indev)) {
         /* Back before home, matching what the right key does through app_back():
          * from a sub-scene the swipe pops it rather than leaving the app. */
         if (picker) sp_show_devices(false);
@@ -8131,7 +8211,8 @@ static void app_open(int idx) {
     s_cfg_bright_val = NULL;
     s_cfg_batt_bar = NULL;
     s_cfg_batt_val = NULL; s_cfg_batt_sub = NULL;
-    s_cfg_care_val = NULL; s_cfg_care_sld = NULL; s_cfg_care_btn = NULL;
+    s_cfg_care_val = NULL; s_cfg_care_sub = NULL;
+    s_cfg_care_sld = NULL; s_cfg_care_btn = NULL;
     s_cfg_net_val = NULL; s_cfg_sys_val = NULL; s_cfg_log = NULL;
     s_cfg_ble_val = NULL; s_cfg_ble_code = NULL; s_cfg_ble_btn = NULL;
     s_sp_art = NULL; s_sp_art_ph = NULL; s_sp_lbl_track = NULL;
@@ -8335,6 +8416,7 @@ void app_main(void) {
                 if (lv_indev_get_type(in) != LV_INDEV_TYPE_POINTER) continue;
                 lv_indev_set_gesture_min_distance(in, 28);
                 lv_indev_set_gesture_min_velocity(in, 1);
+                lv_indev_add_event_cb(in, touch_origin_cb, LV_EVENT_PRESSED, in);
             }
             bsp_display_unlock();
         }
@@ -8791,12 +8873,28 @@ void app_main(void) {
             }
             /* A one-shot ends when the charge it asked for actually finishes,
              * not when the cube is unplugged — so an interrupted top-up resumes
-             * on the next connection instead of being silently dropped. */
-            if (s_chg_once && s_bypass) {
-                s_chg_once = false;
-                s_req_chg_save = true;
-                ESP_LOGI(TAG, "one-shot full charge done, cap back to %d mV",
-                         chg_cv_mv(chg_cv_code()));
+             * on the next connection instead of being silently dropped.
+             *
+             * "Finished" has to mean a cycle we watched run. Testing s_bypass
+             * alone cancelled the request 0.8 s after arming it: the cap had
+             * just been raised, but reg 0x01 still carried the *previous*
+             * cycle's "done" and that was enough to look complete. So wait for
+             * current to actually flow. If it never does, the cell was already
+             * full and the request is satisfied anyway — but only conclude that
+             * after a few polls, never from the first stale byte. */
+            if (s_chg_once) {
+                if (s_batt_charging) { s_chg_once_seen = true; s_chg_once_idle = 0; }
+                else if (s_bypass)   { s_chg_once_idle++; }
+
+                if (s_chg_once_seen ? s_bypass : s_chg_once_idle >= 5) {
+                    s_chg_once = false;
+                    s_chg_once_seen = false;
+                    s_chg_once_idle = 0;
+                    s_req_chg_save = true;
+                    ESP_LOGI(TAG, "one-shot full charge %s, cap back to %d mV",
+                             s_batt_mv >= 4150 ? "done" : "not needed",
+                             chg_cv_mv(chg_cv_code()));
+                }
             }
             if (s_bypass != was_bypass) {
                 was_bypass = s_bypass;
