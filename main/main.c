@@ -1559,6 +1559,189 @@ static void imu_init(void) {
     ESP_LOGW(TAG, "QMI8658 not found — autorotate disabled");
 }
 
+/* ---------------- bezel pop-out ----------------
+ *
+ * Press a side key and the black bezel beside it swells into the screen, the
+ * way iOS 18 deforms the iPhone's edge. On an AMOLED the lobe is unlit pixels,
+ * so it reads as the bezel moving rather than as drawn UI — which also means it
+ * is invisible over an already-black screen, exactly as it is on a phone with a
+ * black wallpaper. There is nothing to deform there.
+ *
+ * The whole design is a budget: LVGL renders and ships one strip at a time with
+ * no tear gate, and `max_row` comes from the invalidated area's *width*, so a
+ * region is a single flush — and structurally incapable of the band-by-band
+ * wipe — exactly when `width * height <= 15360` (one 30,720 B draw buffer). A
+ * 26x120 lobe is 3,120 px: one render pass, ~0.3 ms on the wire.
+ *
+ * Flat black, and translated rather than resized or faded. A gradient would
+ * band regardless of flush count (RGB565 cannot ramp a dark colour smoothly,
+ * HARDWARE.md §5) and a shadow would be re-blurred every frame.
+ *
+ * The shape is a circle parked tangent to the edge and mostly off-panel, so
+ * what shows is a shallow circular segment: a wide, gently curved swell that
+ * tapers away at both ends, which is what the bezel actually looks like when it
+ * deforms. A rounded rectangle read as a drawn widget; an arc reads as the edge
+ * itself moving. Cost stays low because LVGL clips the invalidation to the
+ * panel — only the segment's bounding strip is dirty, never the whole circle.
+ *
+ * Chord width at depth d is 2*sqrt(2Rd - d^2): R=150, d=26 gives a 168 px wide
+ * swell in a 300x26 dirty strip = 7,800 px, comfortably one flush. */
+#define BEZEL_ARC_R       150      /* circle radius; larger = flatter, wider swell */
+#define BEZEL_LOBE_DEEP    26      /* how far it intrudes  */
+#define BEZEL_IN_MS       110      /* out fast, so the finger feels like the cause */
+#define BEZEL_OUT_MS      190      /* back slower, so it reads elastic */
+
+/* Which LVGL edge the key strip occupies at s_rot == 0: 0 top, 1 right,
+ * 2 bottom, 3 left. The three side keys are on the TOP of the cube. Nothing in
+ * the repo recorded this; HARDWARE.md §1 now does. */
+#define BTN_EDGE_NATIVE     0
+
+/* Where each key sits along that edge, percent of 480, in the silkscreen's
+ * leftmost/middle/rightmost order. */
+static const uint8_t s_bezel_at[3] = { 32, 50, 68 };
+
+static lv_obj_t *s_bezel[3];
+static int32_t   s_bezel_v[3];     /* current intrusion in px, 0 = parked */
+
+/* Quarter turns to carry a device-fixed point through for the current panel
+ * rotation. Both the edge and the along-edge position go through this, so the
+ * two can never disagree.
+ *
+ * It is a plain s_rot, NOT the inverse. The inverse is the intuitive guess —
+ * the panel turns the content, so a feature bolted to the case ought to travel
+ * the opposite way — and it is wrong here, because s_rot already counts turns
+ * of the panel relative to the case rather than of the case relative to the
+ * world. Measured, not reasoned: with the inverse, 0 and 180 were correct while
+ * 90 and 270 emerged from the opposite side, which is precisely the failure the
+ * MADCTL table warns about. Test all FOUR orientations; two will lie to you. */
+static int bezel_rot(void) { return s_rot & 3; }
+
+static int bezel_edge(void) { return (BTN_EDGE_NATIVE + bezel_rot()) & 3; }
+
+static void bezel_apply(int i) {
+    lv_obj_t *o = s_bezel[i];
+    if (!o) return;
+    int32_t v = s_bezel_v[i], tx = 0, ty = 0;
+    switch (bezel_edge()) {
+        case 0:  ty =  v; break;               /* top    -> push down  */
+        case 1:  tx = -v; break;               /* right  -> push left  */
+        case 2:  ty = -v; break;               /* bottom -> push up    */
+        default: tx =  v; break;               /* left   -> push right */
+    }
+    /* Change-gated: LVGL style setters invalidate whether or not the value
+     * actually moved (HARDWARE.md §5), and this runs every animation step. */
+    if (lv_obj_get_style_translate_x(o, 0) != tx) lv_obj_set_style_translate_x(o, tx, 0);
+    if (lv_obj_get_style_translate_y(o, 0) != ty) lv_obj_set_style_translate_y(o, ty, 0);
+}
+
+/* Native panel point -> current screen point. The panel rotates the content via
+ * MADCTL and LVGL's origin never moves, so a device-fixed feature like a side
+ * key has to be carried through the same turn by hand. */
+static void bezel_rotate(int r, int32_t nx, int32_t ny, int32_t *sx, int32_t *sy) {
+    switch (r & 3) {
+        case 1:  *sx = 479 - ny; *sy = nx;       break;
+        case 2:  *sx = 479 - nx; *sy = 479 - ny; break;
+        case 3:  *sx = ny;       *sy = 479 - nx; break;
+        default: *sx = nx;       *sy = ny;       break;
+    }
+}
+
+static void bezel_place(int i) {
+    lv_obj_t *o = s_bezel[i];
+    if (!o) return;
+    int edge = bezel_edge();
+
+    int32_t f = 480 * s_bezel_at[i] / 100, nx, ny;
+    switch (BTN_EDGE_NATIVE) {
+        case 0:  nx = f;   ny = 0;   break;
+        case 1:  nx = 479; ny = f;   break;
+        case 2:  nx = f;   ny = 479; break;
+        default: nx = 0;   ny = f;   break;
+    }
+    int32_t cx, cy;
+    bezel_rotate(bezel_rot(), nx, ny, &cx, &cy);
+
+    const int32_t r = BEZEL_ARC_R, d = r * 2;
+    lv_obj_set_size(o, d, d);
+    lv_obj_set_style_radius(o, LV_RADIUS_CIRCLE, 0);
+
+    /* Parked exactly tangent to its edge and centred on its key, so at rest not
+     * one pixel of it is on the panel. The translate is what dips the arc in. */
+    switch (edge) {
+        case 0:  lv_obj_set_pos(o, cx - r, -d);    break;   /* tangent to y=0   */
+        case 1:  lv_obj_set_pos(o, 480,    cy - r); break;   /* tangent to x=480 */
+        case 2:  lv_obj_set_pos(o, cx - r, 480);   break;   /* tangent to y=480 */
+        default: lv_obj_set_pos(o, -d,     cy - r); break;   /* tangent to x=0   */
+    }
+    bezel_apply(i);
+}
+
+static void bezel_layout(void) {
+    for (int i = 0; i < 3; i++) bezel_place(i);
+    /* Cheap, and the only way to check the mapping without staring at the
+     * panel: rot is the panel's quarter turns, edge is where the keys ended up
+     * (0 top, 1 right, 2 bottom, 3 left). */
+    ESP_LOGI(TAG, "bezel: rot=%d -> edge=%d", s_rot & 3, bezel_edge());
+}
+
+static void bezel_anim_exec(void *var, int32_t v) {
+    int32_t *slot = (int32_t *)var;
+    *slot = v;
+    bezel_apply((int)(slot - s_bezel_v));
+}
+
+static void bezel_press(int i, bool down) {
+    if (i < 0 || i > 2 || !s_bezel[i]) return;
+    int32_t to = down ? BEZEL_LOBE_DEEP : 0;
+    if (s_bezel_v[i] == to) return;
+    lv_anim_delete(&s_bezel_v[i], bezel_anim_exec);
+    lv_anim_t a;
+    lv_anim_init(&a);
+    lv_anim_set_var(&a, &s_bezel_v[i]);
+    lv_anim_set_exec_cb(&a, bezel_anim_exec);
+    lv_anim_set_values(&a, s_bezel_v[i], to);
+    lv_anim_set_duration(&a, down ? BEZEL_IN_MS : BEZEL_OUT_MS);
+    lv_anim_set_path_cb(&a, down ? lv_anim_path_ease_out : lv_anim_path_ease_in);
+    lv_anim_start(&a);
+}
+
+/* PWR has no press-down to hook: the AXP2101 hands us a *completed* short press
+ * over I2C, so the lobe can only pop and return once the key is already back
+ * up. It will read a beat behind the other two, and there is no register that
+ * would fix that. */
+static void bezel_pop(int i) {
+    if (i < 0 || i > 2 || !s_bezel[i]) return;
+    lv_anim_delete(&s_bezel_v[i], bezel_anim_exec);
+    s_bezel_v[i] = 0;
+    lv_anim_t a;
+    lv_anim_init(&a);
+    lv_anim_set_var(&a, &s_bezel_v[i]);
+    lv_anim_set_exec_cb(&a, bezel_anim_exec);
+    lv_anim_set_values(&a, 0, BEZEL_LOBE_DEEP);
+    lv_anim_set_duration(&a, BEZEL_IN_MS);
+    lv_anim_set_playback_duration(&a, BEZEL_OUT_MS);
+    lv_anim_set_path_cb(&a, lv_anim_path_ease_out);
+    lv_anim_start(&a);
+}
+
+static void bezel_init(void) {
+    lv_obj_t *top = lv_layer_top();
+    for (int i = 0; i < 3; i++) {
+        lv_obj_t *o = lv_obj_create(top);
+        lv_obj_remove_style_all(o);
+        lv_obj_set_style_bg_color(o, lv_color_black(), 0);
+        lv_obj_set_style_bg_opa(o, LV_OPA_COVER, 0);
+        /* The top layer sits above every screen, so anything clickable here
+         * would swallow the tap that unlocks the device — on all of them. */
+        lv_obj_remove_flag(o, LV_OBJ_FLAG_CLICKABLE);
+        lv_obj_remove_flag(o, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_remove_flag(o, LV_OBJ_FLAG_GESTURE_BUBBLE);
+        s_bezel[i] = o;
+        s_bezel_v[i] = 0;
+    }
+    bezel_layout();
+}
+
 /* Defined below bright_apply(), which owns the only path to panel command 0x51
  * (pitfall #23) — so the transition cannot be written inline here. */
 static void rot_fade_begin(void);
@@ -1593,6 +1776,14 @@ static void rotation_apply(int r) {
     rot_fade_end();
 
     s_rot = r;
+    /* The keys are bolted to the device, so their lobes have to be carried
+     * round to whichever screen edge the panel just put them on. After s_rot,
+     * and under its own lock — they are parked off-panel, so relaying them out
+     * here cannot reveal a seam. */
+    if (ui_lock()) {
+        bezel_layout();
+        bsp_display_unlock();
+    }
     ESP_LOGI(TAG, "rotation -> %d deg (swap=%d mx=%d my=%d) ax=%d ay=%d az=%d",
              r * 90, s_rot_tbl[r].swap, s_rot_tbl[r].mx, s_rot_tbl[r].my,
              s_acc_x, s_acc_y, s_acc_z);
@@ -1760,6 +1951,11 @@ typedef struct {
     int stable, last_raw;
     int64_t change_ms, press_ms, repeat_ms;
     bool long_fired;
+    /* +1 the poll the pin first reads low, -1 the poll it first reads high, 0
+     * otherwise. Deliberately un-debounced: the classified events below are
+     * 50-70 ms late, which is too slow for a press animation to feel caused by
+     * the finger. A bounce can flash the bezel lobe once; it is self-clearing. */
+    int8_t raw_edge;
 } btn_t;
 
 static btn_t s_key_left  = { .pin = KEY_LEFT_GPIO,  .stable = 1, .last_raw = 1 };
@@ -1784,9 +1980,11 @@ static void btn_swallow(btn_t *b) {
 
 static btn_ev_t btn_poll(btn_t *b, int64_t t) {
     int raw = gpio_get_level(b->pin);
+    b->raw_edge = 0;
     if (raw != b->last_raw) {
         b->last_raw = raw;
         b->change_ms = t;
+        b->raw_edge = (raw == 0) ? 1 : -1;   /* active low; earliest signal there is */
         ESP_LOGI(TAG, "key gpio%d -> %d", (int)b->pin, raw);
         return BTN_NONE;
     }
@@ -8509,6 +8707,13 @@ void app_main(void) {
     rotation_apply(s_autorot ? 0 : s_rot_held);
     btn_init(&s_key_left);
     btn_init(&s_key_right);
+    /* After rotation_apply(), so the lobes land on the edge the keys are
+     * actually on. They live on lv_layer_top(), which belongs to the display
+     * rather than to a screen, so they outlive every app teardown. */
+    if (ui_lock()) {
+        bezel_init();
+        bsp_display_unlock();
+    }
 
 #if PWRLOG_DUMP
     telemetry_dump();          /* before this boot adds its own rows */
@@ -8573,6 +8778,19 @@ void app_main(void) {
                 btn_swallow(&s_key_right);
                 kleft = BTN_NONE; kright = BTN_NONE; pwr = false;
                 s_last_btn = t;
+            }
+        }
+
+        /* Bezel pop-out. Driven from the raw pin edge rather than the
+         * classified event, which is 50-70 ms late — far too slow to feel
+         * caused by the finger. Skipped while the screen is off: that press is
+         * a wake, and the block above has already swallowed it. */
+        if (s_screen_on && (s_key_left.raw_edge || s_key_right.raw_edge || pwr)) {
+            if (ui_lock()) {
+                if (s_key_left.raw_edge)  bezel_press(0, s_key_left.raw_edge > 0);
+                if (s_key_right.raw_edge) bezel_press(2, s_key_right.raw_edge > 0);
+                if (pwr)                  bezel_pop(1);
+                bsp_display_unlock();
             }
         }
 

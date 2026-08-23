@@ -735,6 +735,48 @@ LVGL's indev does honour it, but local styles beat the theme's grey, so the fade
 has to be explicit. `IMU_FORCE_ABSENT` exists to make that branch testable in one
 build cycle rather than never.
 
+## The bezel pop-out
+
+Press a side key and the black bezel beside it swells into the screen, the way
+iOS 18 deforms the iPhone's edge. Until this, no key press produced any visual
+acknowledgement anywhere in the firmware.
+
+**It is a circle, not a rectangle.** Each of the three keys owns a 300 px circle
+parked exactly tangent to its screen edge, entirely off-panel at rest. Pressing
+translates it 26 px inward, so what shows is a shallow circular segment — a
+~168 px swell that tapers to nothing at both ends. A rounded rectangle was tried
+first and read as a widget sliding in; the arc reads as the edge itself moving.
+
+Three properties make it cheap enough to feel instant, and none is optional:
+
+- **Flat black, never a gradient.** RGB565 cannot ramp a dark colour smoothly
+  (HARDWARE.md §5), so a soft vignette would band no matter how it was flushed.
+  Flat black is also literally unlit pixels on this panel, which is why it reads
+  as bezel rather than as paint.
+- **Translated, never resized or shadowed.** Same rule MUSIC's nudge follows:
+  translate composes with the existing layout and allocates no transient layer.
+  A `shadow_width` re-blurred per frame is the known route to 20 fps.
+- **One flush.** LVGL clips invalidation to the panel, so the circle costs
+  300×26 = 7,800 px, not 300×300 — inside the one-buffer budget, so it cannot
+  band. See the rule in HARDWARE.md §5.
+
+**Driven from the raw pin edge, not the debounced event.** `btn_poll()` needs
+50 ms of stable level before it will classify anything, and the loop ticks every
+20 ms, so a `BTN_SHORT` is 50–70 ms late — enough to feel like lag rather than
+cause. `btn_t.raw_edge` reports the first poll on which the pin changed, ≤20 ms.
+A contact bounce can flash a lobe once; it is self-clearing and worth it.
+
+**PWR is asymmetric and cannot be fixed.** The AXP2101 hands us a *completed*
+short press over I2C — there is no level register and no press-down bit — so the
+middle lobe can only pop and retract after the key is already back up. It reads
+a beat behind the other two. No register would change that.
+
+The lobes live on `lv_layer_top()`, which belongs to the display rather than to
+a screen, so they survive every app teardown and lock cycle. That also makes
+them the one set of widgets nothing else nulls, and any object there **must**
+clear `CLICKABLE` — the top layer is above every screen, so a clickable child
+would swallow the tap that unlocks the device, on all of them.
+
 ## Sound
 
 Clips are authored offline and embedded in flash via `EMBED_FILES` (~99 KB),

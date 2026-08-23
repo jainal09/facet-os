@@ -63,6 +63,20 @@ rightmost = plus          -> GPIO18
 This is the opposite of the intuitive guess and cost real debugging time. GPIO0
 is safe as a user key; only holding it **through a reset** enters download mode.
 
+**The three keys run along the TOP edge of the cube**, in that order, which in
+LVGL space at `s_rot == 0` is edge 0 (`BTN_EDGE_NATIVE` in `main.c`). This was
+not recorded anywhere until the bezel pop-out needed it, and it was guessed
+wrong first — left, on the reasoning that the strip is held vertically. Look at
+the device.
+
+Anything anchored to a key must be carried through the panel rotation by hand,
+and **the correction is a plain `s_rot`, not its inverse.** The inverse is the
+intuitive guess (the panel turns the content, so a case-fixed feature should
+travel the other way) and it is wrong, because `s_rot` already counts turns of
+the panel relative to the case. The symptom of getting it backwards is the one
+§6 warns about: 0° and 180° look perfect while 90° and 270° emerge from opposite
+sides. **Test all four orientations; two of them will lie to you.**
+
 Reading PWR: enable the short-press IRQ (reg `0x41` bit 3), then poll status reg
 `0x49` bit 3 and **write 1 to clear**. Leave long-press alone — the PMU may act
 on it itself.
@@ -267,6 +281,19 @@ specific to BLE — treat "it fits, just" as unproven rather than as a result.
   (2 × 30,720 B) is a good default.
 - Set the SPI bus `max_transfer_sz` to **one draw buffer**, not a full frame.
   The BSP defaults to 480×480×2 = 460,800 B and over-allocates DMA descriptors.
+- **An animation is band-proof exactly when its dirty rect fits one draw
+  buffer: `width × height ≤ 15,360 px`.** LVGL renders a slice and ships it,
+  then renders the next, with no tear gate — so a region spanning several
+  buffer-fulls lands on the glass strip by strip, which is the dial-up look.
+  `max_row` comes from the **invalidated area's width**, not the panel's
+  (`lv_refr.c` `get_max_row()`), so the budget is genuinely the product: a
+  32 px-wide full-height column is one flush, and so is a 300×26 strip, while a
+  full-width 480×96 band is three. Size any press/hover effect against this
+  number before designing it, and confirm with `render perf:` — **`flushes /
+  redraws` must be ~1**, measured under the interaction, never at idle.
+- A shape can be far larger than its dirty rect: LVGL clips invalidation to the
+  panel, so a 300 px circle parked mostly off-screen and dipped 26 px in costs
+  300×26, not 300×300. That is how the bezel pop-out draws a smooth arc cheaply.
 - `lv_obj_create()` objects are **clickable by default**. A full-screen scene
   must `lv_obj_remove_flag(o, LV_OBJ_FLAG_CLICKABLE)` on every decorative shape
   or they silently swallow taps. Gestures still bubble.
