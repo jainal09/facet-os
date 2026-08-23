@@ -1,0 +1,37 @@
+main/main.c
+  s_fb998ec38e88eb::t_cc2af6e17e94c9 8784-8793
+  s_fb998ec38e88eb::t_e247fad76b80f8 1595-1597
+  s_fb998ec38e88eb::t_324559b878d877 1606,1609,1618-1619
+  s_fb998ec38e88eb::t_c51ac489df862b 1679-1685
+  s_fb998ec38e88eb::t_7374e1a22527e1 1954-1958
+  s_fb998ec38e88eb::t_722674ac065ad7 1607-1608,1610-1617
+  s_fb998ec38e88eb::t_b719090a2ab629 1664-1666,1668-1669,1671-1674
+  s_fb998ec38e88eb::t_044fe35c400316 1983,1987
+  s_fb998ec38e88eb::t_1801117d1809f0 1779-1786
+  s_fb998ec38e88eb::t_847863769b9317 1562-1577,1590-1594,1598-1605,1620-1661,1663,1667,1670,1675-1678,1686-1744
+  s_fb998ec38e88eb::t_51f3b418825c2f 1662
+  s_fb998ec38e88eb::t_ad0d59d9b2c33f 8710-8716
+  s_fb998ec38e88eb::t_cd6c21eb9eb266 1578-1589
+  s_fb998ec38e88eb::t_0f49b3dea6170d 8794-8796
+docs/ARCHITECTURE.md
+  s_fb998ec38e88eb::t_6db98ea33537cc 738-779
+docs/HARDWARE.md
+  s_fb998ec38e88eb::t_e81b1f6974fe52 284-296
+  s_fb998ec38e88eb::t_c768f5c3e9b53a 66-79
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.23",
+  "base_commit_sha": "5454d4961e6f09cbbc1b399b0dd7e967c8c51e35",
+  "prompts": {},
+  "sessions": {
+    "s_fb998ec38e88eb": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "460c1548-160c-4cc9-8a1b-63c06bb5231c",
+        "model": "claude-opus-5"
+      },
+      "human_author": "Jainal Gosaliya <jainal09gosalia@gmail.com>"
+    }
+  }
+}
