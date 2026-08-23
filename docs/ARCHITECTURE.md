@@ -273,7 +273,9 @@ Three things make it work:
 1. **Autorotate is gated at the commit, not the poll.** `imu_poll()` still
    computes `s_base_rot` every 100 ms, but `rotation_apply()` is skipped while
    `s_app == APP_POMO`. If the panel counter-rotated, the labels would stay put
-   relative to your eye and turning the cube would change nothing.
+   relative to your eye and turning the cube would change nothing. The selected
+   edge is computed relative to that frozen panel rotation, so entering FOCUS in
+   any autorotated orientation starts with 60 minutes at the top.
 2. **The dial is fixed to the device; the readout is fixed to you.** The centre
    clock counter-rotates by `-90*top_edge`. Crucially, rotating a label spins it
    about its own centre only — its *offset* from the screen centre does not
@@ -604,6 +606,12 @@ enough to ghost-touch, and the same mistake the first MUSIC layout made. When th
 panel appears the clock drops to `hud_clock_48` and moves up, the divider hides,
 and the transport gets 76/88/76 px with real padding. The clock has nothing below
 it worth protecting.
+
+**Dismissal survives lock and home.** Swiping the transport panel away keeps it
+hidden across later lock-screen builds, track changes, and playback restarts.
+Entering MUSIC is the sole reset: it expresses renewed Spotify intent, so the
+panel may appear the next time the cube is locked. The flag is session state in
+RAM, not a saved preference.
 
 ## Wi-Fi setup from a phone
 

@@ -266,8 +266,7 @@ static lv_obj_t *s_lock_np, *s_lock_np_art, *s_lock_np_ph, *s_lock_np_track;
 static lv_obj_t *s_lock_np_prev, *s_lock_np_play, *s_lock_np_next;
 static volatile bool s_lock_np_up;
 static uint32_t s_lock_np_bg;    /* last scrim colour, 0 = unset */
-static bool s_lock_np_off;       /* user swiped the panel away this visit */
-static bool s_lock_np_had;       /* was something playing on the previous tick? */
+static bool s_lock_np_off;       /* stays dismissed until MUSIC is opened */
 static int64_t s_lock_swipe_at;  /* lock_tap_cb ignores a click in a swipe's shadow */
 static lv_obj_t *s_lock_rule;    /* divider under the clock; moves with it */
 static int s_sweep_deg;
@@ -3403,13 +3402,14 @@ static void pomo_finish(void) {
 /* ---- the screen ---- */
 
 /* Which edge is physically at the top. Reads the same calibration autorotate
- * uses, so a correctly calibrated device gives a correctly oriented dial.
+ * uses, relative to the panel rotation that FOCUS freezes on entry. This makes
+ * the current display-up direction slot 0 (60 min), whatever its orientation.
  *
  * There is deliberately no fudge factor here. One was added after misreading two
  * photographs — a photo has no gravity reference, so "the top label looks upright
  * in the picture" says nothing about which way the cube was actually facing. */
 static int pomo_top_edge(void) {
-    return rot_from_base(s_base_rot) & 3;
+    return (rot_from_base(s_base_rot) - s_rot + 4) & 3;
 }
 
 /* 0.1-degree units, clockwise. Edge i must be pre-rotated by -90*i so that
@@ -6899,15 +6899,6 @@ static void lock_np_refresh(void) {
 
     bool playing = s_sp_have_state && s_sp_track[0];
 
-    /* Playback starting again is a new thing to announce, so it clears a previous
-     * dismissal. Without this, swiping the panel away once would silence it until
-     * the lock screen was rebuilt, which is not what "dismiss" means. */
-    if (playing && !s_lock_np_had) {
-        if (s_lock_np_off) ESP_LOGW(TAG, "lock: dismissal cleared — playback restarted");
-        s_lock_np_off = false;
-    }
-    s_lock_np_had = playing;
-
     bool show = playing && !s_lock_np_off;
     if (show == s_lock_np_up) {
         if (!show) return;                      /* nothing to do while hidden */
@@ -7003,9 +6994,9 @@ static void lock_timer_cb(lv_timer_t *t) {
     lock_refresh();
 }
 
-/* The panel sits along the bottom edge, so swiping it down pushes it off the way
- * it came — the same direction a phone uses to dismiss a sheet. Up brings it back,
- * so a dismissal is undoable without waiting for the next track. */
+/* The panel sits along the bottom edge, so a swipe pushes it away like a phone
+ * sheet. It stays away until MUSIC is opened; lock/home cycles are not playback
+ * intent and must not resurrect controls the user explicitly dismissed. */
 static void lock_gesture_cb(lv_event_t *e) {
     lv_indev_t *indev = lv_indev_active();
     lv_dir_t d = lv_indev_get_gesture_dir(indev);
@@ -7019,16 +7010,8 @@ static void lock_gesture_cb(lv_event_t *e) {
 
     if (!s_sp_have_state || !s_sp_track[0]) return;
 
-    /* Push it away in any direction; pull it back up. A plain toggle was wrong —
-     * a second swipe in the same direction brought the panel back, which is not
-     * what "dismiss" means to a hand that just repeated itself.
-     *
-     * The first version accepted only TOP and BOTTOM and returned silently on
-     * anything else, which is indistinguishable from the handler never running.
-     * It turns out the natural gesture here is sideways: LV_DIR_LEFT. */
-    bool off = (d != LV_DIR_TOP);
-    if (off == s_lock_np_off) return;
-    s_lock_np_off = off;
+    if (s_lock_np_off) return;
+    s_lock_np_off = true;
 
     /* Repaint HERE, not on the next tick. lock_np_refresh() otherwise runs at
      * ~1 Hz (s_lock_slow % 25 inside a 40 ms timer), so a dismissal could take a
@@ -7039,7 +7022,7 @@ static void lock_gesture_cb(lv_event_t *e) {
      * Safe to call directly: a gesture callback runs on the LVGL task, so the
      * lock is already held. */
     lock_np_refresh();
-    ESP_LOGI(TAG, "lock: now-playing %s (dir=%d)", off ? "dismissed" : "restored", (int)d);
+    ESP_LOGI(TAG, "lock: now-playing dismissed (dir=%d)", (int)d);
 }
 
 static void lock_tap_cb(lv_event_t *e) {
@@ -7438,8 +7421,6 @@ static void app_open(int idx) {
      * is torn down, with nothing left on screen to explain why. */
     s_lock_np_up = false;
     s_lock_np_bg = 0;
-    s_lock_np_off = false;
-    s_lock_np_had = false;
     s_lock_rule = NULL;
 
     /* Free the outgoing app BEFORE building the next one. A cross-fade with
@@ -7468,6 +7449,13 @@ static void app_open(int idx) {
     else if (idx == APP_LOCK)         build_lock_screen(scr);
     else                              build_drawer(scr);
     s_app = idx;
+
+    /* Entering Spotify is the one explicit signal that lock-screen playback is
+     * wanted again. Merely locking or visiting home preserves a dismissal. */
+    if (idx == APP_MUSIC && s_lock_np_off) {
+        s_lock_np_off = false;
+        ESP_LOGI(TAG, "lock: now-playing dismissal cleared by MUSIC");
+    }
 
     if (slide) lv_screen_load_anim(scr, LV_SCR_LOAD_ANIM_OUT_TOP, 220, 0, true);
 
