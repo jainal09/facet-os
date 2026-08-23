@@ -375,6 +375,9 @@ static bool s_stack_fallback;
 static volatile bool s_req_wallpaper;
 static uint16_t s_wall_have;         /* bitmask of slots holding a usable PNG */
 static int      s_wall_slot = -1;    /* slot currently on screen, -1 = none */
+static int      s_wall_primed = -1;  /* next slot already decoded in LVGL cache */
+static volatile bool s_req_wall_prime;
+static int64_t  s_wall_prime_after;
 static int64_t  s_wall_last;         /* last download attempt, success or not */
 
 /* Download progress, so the UI can show what a fetch is actually doing.
@@ -6856,12 +6859,17 @@ static int wall_target_slot(void) {
     int empty = wall_first_empty();
     if (empty >= 0) return empty;
 
-    /* Do not replace the session's hot wallpaper underneath the cache. */
+    /* Do not replace either the visible wallpaper or the decoded next one. */
     for (int tries = 0; tries < 8; tries++) {
         int pick = (int)(esp_random() % WALL_SLOTS);
-        if (pick != s_wall_slot || WALL_SLOTS == 1) return pick;
+        if ((pick != s_wall_slot && pick != s_wall_primed) || WALL_SLOTS == 1) {
+            return pick;
+        }
     }
-    return (s_wall_slot + 1) % WALL_SLOTS;
+    for (int pick = 0; pick < WALL_SLOTS; pick++) {
+        if (pick != s_wall_slot && pick != s_wall_primed) return pick;
+    }
+    return 0;
 }
 
 /* A slot to display, avoiding an immediate repeat of the one already up. */
@@ -6874,7 +6882,11 @@ static int wall_display_slot(void) {
         if (pick == s_wall_slot && have > 1) continue;
         return pick;
     }
-    return wall_first_empty() == 0 ? -1 : __builtin_ctz(s_wall_have);
+    for (int pick = 0; pick < WALL_SLOTS; pick++) {
+        if ((s_wall_have & (1u << pick)) &&
+            (pick != s_wall_slot || have == 1)) return pick;
+    }
+    return -1;
 }
 
 /* Pay the one unavoidable PNG decode during boot, before input polling starts,
@@ -6882,6 +6894,7 @@ static int wall_display_slot(void) {
  * leaves the decoded buffer in LVGL's LRU cache. */
 static void wall_cache_prime(void) {
     if (!s_sd_ok || !lv_display_get_default()) return;
+    if (s_wall_primed >= 0 && (s_wall_have & (1u << s_wall_primed))) return;
 
     int slot = wall_display_slot();
     if (slot < 0) return;
@@ -6897,7 +6910,7 @@ static void wall_cache_prime(void) {
     bsp_display_unlock();
 
     if (res == LV_RESULT_OK) {
-        s_wall_slot = slot;
+        s_wall_primed = slot;
         ESP_LOGI(TAG, "wallpaper slot %d primed in %lld ms", slot,
                  (long long)((esp_timer_get_time() - t0) / 1000));
     } else {
@@ -7451,7 +7464,9 @@ static int s_lock_slow;
 static void lock_clock_layout(void) {
     if (!s_lock_time) return;
     int y = s_lock_np_up ? -140 : -18;
-    lv_obj_align(s_lock_time, LV_ALIGN_CENTER, s_clock_24 ? 0 : -22, y);
+    /* Centre the visually dominant digits. AM/PM is an annotation, not part of
+     * the centring box; including it made the clock itself look left-shifted. */
+    lv_obj_align(s_lock_time, LV_ALIGN_CENTER, 0, y);
     if (s_lock_meridiem && !s_clock_24) {
         lv_obj_align_to(s_lock_meridiem, s_lock_time, LV_ALIGN_OUT_RIGHT_MID, 8, 2);
     }
@@ -7671,8 +7686,9 @@ static void lock_refresh(void) {
         lv_obj_set_style_arc_color(s_lock_batt_arc, arc_color, LV_PART_MAIN);
     }
 
-    /* The Always On cue has its own 444 px path outside the 430 px battery
-     * gauge. Sharing one path made a full battery paint over every amber pixel. */
+    /* The Always On cue has its own 412 px path inside the 430 px battery
+     * gauge. Sharing one path hid it at 100%; placing it outside at 444 px let
+     * the rounded panel mask clip its corners. */
     if (s_lock_ring) {
         lv_color_t ring_color = lv_color_hex(s_always_on ? 0xF59E0B : 0x123A52);
         if (!lv_color_eq(lv_obj_get_style_arc_color(s_lock_ring, LV_PART_MAIN),
@@ -7909,16 +7925,16 @@ static void build_lock_screen(lv_obj_t *scr) {
     lv_obj_set_style_bg_color(scr, lv_color_hex(0x000000), 0);
     lv_obj_set_style_bg_grad_dir(scr, LV_GRAD_DIR_NONE, 0);
 
-    /* Reuse the slot primed during boot.  A cache hit is what keeps the panel's
-     * hidden render short enough that the black navigation interval feels like
-     * a transition rather than a freeze. */
+    /* Consume the prepared next slot. A cache hit keeps the hidden render short,
+     * while separating current from primed restores a new image on every lock. */
     int slot = -1;
     if (s_sd_ok) {
-        if (s_wall_slot >= 0 && (s_wall_have & (1u << s_wall_slot))) {
-            slot = s_wall_slot;
+        if (s_wall_primed >= 0 && (s_wall_have & (1u << s_wall_primed))) {
+            slot = s_wall_primed;
         } else {
             slot = wall_display_slot();
         }
+        s_wall_primed = -1;
     }
     if (slot >= 0) {
         char lvpath[72];
@@ -7953,9 +7969,10 @@ static void build_lock_screen(lv_obj_t *scr) {
         }
     }
 
-    /* Always On gets a separate outer ring so the battery gauge cannot cover it. */
+    /* Always On gets a separate inner ring so neither the battery gauge nor the
+     * panel's rounded-corner mask can cover it. */
     s_lock_ring = lv_arc_create(scr);
-    lv_obj_set_size(s_lock_ring, 444, 444);
+    lv_obj_set_size(s_lock_ring, 412, 412);
     lv_obj_center(s_lock_ring);
     lv_obj_remove_style(s_lock_ring, NULL, LV_PART_KNOB);
     lv_obj_remove_flag(s_lock_ring, LV_OBJ_FLAG_CLICKABLE);
@@ -8322,6 +8339,14 @@ static void app_open(int idx) {
         ESP_LOGI(TAG, "lock: now-playing dismissal cleared by MUSIC");
     }
 
+    /* Prepare a different wallpaper after the lock screen is already visible.
+     * The main loop waits for an idle touch window before taking the LVGL lock,
+     * so this never lengthens the black Home -> Lock transition. */
+    if (idx == APP_LOCK && __builtin_popcount(s_wall_have) > 1) {
+        s_wall_prime_after = now_ms() + 1200;
+        s_req_wall_prime = true;
+    }
+
     /* Force all 15 strips through the panel while it is black.  The first
      * brightness command in the reveal drains the final queued DMA transfer,
      * so no half-painted frame can become visible. */
@@ -8632,12 +8657,21 @@ void app_main(void) {
             time_sync_start();
         }
 
-        /* wallpapers are fetched on the network task — see https_task() */
+        /* Wallpaper downloads run on the network task. Decoding the next cached
+         * image uses LVGL, so do it here only after navigation and touch settle. */
 
         if (s_req_app != APP_NONE) {
             int want = s_req_app;
             s_req_app = APP_NONE;
             if (want != s_app) app_open(want);
+        }
+
+        if (s_req_wall_prime && t >= s_wall_prime_after &&
+            lv_display_get_inactive_time(NULL) >= 500 &&
+            !s_lock_pointer_down &&
+            s_dl_state != DL_QUERY && s_dl_state != DL_IMAGE) {
+            s_req_wall_prime = false;
+            wall_cache_prime();
         }
 
         /* Poll while MUSIC is open, and while the lock screen is actually being
