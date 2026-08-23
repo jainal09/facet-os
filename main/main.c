@@ -318,7 +318,7 @@ static bool broker_fetch(const char *path, const char *xname, const char *xval,
 
 static lv_obj_t *s_lock_time, *s_lock_date, *s_lock_meridiem;
 static lv_obj_t *s_lock_batt, *s_lock_charge;
-static lv_obj_t *s_lock_ring, *s_lock_batt_arc;
+static lv_obj_t *s_lock_ring, *s_lock_inner_ring, *s_lock_batt_arc;
 static uint8_t s_lock_charge_phase, s_lock_charge_div;
 
 /* Now-playing panel on the lock screen. Hidden unless Spotify actually has an
@@ -1484,6 +1484,9 @@ static volatile bool s_autorot = true;   /* volatile: LVGL task writes, main rea
 static volatile bool s_req_autorot_save;
 static volatile bool s_clock_24 = true;
 static volatile bool s_req_clock_save;
+static volatile bool s_always_on;
+static volatile bool s_lock_rings = true;
+static volatile bool s_req_lock_pref_save;
 /* The orientation to hold when autorotate is off. Without persisting this, a
  * reboot lands back at native 0 with the switch still reading OFF and — since
  * the calibration button fades out in that state — no way at all to get back. */
@@ -1630,6 +1633,17 @@ static void clock_pref_save(void) {
     }
 }
 
+static void lock_pref_save(void) {
+    if (ble_prov_nvs_blocked()) return;
+    nvs_handle_t h;
+    if (nvs_open("cfg", NVS_READWRITE, &h) == ESP_OK) {
+        nvs_set_i32(h, "alwayson", s_always_on ? 1 : 0);
+        nvs_set_i32(h, "lockrings", s_lock_rings ? 1 : 0);
+        nvs_commit(h);
+        nvs_close(h);
+    }
+}
+
 static void chg_save(void) {
     if (ble_prov_nvs_blocked()) return;
     nvs_handle_t h;
@@ -1665,6 +1679,8 @@ static void rot_off_load(void) {
     if (nvs_get_i32(h, "autorot", &v) == ESP_OK) s_autorot = (v != 0);
     if (nvs_get_i32(h, "rothold", &v) == ESP_OK) s_rot_held = (int)(v & 3);
     if (nvs_get_i32(h, "clock24", &v) == ESP_OK) s_clock_24 = (v != 0);
+    if (nvs_get_i32(h, "alwayson", &v) == ESP_OK) s_always_on = (v != 0);
+    if (nvs_get_i32(h, "lockrings", &v) == ESP_OK) s_lock_rings = (v != 0);
     nvs_close(h);
 }
 
@@ -3059,6 +3075,7 @@ static lv_obj_t *s_cfg_wall_pool, *s_cfg_wall_state, *s_cfg_wall_bar, *s_cfg_wal
 static lv_obj_t *s_cfg_days_val;
 static lv_obj_t *s_cfg_rot_val;
 static lv_obj_t *s_cfg_rot_sw, *s_cfg_rot_btn, *s_cfg_time_sw;
+static lv_obj_t *s_cfg_always_sw, *s_cfg_rings_sw;
 static lv_obj_t *s_cfg_bright_val;
 static lv_obj_t *s_cfg_vol_val;
 static lv_obj_t *s_cfg_batt_bar, *s_cfg_batt_val, *s_cfg_batt_sub;
@@ -3073,6 +3090,7 @@ static lv_obj_t *s_cfg_log;
 #define CFG_ACCENT_WALL 0x22D3EE
 #define CFG_ACCENT_DAYS 0x8B7CF6
 #define CFG_ACCENT_DISP 0xA78BFA
+#define CFG_ACCENT_LOCK 0xF59E0B
 #define CFG_ACCENT_BATT 0x34D399
 #define CFG_ACCENT_NET  0x60A5FA
 #define CFG_ACCENT_SND  0xFB923C
@@ -3251,6 +3269,18 @@ static void cfg_clock_cb(lv_event_t *e) {
     s_clock_24 = lv_obj_has_state(lv_event_get_target(e), LV_STATE_CHECKED);
     s_req_clock_save = true;
     ESP_LOGI(TAG, "lock clock %s", s_clock_24 ? "24-hour" : "12-hour");
+}
+
+static void cfg_always_cb(lv_event_t *e) {
+    s_always_on = lv_obj_has_state(lv_event_get_target(e), LV_STATE_CHECKED);
+    s_req_lock_pref_save = true;
+    ESP_LOGI(TAG, "always-on %s", s_always_on ? "ON" : "OFF");
+}
+
+static void cfg_rings_cb(lv_event_t *e) {
+    s_lock_rings = lv_obj_has_state(lv_event_get_target(e), LV_STATE_CHECKED);
+    s_req_lock_pref_save = true;
+    ESP_LOGI(TAG, "lock-screen rings %s", s_lock_rings ? "ON" : "OFF");
 }
 
 /* Stated as a percentage, not as volts and not as a mode name. The percentage
@@ -3638,6 +3668,9 @@ static void build_control_app(lv_obj_t *scr) {
     lv_obj_set_flex_flow(col, LV_FLEX_FLOW_COLUMN);
     lv_obj_set_style_pad_row(col, 12, 0);
     lv_obj_set_style_pad_all(col, 2, 0);
+    /* Let the final row clear the viewport instead of stopping half-visible at
+     * the bottom edge. This padding is scrollable content, not dead screen area. */
+    lv_obj_set_style_pad_bottom(col, CFG_TOUCH_H + 24, 0);
     lv_obj_set_scroll_dir(col, LV_DIR_VER);
     lv_obj_set_scrollbar_mode(col, LV_SCROLLBAR_MODE_ACTIVE);
 
@@ -3680,8 +3713,6 @@ static void build_control_app(lv_obj_t *scr) {
 
     s_cfg_rot_sw = cfg_switch(c, "Auto-rotate", CFG_ACCENT_DISP,
                               s_autorot, cfg_autorot_cb);
-    s_cfg_time_sw = cfg_switch(c, "24-hour time", CFG_ACCENT_DISP,
-                               s_clock_24, cfg_clock_cb);
     /* No IMU, no autorotate — a switch that cannot do anything is worse than one
      * that plainly looks dead, which is how MUSIC renders an unavailable
      * transport control too. LV_STATE_DISABLED alone is not enough: the indev
@@ -3697,6 +3728,15 @@ static void build_control_app(lv_obj_t *scr) {
      * button follows the switch — see cfg_timer_cb. */
     s_cfg_rot_btn = cfg_button(c, LV_SYMBOL_REFRESH "  Step rotation calibration",
                                CFG_ACCENT_DISP, cfg_rotate_cb);
+
+    /* ---- lock screen ---- */
+    c = cfg_card(col, "LOCK SCREEN", CFG_ACCENT_LOCK);
+    s_cfg_always_sw = cfg_switch(c, "Always-on screen", CFG_ACCENT_LOCK,
+                                 s_always_on, cfg_always_cb);
+    s_cfg_rings_sw = cfg_switch(c, "Lock-screen rings", CFG_ACCENT_LOCK,
+                                s_lock_rings, cfg_rings_cb);
+    s_cfg_time_sw = cfg_switch(c, "24-hour time", CFG_ACCENT_LOCK,
+                               s_clock_24, cfg_clock_cb);
 
     /* ---- audio ---- */
     c = cfg_card(col, "AUDIO", CFG_ACCENT_SND);
@@ -7392,8 +7432,6 @@ static int battery_drain_mv_h(void) {
  * in a fixed card below them. Desk-clock mode colours the base ring amber.
  */
 
-static bool s_always_on;
-
 static void time_sync_start(void) {
     setenv("TZ", TIMEZONE, 1);
     tzset();
@@ -7633,15 +7671,18 @@ static void lock_refresh(void) {
         lv_obj_set_style_arc_color(s_lock_batt_arc, arc_color, LV_PART_MAIN);
     }
 
-    /* Always-on mode is a persistent amber base ring. It changes only when the
-     * mode changes, rather than spending every frame on decorative motion. */
+    /* The Always On cue has its own 444 px path outside the 430 px battery
+     * gauge. Sharing one path made a full battery paint over every amber pixel. */
     if (s_lock_ring) {
-        lv_color_t ring_color = lv_color_hex(s_always_on ? 0x7A4B0C : 0x123A52);
+        lv_color_t ring_color = lv_color_hex(s_always_on ? 0xF59E0B : 0x123A52);
         if (!lv_color_eq(lv_obj_get_style_arc_color(s_lock_ring, LV_PART_MAIN),
                          ring_color)) {
             lv_obj_set_style_arc_color(s_lock_ring, ring_color, LV_PART_MAIN);
         }
     }
+    obj_set_hidden_changed(s_lock_ring, !s_lock_rings);
+    obj_set_hidden_changed(s_lock_inner_ring, !s_lock_rings);
+    obj_set_hidden_changed(s_lock_batt_arc, !s_lock_rings);
 }
 
 /* The live card subtree measured 130-140 ms per translated frame because LVGL
@@ -7912,26 +7953,26 @@ static void build_lock_screen(lv_obj_t *scr) {
         }
     }
 
-    /* HUD rings. A 430 px circle on a 480 px square clears the corner radius. */
+    /* Always On gets a separate outer ring so the battery gauge cannot cover it. */
     s_lock_ring = lv_arc_create(scr);
-    lv_obj_set_size(s_lock_ring, 430, 430);
+    lv_obj_set_size(s_lock_ring, 444, 444);
     lv_obj_center(s_lock_ring);
     lv_obj_remove_style(s_lock_ring, NULL, LV_PART_KNOB);
     lv_obj_remove_flag(s_lock_ring, LV_OBJ_FLAG_CLICKABLE);
-    lv_obj_set_style_arc_width(s_lock_ring, 2, LV_PART_MAIN);
+    lv_obj_set_style_arc_width(s_lock_ring, 3, LV_PART_MAIN);
     lv_obj_set_style_arc_width(s_lock_ring, 0, LV_PART_INDICATOR);
     lv_obj_set_style_arc_color(s_lock_ring, lv_color_hex(0x123A52), LV_PART_MAIN);
     lv_arc_set_bg_angles(s_lock_ring, 0, 360);
 
-    lv_obj_t *ring2 = lv_arc_create(scr);
-    lv_obj_set_size(ring2, 372, 372);
-    lv_obj_center(ring2);
-    lv_obj_remove_style(ring2, NULL, LV_PART_KNOB);
-    lv_obj_remove_flag(ring2, LV_OBJ_FLAG_CLICKABLE);
-    lv_obj_set_style_arc_width(ring2, 1, LV_PART_MAIN);
-    lv_obj_set_style_arc_width(ring2, 0, LV_PART_INDICATOR);
-    lv_obj_set_style_arc_color(ring2, lv_color_hex(0x0C2438), LV_PART_MAIN);
-    lv_arc_set_bg_angles(ring2, 0, 360);
+    s_lock_inner_ring = lv_arc_create(scr);
+    lv_obj_set_size(s_lock_inner_ring, 372, 372);
+    lv_obj_center(s_lock_inner_ring);
+    lv_obj_remove_style(s_lock_inner_ring, NULL, LV_PART_KNOB);
+    lv_obj_remove_flag(s_lock_inner_ring, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_set_style_arc_width(s_lock_inner_ring, 1, LV_PART_MAIN);
+    lv_obj_set_style_arc_width(s_lock_inner_ring, 0, LV_PART_INDICATOR);
+    lv_obj_set_style_arc_color(s_lock_inner_ring, lv_color_hex(0x0C2438), LV_PART_MAIN);
+    lv_arc_set_bg_angles(s_lock_inner_ring, 0, 360);
 
     s_lock_batt_arc = lv_arc_create(scr);
     lv_obj_set_size(s_lock_batt_arc, 430, 430);
@@ -8078,6 +8119,7 @@ static void lock_engage(void) {
  * out and deletes itself — no timer to own or tear down. */
 static void always_on_toggle(void) {
     s_always_on = !s_always_on;
+    s_req_lock_pref_save = true;
     ESP_LOGI(TAG, "always-on %s", s_always_on ? "ON" : "OFF");
 
     if (!ui_lock()) return;
@@ -8208,6 +8250,7 @@ static void app_open(int idx) {
     s_cfg_days_val = NULL;
     s_cfg_rot_val = NULL; s_cfg_vol_val = NULL;
     s_cfg_rot_sw = NULL; s_cfg_rot_btn = NULL; s_cfg_time_sw = NULL;
+    s_cfg_always_sw = NULL; s_cfg_rings_sw = NULL;
     s_cfg_bright_val = NULL;
     s_cfg_batt_bar = NULL;
     s_cfg_batt_val = NULL; s_cfg_batt_sub = NULL;
@@ -8240,7 +8283,8 @@ static void app_open(int idx) {
     lock_snapshot_clear();
     s_lock_time = NULL; s_lock_date = NULL; s_lock_meridiem = NULL;
     s_lock_batt = NULL;
-    s_lock_charge = NULL; s_lock_ring = NULL; s_lock_batt_arc = NULL;
+    s_lock_charge = NULL; s_lock_ring = NULL; s_lock_inner_ring = NULL;
+    s_lock_batt_arc = NULL;
     s_lock_np = NULL;
     s_lock_np_art = NULL; s_lock_np_ph = NULL;
     s_lock_np_track = NULL; s_lock_np_prev = NULL; s_lock_np_play = NULL;
@@ -8647,6 +8691,11 @@ void app_main(void) {
         if (s_req_clock_save && !ble_prov_nvs_blocked()) {
             s_req_clock_save = false;
             clock_pref_save();
+        }
+
+        if (s_req_lock_pref_save && !ble_prov_nvs_blocked()) {
+            s_req_lock_pref_save = false;
+            lock_pref_save();
         }
 
         if (s_req_chg_save && !ble_prov_nvs_blocked()) {
