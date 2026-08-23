@@ -57,7 +57,7 @@ open.
 
 ```
 /sdcard/apps/<id>.bin      per-app state blob (opaque to the store)
-/sdcard/logs/pwrlog.csv    power telemetry
+/sdcard/logs/pwrlog3.csv    power telemetry
 /sdcard/assets/            wallpapers, fonts, downloaded artwork
 ```
 
@@ -73,7 +73,12 @@ truncated write fail safe.
 
 Two constraints from FATFS worth knowing before you name a file: 8.3 filenames
 are the default (`telemetry.csv`, a 9-character stem, silently fails to
-create — hence `pwrlog.csv`), and long filenames need `CONFIG_FATFS_LFN_HEAP=y`.
+create — hence the short `pwrlog3` stem, which still has room to grow), and long
+filenames need `CONFIG_FATFS_LFN_HEAP=y`.
+
+The trailing digit is a schema version. The CSV header is written only for a
+file that does not exist yet, so adding a column has to come with a new name —
+otherwise old rows sit under a header that no longer describes them.
 
 ## Writing a new app
 
@@ -687,7 +692,7 @@ controls read as a desktop dialog enlarged badly — so readouts and button labe
 use `lv_font_montserrat_20`, which is already compiled in and carries the same
 `LV_SYMBOL_*` glyphs as the default.
 
-**Three settings live here, and all three share one shape:** the LVGL callback
+**Every setting here shares one shape:** the LVGL callback
 records a value and raises a flag, and the main loop does the work. That is not
 ceremony. Writing NVS from a `LV_EVENT_VALUE_CHANGED` handler erases flash on
 every pixel of a drag, and rewriting a value label mid-drag re-lays out the
@@ -767,10 +772,42 @@ Two states.
 
 Desk-clock mode suppresses the auto-sleep entirely, so the panel stays lit.
 
-Telemetry lands in `/sdcard/logs/pwrlog.csv` once a minute and on every state
+Telemetry lands in `/sdcard/logs/pwrlog3.csv` once a minute and on every state
 change — the device cannot log to USB while on battery, which is exactly when
 the numbers matter. Track **mV per hour**; percentage moves far too coarsely to
 show an improvement over an hour.
+
+### Battery care
+
+A cube on a desk is a cell held at 4.2 V forever, which is the fastest way to
+wear one out — roughly 300-500 cycles there against 1200-2000 at 4.0 V. CONTROL
+offers three charge targets: **full 4.2 V**, **balanced 4.1 V** (the default,
+~85-90%) and **max lifespan 4.0 V** (~75-80%).
+
+**The PMU does all of it.** Facet writes one register — the CV target, `0x64` —
+and the AXP2101 runs the cycle itself: charge, terminate, open BATFET so the
+cube runs on USB with the cell disconnected, and resume unaided once VBAT drifts
+100 mV below the target. There is no charge-inhibit bit, no state machine and no
+threshold polling; the hysteresis is in silicon. See HARDWARE.md §7.
+
+Three consequences worth knowing:
+
+- **"Charging" and "plugged in" stopped being the same question.** With a cap in
+  force the charger finishes hours before the cube leaves the dock, so the UI
+  reads `s_vbus` (reg `0x00` bit 5) for presence and shows charging / on USB -
+  bypass / plugged as three distinct states. The lock-screen bolt means *on the
+  charger*, not *current flowing*.
+- **The cap is re-asserted every poll, not written at boot.** `0x64` survives an
+  ESP32 reset but not a PMU power-on reset, and the datasheet warns the charger
+  is re-enabled on adapter insertion. One extra register read every two seconds
+  on a bus already in use buys a setting that cannot silently lapse.
+- **Lowering the cap does not drain a full cell** — the AXP2101 has no force
+  discharge, and under bypass the only drain is self-discharge. The setting takes
+  effect from the next charge onward.
+
+"CHARGE FULL ONCE" arms a single 4.2 V cycle that reverts itself at charge-done
+and survives a reboot. It is also the only way to re-calibrate the fuel gauge,
+which needs a complete cycle it otherwise never gets.
 
 ## Layout
 

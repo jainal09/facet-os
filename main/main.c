@@ -103,17 +103,32 @@ static const char *TAG = "funnel";
 
 /* AXP2101 PMU */
 #define AXP2101_ADDR          0x34
-#define AXP_REG_STATUS1       0x00      /* bit3: battery present */
-#define AXP_REG_STATUS2       0x01      /* bits[6:5]: 01=charging */
+#define AXP_REG_STATUS1       0x00      /* b5 VBUS good, b4 BATFET, b3 battery present, b0 in ILIM */
+#define AXP_REG_STATUS2       0x01      /* b[6:5] 00 idle/01 charge/10 discharge, b[2:0] charge state */
 #define AXP_REG_GAUGE_CTRL    0x18      /* bit3: fuel-gauge module enable */
 #define AXP_REG_ADC_CH_CTRL   0x30      /* bit0: battery voltage ADC enable */
 #define AXP_REG_ADC_DATA_H    0x34
 #define AXP_REG_ADC_DATA_L    0x35
 #define AXP_REG_INTEN2        0x41      /* bit3: PWRKEY short-press IRQ enable */
 #define AXP_REG_INTSTS2       0x49      /* bit3: PWRKEY short press, write 1 to clear */
+#define AXP_REG_CHG_ICC       0x62      /* bits[4:0]: constant-current charge step */
+#define AXP_REG_CHG_CV        0x64      /* bits[2:0]: charge target (CV) voltage */
 #define AXP_REG_BAT_DET_CTRL  0x68      /* bit0: battery detection enable */
 #define AXP_REG_BAT_PERCENT   0xA4
 #define AXP_PKEY_SHORT_BIT    3
+
+/* Charge target voltage, reg 0x64[2:0]. The cell is never held above this, and
+ * the PMU restarts charging on its own once it falls 100 mV below (VRECHG is
+ * fixed at CV-100mV), so the whole charge-limit feature is these three codes —
+ * no polling loop, no charge-inhibit bit. */
+#define AXP_CV_4V00           0x01
+#define AXP_CV_4V10           0x02
+#define AXP_CV_4V20           0x03
+#define AXP_CV_MASK           0x07
+
+/* reg 0x01[2:0] charge state. Only "done" matters to us: it is the point where
+ * the PMU stops charging and opens BATFET, which is the bypass we are after. */
+#define AXP_CHG_DONE          0x04
 
 static EventGroupHandle_t s_evt;
 #define WIFI_CONNECTED_BIT BIT0
@@ -199,6 +214,23 @@ static volatile int  s_batt_mv;
 static volatile bool s_batt_charging;
 static volatile bool s_wifi_up;
 static volatile bool s_screen_on = true;
+
+/* Battery care. A device that lives on a desk sits pinned at 4.2 V, which is
+ * the worst thing you can do to a lithium cell — roughly 300-500 cycles there
+ * against 1200-2000 at 4.0 V. Capping the charge target trades a little
+ * runtime for that, the same bargain every laptop vendor now ships. */
+typedef enum { CHG_FULL = 0, CHG_BALANCED = 1, CHG_LIFESPAN = 2 } chg_mode_t;
+static volatile int  s_chg_mode = CHG_BALANCED;
+static volatile bool s_chg_once;            /* one-shot: charge to full this once */
+static volatile bool s_req_chg_save;
+
+/* Read from the PMU status bytes battery_poll() already fetches. s_vbus is
+ * what "plugged in" means now: once the cap engages the charger stops while
+ * still on USB, so s_batt_charging alone would report a docked cube as running
+ * on battery. */
+static volatile bool    s_vbus;
+static volatile bool    s_bypass;           /* on USB, charge finished, cell idle */
+static volatile uint8_t s_chg_state;        /* reg 0x01[2:0] */
 
 /* pet state (persisted) */
 static int s_food = 80, s_fun = 75, s_nrg = 90;
@@ -1251,6 +1283,41 @@ static esp_err_t axp_set_bit(uint8_t reg, uint8_t bit) {
     return axp_write(reg, (uint8_t)(v | (1u << bit)));
 }
 
+static uint8_t chg_cv_code(void) {
+    if (s_chg_once) return AXP_CV_4V20;
+    switch (s_chg_mode) {
+        case CHG_LIFESPAN: return AXP_CV_4V00;
+        case CHG_BALANCED: return AXP_CV_4V10;
+        default:           return AXP_CV_4V20;
+    }
+}
+
+static int chg_cv_mv(uint8_t code) {
+    switch (code & AXP_CV_MASK) {
+        case AXP_CV_4V00: return 4000;
+        case AXP_CV_4V10: return 4100;
+        case AXP_CV_4V20: return 4200;
+        default:          return 0;        /* 4.35/4.4 V, or the reserved 000 */
+    }
+}
+
+/* Write the charge cap if the PMU is not already holding it.
+ *
+ * This is called from battery_poll() rather than once at boot, and that is the
+ * point: reg 0x64 survives a system reset but not a POR, and the datasheet is
+ * explicit that "the charger is enabled when an adapter is inserted" — so the
+ * cap has to be something we keep asserting, not something we set and trust.
+ * The read is one byte on a bus we are already talking to. */
+static void chg_apply(void) {
+    if (!s_axp) return;
+    uint8_t want = chg_cv_code(), cv = 0;
+    if (axp_read(AXP_REG_CHG_CV, &cv) != ESP_OK) return;
+    if ((cv & AXP_CV_MASK) == want) return;
+    if (axp_write(AXP_REG_CHG_CV, (uint8_t)((cv & ~AXP_CV_MASK) | want)) != ESP_OK) return;
+    ESP_LOGI(TAG, "charge cap -> %d mV (CV 0x%02x -> 0x%02x)",
+             chg_cv_mv(want), cv & AXP_CV_MASK, want);
+}
+
 static void pmu_init(void) {
     i2c_master_bus_handle_t bus = bsp_i2c_get_handle();
     if (!bus) {
@@ -1277,13 +1344,16 @@ static void pmu_init(void) {
     /* The PMU powers up at 25 mA, which barely charges the cell at all.
      * 400 mA is what Waveshare's own AXP2101 example programs. */
     uint8_t icc = 0, cv = 0, ctrl = 0;
-    axp_read(0x62, &icc);
-    axp_write(0x62, (uint8_t)((icc & 0xE0) | 10));      /* step 10 = 400 mA */
-    axp_read(0x62, &icc); axp_read(0x64, &cv); axp_read(0x18, &ctrl);
+    axp_read(AXP_REG_CHG_ICC, &icc);
+    axp_write(AXP_REG_CHG_ICC, (uint8_t)((icc & 0xE0) | 10));   /* step 10 = 400 mA */
+    chg_apply();
+    axp_read(AXP_REG_CHG_ICC, &icc);
+    axp_read(AXP_REG_CHG_CV, &cv);
+    axp_read(AXP_REG_GAUGE_CTRL, &ctrl);
     int step = icc & 0x1F;
     int ma = (step <= 8) ? step * 25 : 200 + (step - 8) * 100;
-    ESP_LOGI(TAG, "AXP2101 ready — charge current %d mA (ICC=0x%02x) CV=0x%02x CTRL=0x%02x",
-             ma, icc, cv, ctrl);
+    ESP_LOGI(TAG, "AXP2101 ready — charge current %d mA (ICC=0x%02x) cap %d mV "
+                  "(CV=0x%02x) CTRL=0x%02x", ma, icc, chg_cv_mv(cv), cv, ctrl);
 }
 
 static void battery_poll(void) {
@@ -1293,6 +1363,17 @@ static void battery_poll(void) {
     if (axp_read(AXP_REG_STATUS1, &st1) != ESP_OK) return;
     axp_read(AXP_REG_STATUS2, &st2);
     s_batt_charging = ((st2 >> 5) & 0x03) == 0x01;
+
+    /* Presence is reg 0x00 bit 5 alone. XPowersLib's isVbusIn() also demands
+     * "not in VINDPM", which reads as unplugged whenever the supply droops —
+     * exactly the case a charge cap makes more likely, not less. */
+    s_vbus      = (st1 >> 5) & 0x01;
+    s_chg_state = st2 & 0x07;
+    s_bypass    = s_vbus && s_chg_state == AXP_CHG_DONE;
+
+    /* Above the no-cell return: the cap is a PMU setting, and both it and VBUS
+     * stay meaningful on a board running with the battery unplugged. */
+    chg_apply();
 
     if (!((st1 >> 3) & 0x01)) {          /* no battery on the connector */
         s_batt_pct = -1;
@@ -1545,6 +1626,32 @@ static void clock_pref_save(void) {
         nvs_commit(h);
         nvs_close(h);
     }
+}
+
+static void chg_save(void) {
+    if (ble_prov_nvs_blocked()) return;
+    nvs_handle_t h;
+    if (nvs_open("cfg", NVS_READWRITE, &h) == ESP_OK) {
+        nvs_set_i32(h, "chgmode", s_chg_mode);
+        nvs_set_i32(h, "chgonce", s_chg_once ? 1 : 0);
+        nvs_commit(h);
+        nvs_close(h);
+    }
+}
+
+/* Runs before pmu_init() so the first CV write is already the user's choice
+ * rather than the compiled default corrected a poll later. The armed one-shot
+ * is persisted on purpose: a reboot part-way through a top-up should finish it,
+ * not silently cancel it. */
+static void chg_load(void) {
+    nvs_handle_t h;
+    if (nvs_open("cfg", NVS_READONLY, &h) != ESP_OK) return;
+    int32_t v;
+    if (nvs_get_i32(h, "chgmode", &v) == ESP_OK && v >= CHG_FULL && v <= CHG_LIFESPAN) {
+        s_chg_mode = (int)v;
+    }
+    if (nvs_get_i32(h, "chgonce", &v) == ESP_OK) s_chg_once = (v != 0);
+    nvs_close(h);
 }
 
 /* Both display-orientation settings, on one handle: this runs once at boot. */
@@ -2927,6 +3034,7 @@ static lv_obj_t *s_cfg_rot_sw, *s_cfg_rot_btn, *s_cfg_time_sw;
 static lv_obj_t *s_cfg_bright_val;
 static lv_obj_t *s_cfg_vol_val;
 static lv_obj_t *s_cfg_batt_bar, *s_cfg_batt_val, *s_cfg_batt_sub;
+static lv_obj_t *s_cfg_care_val, *s_cfg_care_sld, *s_cfg_care_btn;
 static lv_obj_t *s_cfg_net_val;
 static lv_obj_t *s_cfg_ble_val;
 static lv_obj_t *s_cfg_ble_code;
@@ -3117,6 +3225,39 @@ static void cfg_clock_cb(lv_event_t *e) {
     ESP_LOGI(TAG, "lock clock %s", s_clock_24 ? "24-hour" : "12-hour");
 }
 
+static const char *chg_mode_name(int mode) {
+    switch (mode) {
+        case CHG_LIFESPAN: return "max lifespan  4.0V";
+        case CHG_BALANCED: return "balanced  4.1V";
+        default:           return "full  4.2V";
+    }
+}
+
+/* Three stops on a slider rather than three buttons: it inherits the 76 px
+ * touch sizing and the widened hit area that this panel needs, and a row of
+ * buttons would have to fight the card's flex column for width. Label on
+ * release only, for the reason cfg_vol_cb spells out above. */
+static void cfg_care_cb(lv_event_t *e) {
+    s_chg_mode = clampi((int)lv_slider_get_value(lv_event_get_target(e)),
+                        CHG_FULL, CHG_LIFESPAN);
+    if (lv_event_get_code(e) != LV_EVENT_RELEASED) return;
+
+    if (s_cfg_care_val) {
+        lv_label_set_text_fmt(s_cfg_care_val, "charge to  %s", chg_mode_name(s_chg_mode));
+    }
+    s_req_chg_save = true;
+    ESP_LOGI(TAG, "battery care -> %s", chg_mode_name(s_chg_mode));
+}
+
+/* Arms a single full charge, which reverts itself at charge-done. It is also
+ * the only way to re-learn the fuel gauge: the coulomb counter only recalibrates
+ * across a complete cycle, and a capped cube never gives it one. */
+static void cfg_care_once_cb(lv_event_t *e) {
+    s_chg_once = !s_chg_once;
+    s_req_chg_save = true;
+    ESP_LOGI(TAG, "one-shot full charge %s", s_chg_once ? "ARMED" : "cancelled");
+}
+
 /* Same shape as cfg_vol_cb and for the same three reasons: the label is only
  * rewritten on release, because resizing it mid-drag re-lays out the card and
  * moves the slider under the finger; the panel write is left to the main loop,
@@ -3275,11 +3416,16 @@ static void cfg_timer_cb(lv_timer_t *t) {
         lv_color_hex(pct < 0 ? 0x4A9EFF
                     : pct >= 50 ? 0x35C759
                     : pct >= 20 ? 0xFFB020 : 0xFF453A), LV_PART_INDICATOR);
+    /* "charging" is no longer the same question as "plugged in" — with a cap in
+     * force the charger stops long before the cube leaves the dock, so say which
+     * of the three states it actually is. */
+    const char *power = s_batt_charging ? "   " LV_SYMBOL_CHARGE " charging"
+                      : s_bypass        ? "   on USB - bypass"
+                      : s_vbus          ? "   plugged" : "";
     if (pct < 0) {
-        label_set_changed(s_cfg_batt_val, "external power");
+        label_set_fmt_changed(s_cfg_batt_val, "external power%s", power);
     } else {
-        label_set_fmt_changed(s_cfg_batt_val, "%d%%   %d mV%s", pct, s_batt_mv,
-                              s_batt_charging ? "   " LV_SYMBOL_CHARGE " charging" : "");
+        label_set_fmt_changed(s_cfg_batt_val, "%d%%   %d mV%s", pct, s_batt_mv, power);
     }
     int drain = battery_drain_mv_h();
     if (drain > 0) {
@@ -3288,6 +3434,18 @@ static void cfg_timer_cb(lv_timer_t *t) {
     } else {
         label_set_fmt_changed(s_cfg_batt_sub, "drain  measuring...   /   %s",
                               s_doze ? "dozing" : "active");
+    }
+    if (s_cfg_care_val) {
+        if (s_chg_once) {
+            label_set_changed(s_cfg_care_val, "charging to full once, then back");
+        } else {
+            label_set_fmt_changed(s_cfg_care_val, "charge to  %s",
+                                  chg_mode_name(s_chg_mode));
+        }
+    }
+    if (s_cfg_care_btn) {
+        /* Nothing to top up to when Full is already the target. */
+        cfg_button_live(s_cfg_care_btn, s_chg_mode != CHG_FULL);
     }
 
     /* ---- pair ----
@@ -3492,6 +3650,14 @@ static void build_control_app(lv_obj_t *scr) {
     lv_obj_set_style_radius(s_cfg_batt_bar, 6, LV_PART_INDICATOR);
     lv_obj_set_style_bg_color(s_cfg_batt_bar, lv_color_hex(0x1E293B), 0);
     s_cfg_batt_sub = cfg_text(c, 0x64748B);
+
+    s_cfg_care_val = cfg_text(c, 0xC7D2E0);
+    lv_obj_set_height(s_cfg_care_val, 26);     /* one montserrat_20 line, uncl'd */
+    lv_label_set_text_fmt(s_cfg_care_val, "charge to  %s", chg_mode_name(s_chg_mode));
+    s_cfg_care_sld = cfg_slider(c, CHG_FULL, CHG_LIFESPAN, s_chg_mode,
+                                CFG_ACCENT_BATT, 0xA7F3D0, cfg_care_cb);
+    s_cfg_care_btn = cfg_button(c, "CHARGE FULL ONCE", CFG_ACCENT_BATT,
+                                cfg_care_once_cb);
 
     /* ---- wi-fi setup ---- */
     /* Directly above NETWORK: setup is what you reach for when the readout
@@ -7001,8 +7167,10 @@ static bool store_load(const char *id, void *data, size_t len) {
  * the power numbers matter — so it keeps its own history on the card.
  */
 
-#define TELEMETRY_PATH   BSP_SD_MOUNT_POINT "/logs/pwrlog2.csv"
-#define TELEMETRY_OLD    BSP_SD_MOUNT_POINT "/logs/pwrlog.csv"
+/* Bumped to 3 when the charge-care columns landed. The header is only written
+ * for a file that does not exist yet, so adding a column to the old name would
+ * have left rows that no longer line up with the header above them. */
+#define TELEMETRY_PATH   BSP_SD_MOUNT_POINT "/logs/pwrlog3.csv"
 #define TELEMETRY_PERIOD 60000
 
 static void sd_init(void) {
@@ -7031,7 +7199,7 @@ static void telemetry_dump(void) {
         ESP_LOGW(TAG, "no power log at %s", TELEMETRY_PATH);
         return;
     }
-    ESP_LOGW(TAG, "=== BEGIN pwrlog.csv ===");
+    ESP_LOGW(TAG, "=== BEGIN pwrlog ===");
     char line[224];
     int n = 0;
     while (fgets(line, sizeof(line), f)) {
@@ -7041,7 +7209,7 @@ static void telemetry_dump(void) {
         if ((n % 40) == 0) vTaskDelay(pdMS_TO_TICKS(20));  /* let USB-CDC drain */
     }
     fclose(f);
-    ESP_LOGW(TAG, "=== END pwrlog.csv (%d lines) ===", n);
+    ESP_LOGW(TAG, "=== END pwrlog (%d lines) ===", n);
 }
 #endif
 
@@ -7058,7 +7226,8 @@ static void telemetry_row(const char *event) {
         return;
     }
     if (fresh) {
-        fprintf(f, "build,clock,uptime_s,event,batt_mv,batt_pct,charging,doze,screen,"
+        fprintf(f, "build,clock,uptime_s,event,batt_mv,batt_pct,charging,vbus,"
+                   "chg_state,cap_mv,doze,screen,"
                    "wifi,app,heap_free,heap_min,heap_largest,fps\n");
     }
 
@@ -7069,9 +7238,10 @@ static void telemetry_row(const char *event) {
     localtime_r(&tnow, &ti);
     if (ti.tm_year >= (2024 - 1900)) strftime(clock, sizeof(clock), "%H:%M:%S", &ti);
 
-    fprintf(f, "%s,%s,%lld,%s,%d,%d,%d,%d,%d,%d,%d,%u,%u,%u,%u.%u\n",
+    fprintf(f, "%s,%s,%lld,%s,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%u,%u,%u,%u.%u\n",
             build_id(), clock, (long long)(now_ms() / 1000), event,
             s_batt_mv, s_batt_pct, s_batt_charging ? 1 : 0,
+            s_vbus ? 1 : 0, s_chg_state, chg_cv_mv(chg_cv_code()),
             s_doze ? 1 : 0, s_screen_on ? 1 : 0, s_wifi_up ? 1 : 0, s_app,
             (unsigned)hp_free(), (unsigned)hp_min(), (unsigned)hp_largest(),
             (unsigned)(s_last_fps_x10 / 10), (unsigned)(s_last_fps_x10 % 10));
@@ -7352,19 +7522,28 @@ static void lock_refresh(void) {
                                   : (pct >= 50 ? 0x22D3EE
                                      : (pct >= 20 ? 0xF59E0B : 0xEF4444)));
     }
+    /* The bolt means "on the charger", not "current is flowing". With a charge
+     * cap in force the cube reaches its target and stops hours before it leaves
+     * the dock, and a bolt that vanishes there reads as the dock having failed.
+     * So it shows on VBUS and breathes only while current actually flows —
+     * steady bolt is the resting state of a docked, capped cube. */
+    static bool was_charging;
     bool charge_was_hidden = s_lock_charge &&
                              lv_obj_has_flag(s_lock_charge, LV_OBJ_FLAG_HIDDEN);
-    obj_set_hidden_changed(s_lock_charge, !s_batt_charging);
+    obj_set_hidden_changed(s_lock_charge, !s_vbus);
     if (!s_batt_charging) {
         s_lock_charge_phase = s_lock_charge_div = 0;
         if (s_lock_charge &&
             lv_obj_get_style_text_opa(s_lock_charge, 0) != LV_OPA_COVER) {
             lv_obj_set_style_text_opa(s_lock_charge, LV_OPA_COVER, 0);
         }
-    } else if (charge_was_hidden) {
+    } else if (charge_was_hidden || !was_charging) {
+        /* Also seed the fade when charging starts under an already-visible
+         * bolt — plugging in now reveals it before any current flows. */
         s_lock_charge_phase = s_lock_charge_div = 0;
         lv_obj_set_style_text_opa(s_lock_charge, 96, 0);
     }
+    was_charging = s_batt_charging;
     if (lv_arc_get_bg_angle_start(s_lock_batt_arc) != 0 ||
         lv_arc_get_bg_angle_end(s_lock_batt_arc) != arc_end) {
         lv_arc_set_bg_angles(s_lock_batt_arc, 0, arc_end);
@@ -7952,6 +8131,7 @@ static void app_open(int idx) {
     s_cfg_bright_val = NULL;
     s_cfg_batt_bar = NULL;
     s_cfg_batt_val = NULL; s_cfg_batt_sub = NULL;
+    s_cfg_care_val = NULL; s_cfg_care_sld = NULL; s_cfg_care_btn = NULL;
     s_cfg_net_val = NULL; s_cfg_sys_val = NULL; s_cfg_log = NULL;
     s_cfg_ble_val = NULL; s_cfg_ble_code = NULL; s_cfg_ble_btn = NULL;
     s_sp_art = NULL; s_sp_art_ph = NULL; s_sp_lbl_track = NULL;
@@ -8167,6 +8347,7 @@ void app_main(void) {
     sd_init();
     days_load();
     rtc_init();
+    chg_load();          /* before pmu_init: the first CV write is the user's */
     pmu_init();
     battery_poll();
     rot_off_load();
@@ -8386,6 +8567,13 @@ void app_main(void) {
             clock_pref_save();
         }
 
+        if (s_req_chg_save && !ble_prov_nvs_blocked()) {
+            s_req_chg_save = false;
+            chg_save();
+            chg_apply();        /* don't make the user wait for the next poll */
+            telemetry_row("chgmode");
+        }
+
         if (s_req_ble_on) {
             s_req_ble_on = false;
 
@@ -8595,10 +8783,24 @@ void app_main(void) {
 
         if (t - last_batt >= (s_doze ? 30000 : BATTERY_PERIOD_MS)) {
             last_batt = t;
+            static bool was_bypass;
             battery_poll();
             if (s_batt_mv > 0 && !s_batt_t_first) {
                 s_batt_mv_first = s_batt_mv;
                 s_batt_t_first = now_ms();
+            }
+            /* A one-shot ends when the charge it asked for actually finishes,
+             * not when the cube is unplugged — so an interrupted top-up resumes
+             * on the next connection instead of being silently dropped. */
+            if (s_chg_once && s_bypass) {
+                s_chg_once = false;
+                s_req_chg_save = true;
+                ESP_LOGI(TAG, "one-shot full charge done, cap back to %d mV",
+                         chg_cv_mv(chg_cv_code()));
+            }
+            if (s_bypass != was_bypass) {
+                was_bypass = s_bypass;
+                telemetry_row(s_bypass ? "bypass" : "charge");
             }
         }
 
@@ -8622,7 +8824,7 @@ void app_main(void) {
                     strftime(clock, sizeof(clock), "%H:%M:%S", &tinfo);
                 }
             }
-            ESP_LOGI(TAG, "uptime=%llds clock=%s scr=%d idle=%lu/%llds wifi=%s%d screen=%s batt=%d%% %dmV%s fps=%u.%u "
+            ESP_LOGI(TAG, "uptime=%llds clock=%s scr=%d idle=%lu/%llds wifi=%s%d screen=%s batt=%d%% %dmV%s%s cap=%dmV%s fps=%u.%u "
                           "rot=%d sd=%lu pet[%d/%d/%d]%s",
                      (long long)(t / 1000), clock, (int)s_app,
                      (unsigned long)lv_display_get_inactive_time(NULL),
@@ -8631,6 +8833,8 @@ void app_main(void) {
                      s_screen_on ? "on" : "off",
                      (int)s_batt_pct, (int)s_batt_mv,
                      s_batt_charging ? " CHG" : "",
+                     s_bypass ? " BYP" : (s_vbus ? " PLUG" : ""),
+                     chg_cv_mv(chg_cv_code()), s_chg_once ? " ONCE" : "",
                      (unsigned)(s_last_fps_x10 / 10), (unsigned)(s_last_fps_x10 % 10),
                      s_rot * 90, (unsigned long)s_tele_rows, s_food, s_fun, s_nrg,
                      s_stack_fallback ? " STACK-FALLBACK!" : "");

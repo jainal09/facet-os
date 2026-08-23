@@ -402,8 +402,43 @@ are rebound to volume.
 
 - **Charge current powers up at 25 mA** (reg `0x62` = 0x01), which looks exactly
   like "the battery never charges". Waveshare's own example sets **400 mA**
-  (step 10): `reg 0x62 = (old & 0xE0) | 10`. CV reg `0x64` = 0x03 = 4.2 V is
-  already correct.
+  (step 10): `reg 0x62 = (old & 0xE0) | 10`.
+- **The charge target is reg `0x64` bits[2:0]:** `001` = 4.0 V, `010` = 4.1 V,
+  `011` = 4.2 V (POR default), `100` = 4.35 V, `101` = 4.4 V. There is nothing
+  between the steps — 4.0/4.1/4.2 is the entire granularity available for a
+  charge limit, which is why Facet's battery care has three modes and not a
+  percentage slider.
+- **The PMU opens BATFET at charge-done, and that is real battery bypass.**
+  Datasheet §6.7.3.3: at termination it "stops charging (charger enable bit is
+  still 1) and turns off BATFET", so the cell is disconnected from the system
+  rail and the board runs from VBUS alone. §6.7.3.4: it re-closes and resumes
+  charging on its own once VBAT falls below **VRECHG, fixed at CV − 100 mV**.
+  That is hardware hysteresis — a charge limit needs no polling loop and cannot
+  micro-cycle. Cap the CV and the PMU does the rest.
+- **You cannot command BATFET.** `0x00` bit 4 is read-only state, there is no
+  ship mode, and `0x12` — which `XPowersLib` names `BATFET_CTRL` — holds only
+  die-over-temperature bits. The `enableBATFET`/`disableBATFET` in that library
+  belong to the SY6970, a different chip. Bypass is reached, never ordered.
+- **Reset domains decide what you must re-assert.** `0x64` (CV), `0x62` (ICC),
+  `0x61`, `0x68` and the ADC enables are **POR**-reset: they survive an ESP32
+  reset but not a true power-on. `0x18` bit 1 (cell charge enable) and `0x63`
+  bit 4 are **System Reset** — cleared far more often, and §6.7.3.4 additionally
+  warns "the charger is enabled when an adapter is inserted". Driving a charge
+  limit from CV rather than from the enable bit is the robust choice, and even
+  CV is re-checked every poll rather than written once at boot.
+- **`isVbusIn()` is a trap; use `0x00` bit 5.** `XPowersLib`'s `isVbusIn()` ANDs
+  VBUS-good with *not in VINDPM*, so a drooping supply reports "unplugged" while
+  plugged, and its `getVbusVoltage()` then returns 0. Bit 5 alone is the honest
+  presence bit. Charge state is `0x01` bits[2:0]: `010` CC, `011` CV,
+  **`100` done**, `101` not charging.
+- **Two AXP2101 datasheets are in circulation and they disagree.** The
+  switching-charger revision documents `0x14` bits[2:0] as a 3.2–3.9 V minimum
+  system voltage; the linear-charger revision documents bits[6:4] as a 4.1–4.8 V
+  VSYS DPM. The charge-control registers (`0x00`, `0x01`, `0x18`, `0x62`, `0x64`)
+  are identical in both. Leave `0x14`/`0x15`/`0x16` alone unless you have
+  established which silicon is fitted — `0x16` already defaults to 1500 mA, which
+  is what keeps the system fed from VBUS instead of dropping into supplement mode
+  under an AMOLED + Wi-Fi load spike.
 - The fuel gauge reads 0% until **three** separate enables: `0x18` bit 3 (gauge
   module), `0x68` bit 0 (battery detect), `0x30` bit 0 (voltage ADC). Percentage
   at `0xA4`; battery voltage at `0x34`/`0x35` as `((hi & 0x1F) << 8) | lo` mV.
@@ -421,6 +456,11 @@ are rebound to volume.
   when terminal voltage is at its most flattering, so that pairing is a
   contradiction no load condition explains. The wide-gap test alone is not enough:
   100% at 4013 mV is only 21 points out and slips through.
+- **A charge cap makes the gauge worse, and the one-shot is the cure.** Capped at
+  4.1 V the cell never reaches a full charge, so the coulomb counter never gets
+  the complete cycle it needs to re-learn and the voltage cross-check above stops
+  being a fallback — it becomes the primary reading. CONTROL's "CHARGE FULL ONCE"
+  exists as much for the gauge as for the trip you are packing for.
 
 ## 7b. Power management and idle drain
 
@@ -455,7 +495,7 @@ measured on hardware:
 
 Measure, don't guess: log battery mV and derive mV/hour. Percentage moves far
 too coarsely to see an improvement over an hour. Facet writes a row to
-`/sdcard/logs/pwrlog.csv` every minute and on every power-state change.
+`/sdcard/logs/pwrlog3.csv` every minute and on every power-state change.
 
 ## 7c. Images, assets and the SD card
 
