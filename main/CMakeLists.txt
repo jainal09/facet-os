@@ -19,6 +19,10 @@ set(UNSPLASH_KEY     "")
 set(UNSPLASH_QUERY   "space,nebula,astronomy")
 set(BROKER_TOKEN         "")
 set(BROKER_URL           "")
+# Not a secret, unlike everything else here: it is a public static page, and the
+# default has to work for a fresh clone with no .env, because a device that
+# cannot show a working setup QR cannot be given Wi-Fi credentials at all.
+set(SETUP_URL            "https://jainal09.github.io/facet-os/setup/v1/")
 set(SPOTIFY_REFRESH_TOKEN  "")
 set(SPOTIFY_CLIENT_ID    "")
 

@@ -671,9 +671,45 @@ everything after is AES-GCM. Five wrong attempts ends the session and stops
 advertising — the limit is what makes six digits worth anything, so it must
 close the session rather than merely refuse the frame.
 
-The phone page is served by the broker at `/provision`, because Web Bluetooth
-requires a secure context and that service already has a real certificate behind
-Tailscale Funnel. It is inert markup holding no secret, so it is deliberately
+**The cube shows a QR code, because knowing the URL was a prerequisite nobody
+had.** Tapping "Set up / change Wi-Fi" used to display six digits and leave the
+user to discover an address that appears nowhere on the device. The panel now
+draws a QR beside the code, encoding the setup page with the pairing code in its
+**fragment** (`.../setup/v1/#c=123456`) so the phone arrives already unlocked. A
+fragment rather than a query string: fragments are never sent to a server, so the
+code stays out of the static host's access log. It is no more secret than the
+digits printed next to the QR, but there is no reason to hand it to a third party.
+
+**The page is static, and it is not served by the broker any more.** It talks to
+the cube over GATT and to no server at all, so the only thing it ever needed from
+the broker was an HTTPS certificate for Web Bluetooth's secure-context rule.
+GitHub Pages provides one, so `SETUP_URL` points there and
+`.github/workflows/pages.yml` publishes it. That matters because Wi-Fi setup was
+otherwise a hostage to the home server: when the broker's disk filled,
+re-provisioning a cube would have been down with it, and a cube that cannot be
+given Wi-Fi credentials cannot reach anything to fix itself. The broker keeps
+serving its own embedded copy at `/provision` as a fallback, and
+`broker/static/provision.html` stays the single source of truth — it must live
+under `broker/` because `go:embed` cannot reach outside the Go module.
+
+**The `/vN/` in the path is the GATT protocol version**, and it exists because
+Pages will not let us set headers. The broker sends `Cache-Control: no-store` so a
+phone cannot hold a cached page that speaks an older protocol than the cube in
+front of it; on Pages that header is not ours to send, so the *path* carries the
+version instead. A stale cache can then only be old-and-unused, never wrong.
+
+**The page branches on capability, never on user-agent.** `navigator.bluetooth`
+being undefined is the actual question — it is true on iOS, where Safari does not
+implement Web Bluetooth and every iOS browser is Safari underneath, and equally
+true in Firefox on Android, in every in-app webview, and on a desktop. Sniffing
+the UA string gets all of those wrong. Where it is missing the page swaps the
+Connect card for instructions to install Bluefy and copy the link, rather than
+presenting a disabled button with no explanation. Note what is deliberately *not*
+done: no `bluefy://` scheme goes into the QR itself. iOS Camera handles non-HTTPS
+schemes unreliably, and a scan that dead-ends when the app is absent is worse than
+one that lands somewhere able to explain itself.
+
+The page is inert markup holding no secret, so it is deliberately
 unauthenticated: reaching a cube needs radio range *and* the code on its screen.
 
 ## CONTROL: sized for a fingertip

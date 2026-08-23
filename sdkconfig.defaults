@@ -184,6 +184,12 @@ CONFIG_FREERTOS_USE_TICKLESS_IDLE=y
 CONFIG_FATFS_LFN_HEAP=y
 CONFIG_FATFS_MAX_LFN=64
 
+#### The Wi-Fi setup QR code
+# The cube draws a QR pointing at the setup page, so nobody has to be told a URL.
+# LVGL's encoder renders into a 1-bpp canvas, which LV_DRAW_SW_SUPPORT_I1 above
+# is what makes drawable -- without that the object exists and paints nothing.
+CONFIG_LV_USE_QRCODE=y
+
 #### Images from the SD card
 # LVGL's own POSIX FS driver (drive letter 'S') plus TJpgDec, which decodes
 # baseline JPEG in blocks rather than slurping the file into RAM.

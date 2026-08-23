@@ -1,0 +1,60 @@
+# Publishes the Wi-Fi setup page to GitHub Pages.
+#
+# The page is inert markup that talks to the cube over Web Bluetooth and to no
+# server at all, so the only thing it ever needed from the broker was an HTTPS
+# certificate. Serving it from Pages instead removes the broker -- and the home
+# server it runs on -- from the Wi-Fi setup path entirely. Setting up Wi-Fi is
+# precisely the thing that must not require the rest of the estate to be healthy.
+#
+# broker/static/provision.html stays the single source of truth: it has to live
+# under broker/ because go:embed cannot reach outside the Go module, and the
+# broker still serves its own copy as a fallback.
+#
+# The /setup/v1/ path is the protocol version, and it is what replaces the
+# Cache-Control: no-store header the broker sets and Pages will not let us set.
+# Bump it here AND in SETUP_URL in main/CMakeLists.txt when the GATT contract in
+# main/ble_prov.c changes; old firmware then keeps working against the old path
+# instead of meeting a page that speaks a protocol it does not.
+name: Pages
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'broker/static/provision.html'
+      - '.github/workflows/pages.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# Never cancel a half-finished deploy: the artifact is the live setup page.
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Assemble the site
+        run: |
+          mkdir -p site/setup/v1
+          cp broker/static/provision.html site/setup/v1/index.html
+          # Jekyll would otherwise try to process the tree and drop anything
+          # beginning with an underscore.
+          touch site/.nojekyll
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: site
+
+      - id: deploy
+        uses: actions/deploy-pages@v4

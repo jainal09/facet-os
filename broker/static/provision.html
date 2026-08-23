@@ -114,6 +114,24 @@
   .row { display:flex; gap:10px; }
   .row > * { flex:1; }
   .hint { color:var(--dim); font-size:12px; margin-top:10px; }
+  /* The iOS card is the only place this page gives instructions rather than
+     controls, so it needs a list and a link that reads as a button. */
+  .steps { margin:0 0 14px; padding-left:20px; color:var(--mid); font-size:14px; }
+  .steps li { margin-bottom:6px; }
+  .btnlink {
+    display:block; text-align:center; text-decoration:none;
+    width:100%; min-height:48px; border-radius:12px; border:1px solid var(--accent);
+    background:#1B2432; color:var(--ink); font-size:16px; padding:12px;
+  }
+  .btnlink:active { background:var(--accent); color:#0A0E14; }
+  /* The link is shown as text as well as copied, because a long-press copy is
+     the reliable fallback when the clipboard API is refused. */
+  .urlbox {
+    margin-top:10px; padding:10px 12px; border-radius:10px;
+    background:#0A0E14; border:1px solid var(--line);
+    color:var(--mid); font-size:12px; word-break:break-all;
+    -webkit-user-select:all; user-select:all;
+  }
   .spin {
     display:inline-block; width:14px; height:14px; vertical-align:-2px;
     margin-right:8px; border:2px solid var(--line); border-top-color:var(--accent);
@@ -132,7 +150,29 @@
 <div class="card" id="cardConnect">
   <h2>Connect</h2>
   <button id="btnConnect">Find my cube</button>
-  <div class="hint" id="hintSupport"></div>
+  <div class="hint" id="hintConnect"></div>
+</div>
+
+<!-- Shown instead of Connect wherever there is no Web Bluetooth. In practice
+     that is iPhone, because Safari does not implement it and every iOS browser
+     is Safari underneath; a scanned QR opens there by default. -->
+<div class="card hide" id="cardIos">
+  <h2>iPhone needs one more app</h2>
+  <div class="sub" style="margin:0 0 12px">
+    Safari cannot talk to Bluetooth devices. Bluefy is a browser that can, and
+    this page works inside it.
+  </div>
+  <ol class="steps">
+    <li>Install <b>Bluefy</b> from the App Store.</li>
+    <li>Copy the setup link below.</li>
+    <li>Open Bluefy, paste it in the address bar, and carry on there.</li>
+  </ol>
+  <a class="btnlink" id="lnkStore" target="_blank" rel="noopener"
+     href="https://apps.apple.com/app/id1492822055">Get Bluefy on the App Store</a>
+  <div style="height:8px"></div>
+  <button class="ghost" id="btnCopyLink">Copy setup link</button>
+  <div class="urlbox" id="urlText"></div>
+  <div class="hint" id="hintCopy"></div>
 </div>
 
 <div class="card hide" id="cardCode">
@@ -222,6 +262,17 @@ const ERRS = ["",
 let handedOff = false;
 
 const $ = (id) => document.getElementById(id);
+
+/* The cube's QR encodes the pairing code as a fragment: .../setup/v1/#c=123456.
+ * A fragment, deliberately, and not a query string: fragments are never sent to
+ * the server, so the code stays out of the access log of whatever static host
+ * serves this page. It is no more secret than the six digits printed on the
+ * screen next to the QR, but there is no reason to hand it to a third party. */
+function codeFromHash() {
+  const m = /(?:^|[#&])c=(\d{6})(?:&|$)/.exec(location.hash || "");
+  return m ? m[1] : "";
+}
+const prefillCode = codeFromHash();
 
 /* A GATT read hands back a DataView, and `dv.buffer` is the WHOLE underlying
  * buffer — which equals the value only if the implementation happened to
@@ -501,7 +552,7 @@ async function onState(ev) {
     /* Pairing again needs a fresh code from the cube, so offer the way back
        rather than leaving the page with nothing to press. */
     show("cardConnect", true);
-    $("hintSupport").textContent =
+    $("hintConnect").textContent =
       "To pair again, press PAIR on the cube first — it stops advertising "
       + "once it has your credentials.";
   } else if (err && ERRS[err]) {
@@ -569,8 +620,19 @@ $("btnConnect").onclick = async () => {
 
     show("cardConnect", false);
     show("cardCode", true);
-    $("inCode").focus();
-    say("Connected. Enter the code shown on the cube.");
+    if (prefillCode) {
+      /* Arrived by QR, so the code is already known and typing it again is
+         pure ceremony. Going through btnCode rather than calling handshake()
+         directly reuses its double-tap guard, its validation and its error
+         path; a stale or rejected code simply leaves the card visible, because
+         btnCode only hides it on success. */
+      $("inCode").value = prefillCode;
+      say("Connected. Unlocking\u2026", "work");
+      $("btnCode").click();
+    } else {
+      $("inCode").focus();
+      say("Connected. Enter the code shown on the cube.");
+    }
   } catch (e) {
     say(e.message || String(e), "err");
   }
@@ -676,11 +738,33 @@ $("btnEye").onclick = () => { pwShown($("inPass").type === "password"); $("inPas
 $("inCode").onkeydown = (e) => { if (e.key === "Enter") $("btnCode").click(); };
 $("inPass").onkeydown = (e) => { if (e.key === "Enter") $("btnJoin").click(); };
 
+$("btnCopyLink").onclick = async () => {
+  /* location.href carries the #c= fragment, so what lands in Bluefy is the
+     whole setup link, pairing code included, and the prefill still works. */
+  try {
+    await navigator.clipboard.writeText(location.href);
+    $("hintCopy").textContent = "Copied. Now open Bluefy and paste it.";
+  } catch (e) {
+    /* Refused clipboards are common in embedded webviews. The link is on
+       screen and selectable, so say that rather than reporting a failure. */
+    $("hintCopy").textContent = "Could not copy automatically \u2014 "
+      + "long-press the link above to copy it.";
+  }
+};
+
+/* Capability, not user-agent. A scanned QR can land in Safari, Chrome, Firefox,
+   an in-app webview, or on a desktop, and exactly one question decides whether
+   this page can work: is there a Bluetooth API to reach the cube with? Sniffing
+   the UA string gets Firefox-on-Android and every in-app browser wrong; asking
+   the API directly cannot. */
 if (!navigator.bluetooth) {
-  $("btnConnect").disabled = true;
-  $("hintSupport").innerHTML =
-    "This browser has no Web Bluetooth. On iPhone use <b>Bluefy</b> from the App Store; " +
-    "on Android or desktop use Chrome. The page must be served over <code>https</code>.";
+  show("cardConnect", false);
+  show("cardIos", true);
+  $("urlText").textContent = location.href;
+  say("This browser cannot reach Bluetooth.", "err");
+} else if (prefillCode) {
+  $("hintConnect").textContent =
+    "Pairing code " + prefillCode + " came from the QR \u2014 no need to type it.";
 }
 </script>
 </body>

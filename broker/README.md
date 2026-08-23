@@ -33,6 +33,17 @@ handles baseline only, and its baseline path never populates LVGL's image cache
 (see [`docs/HARDWARE.md` §7c](../docs/HARDWARE.md)), so having one predictable
 format arriving at one known size is worth keeping.
 
+**Wi-Fi setup — served here, but no longer depended on.** `/provision` is inert
+markup that speaks Web Bluetooth to the cube and makes no request of any server,
+so the only thing it ever wanted from this service was an HTTPS certificate.
+`.github/workflows/pages.yml` publishes the same file to GitHub Pages, and the
+cube's setup QR points there. Wi-Fi setup therefore keeps working when this box
+does not — which matters, because a cube with no credentials cannot reach
+anything to fix itself, and the failure would arrive exactly when the broker is
+already down. The copy served here stays as a fallback and the file under
+`static/` remains the single source of truth, since `go:embed` cannot reach
+outside this module.
+
 **DAYS.** A phone or laptop serves as the comfortable date picker and keyboard.
 `/days` is inert public markup; the page asks for the device bearer before it can
 read or change `/countdown`. The compact state is atomically persisted under the
@@ -50,6 +61,7 @@ open.
 | `GET /art?u=URL&s=240` | Bearer | Fetch, centre-crop, scale, re-encode as baseline JPEG, cache |
 | `GET /art.bin?u=URL&s=240` | Bearer | Same, but returns a pre-decoded RGB565 bitmap in LVGL's binary format — **the device does no decoding at all** |
 | `GET /days` | — | Phone-friendly date/message editor; contains no countdown state or secret |
+| `GET /provision` | — | Wi-Fi setup page. **Mirrored to GitHub Pages, which is where the cube's QR points** — see below |
 | `GET /countdown` | Bearer | Compact cube payload: target date, message, and date set |
 | `POST /countdown` | Bearer | Validate and atomically replace the DAYS state |
 
