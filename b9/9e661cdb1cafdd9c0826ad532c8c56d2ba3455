@@ -1,0 +1,36 @@
+.github/workflows/pages.yml
+  s_50719c5855e6f7::t_2cc0c831407e99 1-60
+broker/README.md
+  s_50719c5855e6f7::t_feafa59c0665c7 36-46,64
+.env.example
+  s_50719c5855e6f7::t_69eb922cc0afac 45-52
+broker/static/provision.html
+  s_50719c5855e6f7::t_c67c90b91192de 117-134,153-175,266-276,555,623-635,741-759,761-767
+main/CMakeLists.txt
+  s_50719c5855e6f7::t_69eb922cc0afac 22-25
+sdkconfig.defaults
+  s_50719c5855e6f7::t_69eb922cc0afac 187-192
+broker/provision_test.go
+  s_50719c5855e6f7::t_9372f397a5ebcb 92-122
+  s_50719c5855e6f7::t_762ab7385aab2b 5,60-91
+main/credentials.h.in
+  s_50719c5855e6f7::t_69eb922cc0afac 27-28
+docs/ARCHITECTURE.md
+  s_50719c5855e6f7::t_d174419b9662fa 674-712
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.23",
+  "base_commit_sha": "b99e661cdb1cafdd9c0826ad532c8c56d2ba3455",
+  "prompts": {},
+  "sessions": {
+    "s_50719c5855e6f7": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "993d6d94-5639-4b5f-a73d-4a405a585f5a",
+        "model": "claude-opus-5"
+      },
+      "human_author": "Jainal Gosaliya <jainal09gosalia@gmail.com>"
+    }
+  }
+}
