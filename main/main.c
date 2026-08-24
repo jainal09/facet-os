@@ -3505,6 +3505,28 @@ static lv_obj_t *s_cfg_sliders[CFG_SLIDER_MAX];
 static int32_t   s_cfg_slider_snap[CFG_SLIDER_MAX];
 static int       s_cfg_slider_n;
 
+/* TEMPORARY PERF HARNESS, REMOVE BEFORE COMMIT: drives the CONTROL column up
+ * and down through lv_obj_scroll_by at boot, so render-throughput experiments
+ * measure a repeatable synthetic scroll instead of whoever is awake to rub the
+ * glass. Exercises the same full-column invalidation path as a finger; it only
+ * bypasses the touch pipeline, which these experiments do not target. */
+#define CFG_PERF_SCROLL_SELFTEST 0
+
+/* Hold LEFT+RIGHT together to stream a screenshot of the glass out of the USB
+ * console (tools/capture.py records it, tools/snap_rx.py rebuilds it). Two
+ * frames go out: the screen, and lv_layer_top() as ARGB — the bezel lobes live
+ * on the top layer and both are swelled in while the chord is held, so this is
+ * also how the pop-out design is captured. Costs ~2-3 min of frozen UI per
+ * shot; a debug affordance for a dev cube, requested by the user. */
+#define CFG_SNAP_CHORD 1
+
+#if CFG_PERF_SCROLL_SELFTEST || CFG_SNAP_CHORD
+#include "mbedtls/base64.h"
+#endif
+#if CFG_PERF_SCROLL_SELFTEST
+static lv_obj_t *s_cfg_col;
+#endif
+
 #define CFG_ACCENT_WALL 0x22D3EE
 #define CFG_ACCENT_DAYS 0x8B7CF6
 #define CFG_ACCENT_DISP 0xA78BFA
@@ -4627,6 +4649,9 @@ static void build_control_app(lv_obj_t *scr) {
      * raised by whatever is scrolling, and the sliders are not it. */
     lv_obj_add_event_cb(col, cfg_scroll_guard_cb, LV_EVENT_SCROLL_BEGIN, NULL);
     lv_obj_add_event_cb(col, cfg_scroll_guard_cb, LV_EVENT_SCROLL_END, NULL);
+#if CFG_PERF_SCROLL_SELFTEST
+    s_cfg_col = col;
+#endif
 
     /* ---- wallpaper ---- */
     lv_obj_t *c = cfg_card(col, "WALLPAPER", CFG_ACCENT_WALL);
@@ -5460,8 +5485,15 @@ static void days_refresh(void) {
         days_label_text(s_days_unit, unit);
         days_label_text(s_days_start, have_set ? start : "");
         days_label_text(s_days_target, have_target ? target_text : "");
+#if CFG_PERF_SCROLL_SELFTEST
+        /* Screenshot builds only: the walk dumps this screen into the README,
+         * and the real countdown message is personal. Gated on the harness
+         * define, so production builds render the stored text untouched. */
+        days_label_text(s_days_text, "IMPORTANT TASK");
+#else
         days_label_text(s_days_text, data.text[0] ? data.text
                          : "SET A DATE AND A MESSAGE FROM THE DAYS WEB PAGE");
+#endif
         s_days_painted_ver = version;
         s_days_painted_day = today;
     }
@@ -9516,6 +9548,17 @@ static void app_open(int idx) {
     if (t0 - last_switch < 250000) return;      /* debounce double taps */
     last_switch = t0;
 
+    /* A compiled-out app is a zeroed hole in s_apps (see app_enabled), and
+     * this function was the one table consumer that never checked — a request
+     * for a hole reached "opened %s" with a NULL name and panicked in ROM
+     * strlen. No user gesture can produce such a request (the drawer draws no
+     * tile), but the self-test harness did, ten crashes in one night, and any
+     * future stray request would too. Negative ids are LOCK and DRAWER. */
+    if (idx >= 0 && !app_enabled(idx)) {
+        ESP_LOGW(TAG, "app_open(%d): app compiled out, ignoring", idx);
+        return;
+    }
+
     /* Leaving CONTROL ends any pairing session. The code is only shown on that
      * card, so a session outliving it would advertise with no way to read the
      * code — and would hold the Wi-Fi driver down the whole time. The main
@@ -9560,6 +9603,9 @@ static void app_open(int idx) {
      * exception. */
     s_cfg_slider_n = 0;
     memset(s_cfg_sliders, 0, sizeof(s_cfg_sliders));
+#if CFG_PERF_SCROLL_SELFTEST
+    s_cfg_col = NULL;
+#endif
     s_cfg_ble_val = NULL; s_cfg_ble_code = NULL; s_cfg_ble_btn = NULL;
     s_cfg_ble_qr = NULL; s_cfg_ble_qr_code[0] = '\0';
     /* The widgets are gone, so the next build must repaint from scratch rather
@@ -9710,6 +9756,344 @@ static void app_mem_bench(void) {
 }
 #endif
 
+#if CFG_PERF_SCROLL_SELFTEST || CFG_SNAP_CHORD
+/* Stream one object out of the console as base64 pixels, bracketed by
+ * SNAP_BEGIN/SNAP_END markers, for tools/snap_rx.py to rebuild into an image.
+ * Callable from the LVGL task (harness timers) or from the main loop under
+ * ui_lock (the chord); the UI freezes for the duration, which is the deal a
+ * debug capture makes. printf blocks when the USB-CDC ring fills, so the dump
+ * paces itself, and the WDT is fed inside the loop because the main loop is
+ * subscribed and a frame takes minutes (reset from an unsubscribed task is a
+ * harmless error return). */
+static lv_draw_buf_t *snap_take(lv_obj_t *obj, lv_color_format_t cf, const char *name) {
+    lv_draw_buf_t *snap = lv_snapshot_take(obj, cf);
+    if (!snap) ESP_LOGW(TAG, "snap %s: take failed", name);
+    return snap;
+}
+
+/* Synchronous variant — only the SELFTEST harness uses it now; the chord
+ * path renders, flashes the borders, and writes a BMP to the card. */
+static __attribute__((unused)) void snap_stream(lv_draw_buf_t *snap, const char *name) {
+    if (!snap) return;
+    printf("SNAP_BEGIN %s %u %u %u %u\n", name,
+           (unsigned)snap->header.w, (unsigned)snap->header.h,
+           (unsigned)snap->header.cf, (unsigned)snap->header.stride);
+    /* Sequence-numbered chunks: printf is not atomic against other tasks'
+     * console writes, so ~1 line in a few thousand arrives corrupted or not at
+     * all. With the index in-band the host detects the gap and fills 384 zero
+     * bytes — a black stripe in one screenshot instead of a lost frame. */
+    static unsigned char b64[513];
+    const uint8_t *d = snap->data;
+    unsigned seq = 0;
+    for (size_t off = 0; off < snap->data_size; off += 384, seq++) {
+        size_t n = snap->data_size - off, olen = 0;
+        if (n > 384) n = 384;
+        mbedtls_base64_encode(b64, sizeof b64, &olen, d + off, n);
+        b64[olen] = 0;
+        printf("S:%u:%s\n", seq, (char *)b64);
+        if ((off & 0x3FFF) == 0) {
+            vTaskDelay(1);                        /* let the console drain */
+            esp_task_wdt_reset();                 /* minutes-long from main loop */
+            /* A dump is 54 s and the settle after it 12 more — past the 60 s
+             * auto-lock. Trigger from inside the loop or the NEXT screen's
+             * snapshot is silently the lock screen (it was, twice). */
+            lv_display_trigger_activity(NULL);
+        }
+    }
+    printf("SNAP_END %s\n", name);
+    lv_draw_buf_destroy(snap);
+}
+
+#if CFG_SNAP_CHORD
+/* Capture handler for both chords. The screen snapshot alone NEVER contains
+ * the bezel lobes — they live on lv_layer_top() — so the plain shot is clean
+ * even though two keys are physically held while it renders. with_top adds
+ * the ARGB top-layer frame for snap_rx to composite, which is how a posed
+ * lobe gets into the picture. Ends by swallowing every key and draining the
+ * PMU's latched PWR events, so releases that happen during the minutes-long
+ * stream fire no lock/home/back afterwards. */
+/* Border flash: four thin bars blink in from the edges and fade — the
+ * capture language of this device. White = armed / frame taken, green =
+ * saved to the card, red = failed. Each bar's dirty rect is under 3k px, one
+ * flush, cannot band (§5); top layer, CLICKABLE cleared per the top-layer
+ * rule; fade_out paired with delete_delayed (HARDWARE.md §5). */
+static void snap_flash(uint32_t hex) {
+    if (!ui_lock()) return;
+    lv_obj_t *bars[4];
+    for (int i = 0; i < 4; i++) {
+        lv_obj_t *b = lv_obj_create(lv_layer_top());
+        lv_obj_remove_style_all(b);
+        lv_obj_remove_flag(b, LV_OBJ_FLAG_CLICKABLE);
+        lv_obj_set_style_bg_color(b, lv_color_hex(hex), 0);
+        lv_obj_set_style_bg_opa(b, LV_OPA_COVER, 0);
+        bars[i] = b;
+    }
+    lv_obj_set_size(bars[0], 480, 6); lv_obj_align(bars[0], LV_ALIGN_TOP_MID, 0, 0);
+    lv_obj_set_size(bars[1], 480, 6); lv_obj_align(bars[1], LV_ALIGN_BOTTOM_MID, 0, 0);
+    lv_obj_set_size(bars[2], 6, 468); lv_obj_align(bars[2], LV_ALIGN_LEFT_MID, 0, 0);
+    lv_obj_set_size(bars[3], 6, 468); lv_obj_align(bars[3], LV_ALIGN_RIGHT_MID, 0, 0);
+    lv_refr_now(NULL);
+    for (int i = 0; i < 4; i++) {
+        lv_obj_fade_out(bars[i], 250, 80);
+        lv_obj_delete_delayed(bars[i], 360);
+    }
+    bsp_display_unlock();
+}
+
+/* Write one screenshot to the card as a plain 24-bit BMP — viewable anywhere,
+ * no host tooling needed. The top layer (bezel lobes), when present, is
+ * alpha-composited during the row conversion, so a posed lobe costs no extra
+ * buffer. ~691 KB, about a second on this card; WDT fed per 32 rows because
+ * this runs on the subscribed main loop. 8.3 filenames only (LFN is off). */
+static bool snap_write_bmp(const char *path, lv_draw_buf_t *scr, lv_draw_buf_t *top) {
+    FILE *f = fopen(path, "wb");
+    if (!f) return false;
+    const int w = 480, h = 480;
+    const uint32_t row_out = (w * 3 + 3) & ~3u, img = row_out * h;
+    uint8_t hdr[54] = { 'B', 'M' };
+    uint32_t fsz = 54 + img;
+    int32_t dim = w;
+    memcpy(hdr + 2, &fsz, 4); hdr[10] = 54;
+    hdr[14] = 40;
+    memcpy(hdr + 18, &dim, 4);
+    memcpy(hdr + 22, &dim, 4);
+    hdr[26] = 1; hdr[28] = 24;
+    memcpy(hdr + 34, &img, 4);
+    bool ok = fwrite(hdr, 1, 54, f) == 54;
+    static uint8_t row[480 * 3 + 4];
+    for (int y = h - 1; ok && y >= 0; y--) {
+        const uint8_t *b = scr->data + (size_t)y * scr->header.stride;
+        const uint8_t *tp = top ? top->data + (size_t)y * top->header.stride : NULL;
+        uint8_t *o = row;
+        for (int x = 0; x < w; x++) {
+            uint16_t px = (uint16_t)(b[2 * x] | (b[2 * x + 1] << 8));
+            uint32_t r = ((px >> 11) & 31) * 255 / 31;
+            uint32_t g = ((px >> 5) & 63) * 255 / 63;
+            uint32_t bl = (px & 31) * 255 / 31;
+            if (tp) {
+                uint8_t tb = tp[4 * x], tg = tp[4 * x + 1],
+                        tr = tp[4 * x + 2], ta = tp[4 * x + 3];
+                if (ta) {
+                    r  = (tr * ta + r  * (255 - ta)) / 255;
+                    g  = (tg * ta + g  * (255 - ta)) / 255;
+                    bl = (tb * ta + bl * (255 - ta)) / 255;
+                }
+            }
+            *o++ = (uint8_t)bl; *o++ = (uint8_t)g; *o++ = (uint8_t)r;
+        }
+        memset(o, 0, row_out - (unsigned)w * 3);
+        ok = fwrite(row, 1, row_out, f) == row_out;
+        if ((y & 31) == 0) esp_task_wdt_reset();
+    }
+    fclose(f);
+    return ok;
+}
+
+static void snap_capture(bool with_top, char tag) {
+    if (!s_sd_ok) {
+        ESP_LOGW(TAG, "snap: no card mounted");
+        snap_flash(0xFF3B30);
+        return;
+    }
+    if (!ui_lock()) { ESP_LOGW(TAG, "snap: LVGL lock timeout, skipped"); return; }
+    lv_draw_buf_t *scr = snap_take(lv_screen_active(), LV_COLOR_FORMAT_RGB565, "snap");
+    lv_draw_buf_t *top = with_top
+        ? snap_take(lv_layer_top(), LV_COLOR_FORMAT_ARGB8888, "snap") : NULL;
+    /* Frames are rendered — park the lobes NOW, not after the write. This
+     * loop stays blocked for the ~1 s card write, but the LVGL task is free,
+     * so the retract animation plays immediately and a lifted finger sees the
+     * lobe leave at normal speed instead of hanging through the capture. */
+    for (int i = 0; i < 3; i++) bezel_press(i, false);
+    bsp_display_unlock();
+    /* No flash here: one signal per capture. Green below = saved, red =
+     * failed, and the armed path's white blink is the only other light.
+     * A mid-capture "frame taken" blink read as a third, meaningless lamp. */
+
+    bool ok = false;
+    if (scr) {
+        time_t now = time(NULL);
+        struct tm tm;
+        localtime_r(&now, &tm);
+        mkdir("/sdcard/snaps", 0777);
+        char path[40];
+        snprintf(path, sizeof path, "/sdcard/snaps/%c%02d%02d%02d.bmp",
+                 tag, tm.tm_hour, tm.tm_min, tm.tm_sec);
+        ok = snap_write_bmp(path, scr, top);
+        ESP_LOGI(TAG, "snap: %s %s", path, ok ? "saved" : "WRITE FAILED");
+    }
+    if (scr) lv_draw_buf_destroy(scr);
+    if (top) lv_draw_buf_destroy(top);
+
+    snap_flash(ok ? 0x22C55E : 0xFF3B30);   /* green = saved, red = failed */
+
+    btn_swallow(&s_key_left);
+    btn_swallow(&s_key_right);
+    (void)pmu_pwrkey_edges();
+    (void)pmu_pwrkey_pressed();
+
+    /* The capture blocks this loop for ~2 s, so a finger lifted during it
+     * releases into btn_swallow's silent level-adopt and the PMU drain above —
+     * the release EDGES the bezel retraction listens for never fire, and the
+     * lobes stay swelled in forever (they did). Park all three explicitly;
+     * bezel_press is a no-op for any lobe already home. */
+    if (ui_lock()) {
+        for (int i = 0; i < 3; i++) bezel_press(i, false);
+        bsp_display_unlock();
+    }
+}
+#endif
+
+#if CFG_PERF_SCROLL_SELFTEST
+/* TEMPORARY PERF HARNESS — see the define. Runs inside the LVGL task
+ * (lv_timer), so no lock is needed. Trigger_activity keeps the 60 s auto-lock
+ * from tearing CONTROL down under the test. lv_obj_scroll_by's dy is
+ * subtracted from scroll_y, so a negative step moves toward the bottom. */
+static void perf_snap_dump(const char *name) {
+    snap_stream(snap_take(lv_screen_active(), LV_COLOR_FORMAT_RGB565, name), name);
+}
+
+/* MUSIC showcase: instead of the generic walk, drive the crown-jewel app the
+ * way a hand would — three covers across two real track skips, the lock screen
+ * with its now-playing card, the same card swiped away, then the two screens
+ * the walk lost to a crash. sp_send() is the same producer the touch
+ * callbacks use, and this runs on the LVGL task like they do. 12 s settle:
+ * a poll is 3 s and a cover fetch rides on it. */
+/* Mini-run for the shots the other sequences kept losing: PET and the drawer
+ * first — every heap-ghost crash so far bit on a LATE app switch, so the
+ * scarce shots go before the churn — then the lock screen stripped bare
+ * (rings off via the RAM flag only, no NVS save request, now-playing card
+ * dismissed) for the README's minimal-lock image. Flags restored after. */
+#define CFG_PERF_MINI 1
+#if CFG_PERF_MINI
+static void perf_mini_tick(lv_timer_t *t) {
+    static int idx;
+    lv_display_trigger_activity(NULL);
+    switch (idx++) {
+    /* No PET: FACET_APP_PET is 0 in this profile, so the app does not exist
+     * in this image — requesting it was tonight's crash loop. */
+    case 0: app_request(APP_DRAWER);                                  break;
+    case 1: perf_snap_dump("drawer");
+            s_lock_rings = false; s_lock_np_off = true;
+            app_request(APP_LOCK);                                    break;
+    case 2: perf_snap_dump("lock_noring");
+            s_lock_rings = true; s_lock_np_off = false;
+            app_request(APP_MUSIC);                                   break;
+    case 3: /* second settle period: give MUSIC two full polls so the edge
+             * chrome (shuffle/like/devices column, volume slider) has every
+             * chance to arrive before the frame is judged */          break;
+    default:
+        perf_snap_dump("music_full");
+        lv_timer_delete(t);
+        ESP_LOGI(TAG, "perf selftest: mini complete");
+        return;
+    }
+    if (t) lv_timer_reset(t);
+}
+#endif
+
+#define CFG_PERF_MUSIC_SHOWCASE 1
+#if CFG_PERF_MUSIC_SHOWCASE
+static __attribute__((unused)) void perf_showcase_tick(lv_timer_t *t) {
+    static int idx;
+    lv_display_trigger_activity(NULL);   /* a 54 s dump must not auto-lock */
+    switch (idx++) {
+    case 0: app_request(APP_MUSIC);                                   break;
+    case 1: perf_snap_dump("music1"); sp_send(SP_CMD_NEXT);           break;
+    case 2: perf_snap_dump("music2"); sp_send(SP_CMD_NEXT);           break;
+    case 3: perf_snap_dump("music3"); app_request(APP_LOCK);          break;
+    case 4: perf_snap_dump("lock_playing");
+            s_lock_np_off = true;  app_request(APP_DRAWER);           break;
+    case 5: app_request(APP_LOCK);   /* rebuild, card dismissed */    break;
+    case 6: perf_snap_dump("lock_clean");
+            s_lock_np_off = false; app_request(APP_PET);              break;
+    case 7: perf_snap_dump("pet");   app_request(APP_DRAWER);        break;
+    default:
+        perf_snap_dump("drawer");
+        lv_timer_delete(t);
+        ESP_LOGI(TAG, "perf selftest: showcase complete");
+        return;
+    }
+    /* Dumps overrun the period tenfold; restart it. NULL when the kick calls
+     * step 0 directly — the real timer is already freshly created then. */
+    if (t) lv_timer_reset(t);
+}
+#endif
+
+/* After the scroll test: visit each screen, let it settle, snapshot it. The
+ * README has no pictures and every visual-defect report so far has been a
+ * photo of the glass; this makes the device hand over its own framebuffer. */
+static const struct { int app; const char *name; } s_walk[] = {
+    { APP_CONTROL, "control" }, { APP_MUSIC, "music" }, { APP_POMO, "focus" },
+    { APP_DAYS, "days" }, { APP_PET, "pet" }, { APP_DRAWER, "drawer" },
+    { APP_LOCK, "lock" },
+};
+
+static void perf_walk_tick(lv_timer_t *t) {
+    static int idx;
+    /* Snapshot what the PREVIOUS tick opened, now that it has had a full
+     * period to build, fetch and settle. */
+    if (idx > 0) perf_snap_dump(s_walk[idx - 1].name);
+    /* Skip compiled-out apps — a hole in s_apps is not a screen. */
+    while (idx < (int)(sizeof(s_walk) / sizeof(s_walk[0])) &&
+           s_walk[idx].app >= 0 && !app_enabled(s_walk[idx].app)) idx++;
+    /* The dump overruns the timer period by a factor of ten, and an overdue
+     * lv_timer refires inside the SAME lv_timer_handler pass — so without
+     * this the whole walk runs back-to-back with the LVGL lock held, the main
+     * loop never gets to consume app_request, and every "screen" is a
+     * snapshot of wherever the walk started. Reset so the period restarts
+     * from the end of the dump, which is what hands the main loop its 4.5 s
+     * window to actually open the next app. */
+    lv_timer_reset(t);
+    if (idx >= (int)(sizeof(s_walk) / sizeof(s_walk[0]))) {
+        lv_timer_delete(t);
+        ESP_LOGI(TAG, "perf selftest: walk complete");
+        return;
+    }
+    lv_display_trigger_activity(NULL);
+    app_request(s_walk[idx].app);
+    idx++;
+}
+
+/* unused while CFG_PERF_MUSIC_SHOWCASE displaces the scroll+walk path */
+static __attribute__((unused)) void perf_scroll_tick(lv_timer_t *t) {
+    static int64_t t0;
+    static int32_t dir = -1;
+    if (!s_cfg_col) return;                 /* CONTROL not built yet, or gone */
+    if (!t0) t0 = esp_timer_get_time();
+    if (esp_timer_get_time() - t0 > 40LL * 1000000) {
+        lv_timer_delete(t);
+        ESP_LOGI(TAG, "perf scroll selftest: scroll done, starting walk");
+        /* 9 s settle per screen: MUSIC's first poll plus cover fetch takes
+         * ~6.5 s, and a shorter period freezes its snapshot on the boot
+         * placeholder. */
+        lv_timer_create(perf_walk_tick, 9000, NULL);
+        return;
+    }
+    lv_display_trigger_activity(NULL);
+    if (lv_obj_get_scroll_bottom(s_cfg_col) <= 0) dir = 1;
+    else if (lv_obj_get_scroll_top(s_cfg_col) <= 0) dir = -1;
+    lv_obj_scroll_by(s_cfg_col, 0, dir * 40, LV_ANIM_OFF);
+}
+
+static void perf_selftest_kick(lv_timer_t *t) {
+    lv_timer_delete(t);
+#if CFG_PERF_MINI
+    ESP_LOGI(TAG, "perf selftest: mini (pet, drawer, bare lock)");
+    lv_timer_create(perf_mini_tick, 12000, NULL);
+    perf_mini_tick(NULL);
+#elif CFG_PERF_MUSIC_SHOWCASE
+    ESP_LOGI(TAG, "perf selftest: MUSIC showcase");
+    lv_timer_create(perf_showcase_tick, 12000, NULL);
+    perf_showcase_tick(NULL);   /* step 0 opens MUSIC now, not in 12 s */
+#else
+    ESP_LOGI(TAG, "perf scroll selftest: opening CONTROL");
+    app_request(APP_CONTROL);
+    lv_timer_create(perf_scroll_tick, 30, NULL);
+#endif
+}
+#endif  /* CFG_PERF_SCROLL_SELFTEST */
+#endif  /* CFG_PERF_SCROLL_SELFTEST || CFG_SNAP_CHORD */
+
 /* ---------------- Main ---------------- */
 
 void app_main(void) {
@@ -9760,6 +10144,12 @@ void app_main(void) {
      * call frames in 40 MHz PSRAM made every large redraw pay external-memory
      * latency; the 8 KB internal stack is a better use of the recovered SRAM. */
     disp_cfg.lv_adapter_cfg.stack_in_psram = false;
+    /* LV_OS_NONE moved the ENTIRE render pipeline — blending, layers, and the
+     * TJpgD cover decode — onto this one task's stack; the 8 KB default was
+     * sized when draw threads carried that. Measured overflowing twice in one
+     * minute under MUSIC art updates ("A stack overflow in task lvgl"), with
+     * a wild-jump IllegalInstruction as the trampling variant. 16 KB holds. */
+    disp_cfg.lv_adapter_cfg.task_stack_size = 16384;
 
     lv_display_t *disp = bsp_display_start_with_config(&disp_cfg);
     if (!disp) {
@@ -9777,6 +10167,10 @@ void app_main(void) {
              * for plain RGB565, and they are worth far more than the swap. Do
              * not switch the format without a swapped-target SIMD set. */
             lv_display_add_event_cb(disp, render_perf_cb, LV_EVENT_ALL, NULL);
+
+#if CFG_PERF_SCROLL_SELFTEST
+            lv_timer_create(perf_selftest_kick, 8000, NULL);
+#endif
 
             /* LVGL only emits a gesture once the finger has travelled 50 px AND
              * held a velocity of 3 — defaults tuned for a phone. On this panel
@@ -9872,6 +10266,48 @@ void app_main(void) {
         btn_ev_t kright = btn_poll(&s_key_right, t);   /* plus         */
         bool pwr = pmu_pwrkey_pressed();               /* PWR          */
         uint8_t pwr_edge = pmu_pwrkey_edges();         /* PWR down/up  */
+
+#if CFG_SNAP_CHORD
+        /* LEFT+RIGHT: instant clean screenshot (screen only — held keys'
+         * lobes live on the top layer, which the clean shot skips). White
+         * blink = frame taken, green blink = saved to the card, red = no
+         * card or write failed. LEFT held + MIDDLE press: white blink =
+         * ARMED; for 2 s every key is capture-inert so any single button can
+         * be held to pose its lobe; the shot then fires WITH the top layer
+         * and blinks green when saved. All keys are swallowed after any
+         * capture, so no release ever locks or navigates. */
+        static bool chord_latch;
+        static int64_t snap_at;                /* 0 = no delayed shot armed */
+        static bool pwr_eat;                   /* eat MIDDLE's completed press */
+        if (pwr_eat && pwr) { pwr = false; pwr_eat = false; }
+        if (snap_at) {
+            kleft = kright = BTN_NONE; pwr = false;   /* posing, not commanding */
+            if (t >= snap_at) {
+                snap_at = 0;
+                snap_capture(true, 'l');
+            }
+        } else {
+            if (s_key_left.stable == 0 && s_key_right.stable == 0) {
+                if (!chord_latch) {
+                    chord_latch = true;
+                    btn_swallow(&s_key_left);
+                    btn_swallow(&s_key_right);
+                    kleft = kright = BTN_NONE;
+                    snap_capture(false, 's');
+                }
+            } else if (s_key_left.stable == 1 && s_key_right.stable == 1) {
+                chord_latch = false;
+            }
+            if (s_key_left.stable == 0 && (pwr_edge & 1)) {
+                snap_at = t + 2000;
+                btn_swallow(&s_key_left);
+                kleft = BTN_NONE;
+                pwr_eat = true;
+                snap_flash(0xFFFFFF);          /* the "armed" blink */
+                ESP_LOGI(TAG, "snap: armed, fires in 2 s — pose a key");
+            }
+        }
+#endif
 
         /* left = lock (always) | middle = home | right: tap = back, hold = action */
         if (kleft || kright || pwr) s_last_btn = t;

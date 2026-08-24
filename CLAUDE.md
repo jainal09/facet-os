@@ -85,6 +85,37 @@ the pitfalls index compiled perfectly.
   `hud_text_18` (0x20-0x7F) and `hud_clock_76` (digits and colon only) are
   narrower still. Non-ASCII in `ESP_LOG` strings is fine; that goes to serial.
 
+## Autonomous hardware verification
+
+The device can test itself; do not wait for a human finger when these cover it.
+
+- **Synthetic scroll + screen walk:** `CFG_PERF_SCROLL_SELFTEST` in
+  `main/main.c` (keep it 0 in commits; flip to 1 for a run). At boot+8 s it
+  opens CONTROL, drives `lv_obj_scroll_by` for 40 s — the same full-column
+  invalidation as a finger, minus the touch pipeline — then walks every app
+  and the lock screen, snapshotting each one over the console. Rebooting
+  reruns it, so a flash is also a test start.
+- **Capture:** `tools/capture.py PORT SECS RAWFILE` — prints a narrowed view,
+  stores every line raw. Never capture through a filter that can drop a panic
+  (pitfall #28), and never open a second reader on the tty (pitfall #29).
+- **Chord screenshots on demand** (`CFG_SNAP_CHORD`, on for this dev cube;
+  saved to the CARD as viewable BMPs at `/sdcard/snaps/`, no capture needed).
+  LEFT+RIGHT = instant clean shot, screen only — held keys' lobes are not in
+  it. LEFT held + MIDDLE press = white "armed" blink, then 2 s in which every
+  key is capture-inert — hold any single button to pose its bezel lobe — then
+  the shot fires WITH `lv_layer_top()` composited on-device. Border blinks:
+  white = frame taken / armed, green = saved, red = no card or write failed.
+  All keys are swallowed after a capture. Filenames are 8.3: `sHHMMSS.bmp`
+  (clean) / `lHHMMSS.bmp` (lobe). Retrieve by pulling the card, or ask the
+  user before adding any serial dump path.
+- **Screenshots:** the harness emits `SNAP_BEGIN/S:/SNAP_END` base64 frames;
+  `tools/snap_rx.py RAWFILE OUTDIR` rebuilds them into BMPs
+  (`sips -s format png *.bmp` for PNGs). Use them for visual-defect reports
+  and README imagery instead of photographing the glass.
+- **Reading perf:** the `render perf:` line under the synthetic scroll is the
+  benchmark; compare Mpx/s (render time ÷ pixels), which survives content
+  changes. Rules and measured history live in HARDWARE.md §5 and pitfall #30.
+
 ## Keep the docs hot
 
 `docs/HARDWARE.md` carries a standing maintenance directive at the top and it is
