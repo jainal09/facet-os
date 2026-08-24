@@ -116,6 +116,12 @@ static const char *TAG = "funnel";
 #define AXP_REG_BAT_DET_CTRL  0x68      /* bit0: battery detection enable */
 #define AXP_REG_BAT_PERCENT   0xA4
 #define AXP_PKEY_SHORT_BIT    3
+/* PWRKEY is not short-press-only. The PMU distinguishes four states, and the
+ * two edge IRQs give the middle key a real press-down and release — they are
+ * simply disabled at power-up (reg 0x41 default 0b for both), which is why it
+ * looked like the completed press was all the hardware could report. */
+#define AXP_PKEY_NEG_BIT      1      /* key went down */
+#define AXP_PKEY_POS_BIT      0      /* key came up   */
 
 /* Charge target voltage, reg 0x64[2:0]. The cell is never held above this, and
  * the PMU restarts charging on its own once it falls 100 mV below (VRECHG is
@@ -1345,7 +1351,11 @@ static void pmu_init(void) {
     axp_set_bit(AXP_REG_ADC_CH_CTRL, 0);
     /* PWRKEY short press -> IRQ status bit we poll */
     axp_set_bit(AXP_REG_INTEN2, AXP_PKEY_SHORT_BIT);
-    axp_write(AXP_REG_INTSTS2, 1u << AXP_PKEY_SHORT_BIT);
+    axp_set_bit(AXP_REG_INTEN2, AXP_PKEY_NEG_BIT);
+    axp_set_bit(AXP_REG_INTEN2, AXP_PKEY_POS_BIT);
+    axp_write(AXP_REG_INTSTS2, (1u << AXP_PKEY_SHORT_BIT) |
+                               (1u << AXP_PKEY_NEG_BIT) |
+                               (1u << AXP_PKEY_POS_BIT));
     /* The PMU powers up at 25 mA, which barely charges the cell at all.
      * 400 mA is what Waveshare's own AXP2101 example programs. */
     uint8_t icc = 0, cv = 0, ctrl = 0;
@@ -1432,6 +1442,19 @@ static void battery_poll(void) {
     }
 }
 
+/* bit0 = went down, bit1 = came up. Both can land in one poll on a tap
+ * shorter than the 20 ms loop, which the caller has to handle rather than
+ * pick one. Write-1-to-clear, like every other IRQ status bit here. */
+static uint8_t pmu_pwrkey_edges(void) {
+    if (!s_axp) return 0;
+    uint8_t sts = 0, out = 0, clr = 0;
+    if (axp_read(AXP_REG_INTSTS2, &sts) != ESP_OK) return 0;
+    if (sts & (1u << AXP_PKEY_NEG_BIT)) { out |= 1; clr |= 1u << AXP_PKEY_NEG_BIT; }
+    if (sts & (1u << AXP_PKEY_POS_BIT)) { out |= 2; clr |= 1u << AXP_PKEY_POS_BIT; }
+    if (clr) axp_write(AXP_REG_INTSTS2, clr);
+    return out;
+}
+
 static bool pmu_pwrkey_pressed(void) {
     if (!s_axp) return false;
     uint8_t sts = 0;
@@ -1487,6 +1510,15 @@ static volatile bool s_autorot = true;   /* volatile: LVGL task writes, main rea
 static volatile bool s_req_autorot_save;
 static volatile bool s_clock_24 = true;
 static volatile bool s_req_clock_save;
+
+/* Lock-screen quick action for the middle key, which does nothing there
+ * otherwise. Held as an app index rather than a menu position so the setting
+ * keeps its meaning if an app is compiled in or out; LOCK_KEY_OFF is the
+ * default, so the documented "a key press must not bypass the touchscreen
+ * unlock" behaviour is unchanged unless someone opts in. */
+#define LOCK_KEY_OFF (-1)
+static volatile int s_lock_key_app = LOCK_KEY_OFF;
+
 static volatile bool s_always_on;
 static volatile bool s_lock_rings = true;
 static volatile bool s_req_lock_pref_save;
@@ -1601,6 +1633,12 @@ static void imu_init(void) {
 static const uint8_t s_bezel_at[3] = { 32, 50, 68 };
 
 static lv_obj_t *s_bezel[3];
+/* The middle lobe can carry a glyph, because unlike the other two that key
+ * does something configurable — on the lock screen it opens whichever app
+ * CONTROL points it at. Showing that app's symbol as the arc dips is what
+ * says the special key fired, and which shortcut it took. A child of the
+ * lobe, so it rides the same translate and costs no extra dirty area. */
+static lv_obj_t *s_bezel_icon;
 static int32_t   s_bezel_v[3];     /* current intrusion in px, 0 = parked */
 
 /* Quarter turns to carry a device-fixed point through for the current panel
@@ -1673,16 +1711,38 @@ static void bezel_place(int i) {
         case 2:  lv_obj_set_pos(o, cx - r, 480);   break;   /* tangent to y=480 */
         default: lv_obj_set_pos(o, -d,     cy - r); break;   /* tangent to x=0   */
     }
+    /* Park the glyph at the arc's deepest point, which is whichever side of
+     * the circle faces the panel. */
+    if (i == 1 && s_bezel_icon) {
+        switch (edge) {
+            case 0:  lv_obj_align(s_bezel_icon, LV_ALIGN_BOTTOM_MID, 0, -5); break;
+            case 1:  lv_obj_align(s_bezel_icon, LV_ALIGN_LEFT_MID,   5,  0); break;
+            case 2:  lv_obj_align(s_bezel_icon, LV_ALIGN_TOP_MID,    0,  5); break;
+            default: lv_obj_align(s_bezel_icon, LV_ALIGN_RIGHT_MID, -5,  0); break;
+        }
+    }
     bezel_apply(i);
 }
 
-static void bezel_layout(void) {
-    for (int i = 0; i < 3; i++) bezel_place(i);
-    /* Cheap, and the only way to check the mapping without staring at the
-     * panel: rot is the panel's quarter turns, edge is where the keys ended up
-     * (0 top, 1 right, 2 bottom, 3 left). */
-    ESP_LOGI(TAG, "bezel: rot=%d -> edge=%d", s_rot & 3, bezel_edge());
+/* NULL hides it. Set just before the middle lobe pops, from the one place
+ * that knows both the current screen and the configured shortcut. */
+static void bezel_icon_set(const char *sym) {
+    if (!s_bezel_icon) return;
+    if (!sym) {
+        if (!lv_obj_has_flag(s_bezel_icon, LV_OBJ_FLAG_HIDDEN)) {
+            lv_obj_add_flag(s_bezel_icon, LV_OBJ_FLAG_HIDDEN);
+        }
+        return;
+    }
+    if (strcmp(lv_label_get_text(s_bezel_icon), sym) != 0) {
+        lv_label_set_text(s_bezel_icon, sym);
+    }
+    if (lv_obj_has_flag(s_bezel_icon, LV_OBJ_FLAG_HIDDEN)) {
+        lv_obj_remove_flag(s_bezel_icon, LV_OBJ_FLAG_HIDDEN);
+    }
 }
+
+static void bezel_layout(void) { for (int i = 0; i < 3; i++) bezel_place(i); }
 
 static void bezel_anim_exec(void *var, int32_t v) {
     int32_t *slot = (int32_t *)var;
@@ -1739,6 +1799,13 @@ static void bezel_init(void) {
         s_bezel[i] = o;
         s_bezel_v[i] = 0;
     }
+    /* montserrat_14, not the 64 px app icons: the arc is 26 px deep and an
+     * app_icons_64 glyph would not fit inside it at any alignment. */
+    s_bezel_icon = lv_label_create(s_bezel[1]);
+    lv_obj_set_style_text_font(s_bezel_icon, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(s_bezel_icon, lv_color_hex(0xE2E8F0), 0);
+    lv_label_set_text(s_bezel_icon, "");
+    lv_obj_add_flag(s_bezel_icon, LV_OBJ_FLAG_HIDDEN);
     bezel_layout();
 }
 
@@ -1833,6 +1900,7 @@ static void lock_pref_save(void) {
     if (nvs_open("cfg", NVS_READWRITE, &h) == ESP_OK) {
         nvs_set_i32(h, "alwayson", s_always_on ? 1 : 0);
         nvs_set_i32(h, "lockrings", s_lock_rings ? 1 : 0);
+        nvs_set_i32(h, "lockmid", s_lock_key_app);
         nvs_commit(h);
         nvs_close(h);
     }
@@ -1875,6 +1943,11 @@ static void rot_off_load(void) {
     if (nvs_get_i32(h, "clock24", &v) == ESP_OK) s_clock_24 = (v != 0);
     if (nvs_get_i32(h, "alwayson", &v) == ESP_OK) s_always_on = (v != 0);
     if (nvs_get_i32(h, "lockrings", &v) == ESP_OK) s_lock_rings = (v != 0);
+    /* Range-checked, not trusted: a stored index can outlive the app it named
+     * if one is compiled out, and app_request() on a hole calls a NULL build(). */
+    if (nvs_get_i32(h, "lockmid", &v) == ESP_OK) {
+        s_lock_key_app = (v >= 0 && v < APP_COUNT) ? (int)v : LOCK_KEY_OFF;
+    }
     nvs_close(h);
 }
 
@@ -3276,6 +3349,7 @@ static lv_obj_t *s_cfg_wall_pool, *s_cfg_wall_state, *s_cfg_wall_bar, *s_cfg_wal
 static lv_obj_t *s_cfg_days_val;
 static lv_obj_t *s_cfg_rot_val;
 static lv_obj_t *s_cfg_rot_sw, *s_cfg_rot_btn, *s_cfg_time_sw;
+static lv_obj_t *s_cfg_lockkey_val, *s_cfg_lockkey_btn;
 static lv_obj_t *s_cfg_always_sw, *s_cfg_rings_sw;
 static lv_obj_t *s_cfg_bright_val;
 static lv_obj_t *s_cfg_vol_val;
@@ -3284,9 +3358,87 @@ static lv_obj_t *s_cfg_care_val, *s_cfg_care_sub, *s_cfg_care_sld, *s_cfg_care_b
 static lv_obj_t *s_cfg_net_val;
 static lv_obj_t *s_cfg_ble_val;
 static lv_obj_t *s_cfg_ble_code;
+static lv_obj_t *s_cfg_ble_qr;
+/* The code currently encoded in the QR, so a re-encode happens once per session
+ * rather than once per tick. File scope rather than a function-local static
+ * because the card is rebuilt on every app open: a local would still hold the
+ * previous session's code, match, and skip the update, leaving the freshly
+ * created widget blank for a code the panel is displaying right beside it. */
+static char      s_cfg_ble_qr_code[7];
+
+/* The pairing QR is drawn ONLY inside the full-screen setup scene, never in
+ * the scrolling CONTROL column. Every reboot captured on 2026-08-23 — a tlsf
+ * double-free, two LoadProhibited walks of LVGL's own lists, and a newlib time
+ * lock that stopped being a semaphore — needed the same two things: the QR
+ * visible in the column, and the column being scrolled. Removing the QR
+ * outright stopped the crashes for a session.
+ *
+ * Not attributed, and the honest reading is that the QR may be the canary
+ * rather than the bug: its 5008-byte draw buffer (200x200 I1 + 8 B palette —
+ * exactly the value found in registers at two of the panics) is allocated at
+ * CONTROL build into internal SRAM, and something may dangle into whatever
+ * block it lands in. Ruled out with instrumentation, not guesswork: heap
+ * poisoning (COMPREHENSIVE), LV_USE_ASSERT_OBJ and the end-of-stack
+ * watchpoint all stayed silent; the image cache never owns the canvas buffer
+ * (decode_indexed copies it, or with RAM_LOAD off caches nothing); and the
+ * only frees of that header are set_size at build and the destructor.
+ *
+ * If it comes back with a different face, the first two suspects for the
+ * reopen are today's other additions to the teardown path: the lv_layer_top()
+ * bezel lobes with lv_anim keyed on a static array, and the picker's scroll
+ * callbacks on a list app_open deletes. Set this to 0 to drop the QR entirely
+ * and pair by typing the six-digit code. */
+#define CFG_SETUP_QR 1
+static lv_obj_t *s_cfg_ble_spin;
+/* The Wi-Fi setup scene: a full-screen panel over CONTROL, the same shape as
+ * MUSIC's device picker. QR, code, spinner and the join result live HERE,
+ * not in the scrolling column. */
+static lv_obj_t *s_cfg_wifi, *s_cfg_wifi_st, *s_cfg_wifi_sub, *s_cfg_wifi_stop;
+static lv_obj_t *s_cfg_wifi_tick;   /* the big result glyph: green check or red cross */
+/* 0 = scene idle (nothing asked for), 1 = a session or join is in flight,
+ * 2 = that join finished. The big glyph shows only in phase 2 (or on a
+ * failed retry): opening the scene on an already-connected cube must not
+ * greet you with a success mark for something you have not done yet. */
+static int s_cfg_wifi_phase;
 static lv_obj_t *s_cfg_ble_btn;
+/* True from the tap until the session is either open or known to have failed.
+ * Bringing pairing up runs inline on the main loop and measured ~4 s on
+ * hardware, so this is the window in which the card must say something. */
+static volatile bool s_cfg_ble_starting;
+/* The CONTROL tick's change-gate for this card. At file scope so cfg_ble_cb can
+ * invalidate it: the tick cannot run while the main loop is busy starting BLE,
+ * so on the failure path it would otherwise wake to find the same key it last
+ * saw (wi-fi up, no session), skip its branch, and leave the spinner turning
+ * forever over a card that has finished. */
+static int       s_cfg_ble_key = -1;
 static lv_obj_t *s_cfg_sys_val;
 static lv_obj_t *s_cfg_log;
+
+/* Sliders in the scrolling column, registered so a scroll can make them inert.
+ *
+ * An lv_slider in the default mode jumps to wherever you press on the track —
+ * that is what makes the whole 46 px bar a target rather than just the knob
+ * (see cfg_slider) — but it also means merely *touching* a slider to begin a
+ * scroll commits a value. Two different gestures hit this and they need
+ * different guards, which is why there are two:
+ *
+ *   - starting a drag on a slider that turns out to be a scroll. LVGL hands the
+ *     press to the column once it passes scroll_limit and sends the slider
+ *     LV_EVENT_PRESS_LOST, so the snapshot taken on LV_EVENT_PRESSED is what
+ *     puts the value back.
+ *   - touching down to arrest a fling. There is no press to lose here; the
+ *     finger simply lands on whatever is under it, so the slider has to be
+ *     un-hittable *before* the touch arrives. Hence clearing CLICKABLE for the
+ *     duration of the scroll.
+ *
+ * CLICKABLE and not LV_STATE_DISABLED or an opacity fade: in this app a faded
+ * control means "this cannot act" (the autorotate switch with no IMU), and a
+ * slider that greyed out every time the list moved would read as a fault. This
+ * is invisible, and it costs no dirty area mid-scroll. */
+#define CFG_SLIDER_MAX 4
+static lv_obj_t *s_cfg_sliders[CFG_SLIDER_MAX];
+static int32_t   s_cfg_slider_snap[CFG_SLIDER_MAX];
+static int       s_cfg_slider_n;
 
 #define CFG_ACCENT_WALL 0x22D3EE
 #define CFG_ACCENT_DAYS 0x8B7CF6
@@ -3310,6 +3462,10 @@ static lv_obj_t *cfg_card(lv_obj_t *parent, const char *title, uint32_t accent) 
     /* Controls here are sized for a fingertip (CFG_TOUCH_H), and 7 px of gutter
      * between 76 px controls reads as a pile rather than a list. */
     lv_obj_set_style_pad_row(card, 14, 0);
+    /* The rounded corners and the translucent border are free. Measured
+     * 2026-08-23 with both removed from every card: 2.75 Mpx/s against 2.77
+     * with them, under the same scroll. Do not trade them away for speed;
+     * the render cost is in the flat fill and text blend, not in the masks. */
     lv_obj_set_style_border_width(card, 1, 0);
     lv_obj_set_style_border_color(card, lv_color_hex(accent), 0);
     lv_obj_set_style_border_opa(card, 80, 0);
@@ -3382,8 +3538,63 @@ static void cfg_button_live(lv_obj_t *b, bool live) {
     else      lv_obj_remove_flag(b, LV_OBJ_FLAG_CLICKABLE);
 }
 
+/* The switch equivalent. cfg_switch() hands back the switch, but it lives in a
+ * row next to its label, so fading only the switch leaves bright text over a
+ * greyed control — worse than not fading at all. Dim the row; take CLICKABLE
+ * off the switch, which is the object the indev actually hit-tests. */
+static void cfg_switch_live(lv_obj_t *sw, bool live) {
+    if (!sw) return;
+    lv_obj_t *row = lv_obj_get_parent(sw);
+    if (row) lv_obj_set_style_opa(row, live ? LV_OPA_COVER : LV_OPA_40, 0);
+    if (live) lv_obj_add_flag(sw, LV_OBJ_FLAG_CLICKABLE);
+    else      lv_obj_remove_flag(sw, LV_OBJ_FLAG_CLICKABLE);
+}
+
 /* A full-width slider sized for a finger rather than for a cursor. Both sliders
  * in this app go through here so they cannot drift apart. */
+static int cfg_slider_index(const lv_obj_t *s) {
+    for (int i = 0; i < s_cfg_slider_n; i++) if (s_cfg_sliders[i] == s) return i;
+    return -1;
+}
+
+/* Snapshot on press, put it back if the column steals the press.
+ *
+ * The restore re-sends LV_EVENT_VALUE_CHANGED rather than only moving the knob,
+ * because the app callbacks act on that event: cfg_bright_cb raises
+ * s_req_bright_apply before its release check, so the panel has already been
+ * told to change by the time the scroll is recognised. Re-sending is what undoes
+ * it. Safe from inside a handler — LVGL re-enters lv_obj_send_event, and the
+ * guard ignores VALUE_CHANGED so this cannot recurse. */
+static void cfg_slider_guard_cb(lv_event_t *e) {
+    lv_obj_t *s = lv_event_get_target(e);
+    int i = cfg_slider_index(s);
+    if (i < 0) return;
+
+    if (lv_event_get_code(e) == LV_EVENT_PRESSED) {
+        s_cfg_slider_snap[i] = lv_slider_get_value(s);
+        return;
+    }
+    /* LV_EVENT_PRESS_LOST */
+    if (lv_slider_get_value(s) == s_cfg_slider_snap[i]) return;
+    lv_slider_set_value(s, s_cfg_slider_snap[i], LV_ANIM_OFF);
+    lv_obj_send_event(s, LV_EVENT_VALUE_CHANGED, NULL);
+}
+
+/* Sliders are un-hittable for as long as the column is moving, so a finger put
+ * down to stop a fling lands on the column instead of on a control. Restoring
+ * on SCROLL_END is safe against the arresting touch itself: LVGL binds a press
+ * to an object when the finger lands, and at that moment the slider is still
+ * not clickable, so the already-bound press stays with the column even after
+ * the flag comes back. */
+static void cfg_scroll_guard_cb(lv_event_t *e) {
+    bool scrolling = lv_event_get_code(e) == LV_EVENT_SCROLL_BEGIN;
+    for (int i = 0; i < s_cfg_slider_n; i++) {
+        if (!s_cfg_sliders[i]) continue;
+        if (scrolling) lv_obj_remove_flag(s_cfg_sliders[i], LV_OBJ_FLAG_CLICKABLE);
+        else           lv_obj_add_flag(s_cfg_sliders[i],    LV_OBJ_FLAG_CLICKABLE);
+    }
+}
+
 static lv_obj_t *cfg_slider(lv_obj_t *card, int lo, int hi, int val,
                             uint32_t accent, uint32_t knob, lv_event_cb_t cb) {
     lv_obj_t *s = lv_slider_create(card);
@@ -3405,6 +3616,16 @@ static lv_obj_t *cfg_slider(lv_obj_t *card, int lo, int hi, int val,
     lv_obj_set_style_pad_all(s, 0, LV_PART_KNOB);
     lv_obj_add_event_cb(s, cb, LV_EVENT_VALUE_CHANGED, NULL);
     lv_obj_add_event_cb(s, cb, LV_EVENT_RELEASED, NULL);
+
+    /* After the app's own callback, so a restore on PRESS_LOST re-runs it with
+     * the old value rather than racing it. */
+    if (s_cfg_slider_n < CFG_SLIDER_MAX) {
+        s_cfg_sliders[s_cfg_slider_n]     = s;
+        s_cfg_slider_snap[s_cfg_slider_n] = val;
+        s_cfg_slider_n++;
+        lv_obj_add_event_cb(s, cfg_slider_guard_cb, LV_EVENT_PRESSED, NULL);
+        lv_obj_add_event_cb(s, cfg_slider_guard_cb, LV_EVENT_PRESS_LOST, NULL);
+    }
     return s;
 }
 
@@ -3449,11 +3670,56 @@ static void cfg_days_fetch_cb(lv_event_t *e) {
     if (s_cfg_days_val) lv_label_set_text(s_cfg_days_val, "refresh queued...");
 }
 
+static void cfg_wifi_show(bool on) {
+    if (!s_cfg_wifi) return;
+    if (on) lv_obj_remove_flag(s_cfg_wifi, LV_OBJ_FLAG_HIDDEN);
+    else    lv_obj_add_flag(s_cfg_wifi, LV_OBJ_FLAG_HIDDEN);
+}
+
+/* Opens the setup scene, and starts a session if none is running. Flags only
+ * for the start: it tears the Wi-Fi driver down, which is far too much to do
+ * inside an LVGL callback. The scene paints its own "starting" state from the
+ * tick, because unlike the old in-column card it is not fighting a relayout. */
 static void cfg_ble_cb(lv_event_t *e) {
-    /* Flags only. Starting a session tears the Wi-Fi driver down, which is
-     * far too much to do inside an LVGL callback. */
+    cfg_wifi_show(true);
+    if (s_cfg_ble_starting || ble_prov_active()) return;   /* just show it */
+    s_req_ble_on = true;
+    s_cfg_ble_starting = true;
+    s_cfg_wifi_phase = 1;
+    s_cfg_ble_key = -1;
+    /* Paint the waiting state from HERE. The tick refreshes the scene every
+     * 400 ms whether or not it is visible, so the panel was being revealed
+     * with whatever the last tick drew — a green check, on a cube that was
+     * already online — and only the next tick replaced it. */
+    if (s_cfg_wifi_st)   lv_label_set_text(s_cfg_wifi_st, "starting bluetooth...");
+    if (s_cfg_wifi_sub)  lv_label_set_text(s_cfg_wifi_sub, "");
+    if (s_cfg_wifi_tick) lv_obj_add_flag(s_cfg_wifi_tick, LV_OBJ_FLAG_HIDDEN);
+    if (s_cfg_ble_qr)    lv_obj_add_flag(s_cfg_ble_qr, LV_OBJ_FLAG_HIDDEN);
+    if (s_cfg_ble_code)  lv_obj_add_flag(s_cfg_ble_code, LV_OBJ_FLAG_HIDDEN);
+    if (s_cfg_ble_spin)  lv_obj_remove_flag(s_cfg_ble_spin, LV_OBJ_FLAG_HIDDEN);
+    if (s_cfg_wifi_stop) lv_obj_remove_flag(s_cfg_wifi_stop, LV_OBJ_FLAG_HIDDEN);
+}
+
+/* The scene's own Stop. Distinct from the card button so that opening the
+ * scene to READ a result never also kills a live session. */
+static void cfg_wifi_stop_cb(lv_event_t *e) {
     if (ble_prov_active()) s_req_ble_off = true;
-    else                   s_req_ble_on  = true;
+}
+
+static void cfg_wifi_close_cb(lv_event_t *e) { cfg_wifi_show(false); }
+
+/* What a join failure means, in words the person holding the cube can act on.
+ * The phone is long gone by the time this is known — the radio came down to
+ * let Wi-Fi up — so the panel is the only place it can be said. */
+static const char *wifi_fail_text(int reason) {
+    switch (reason) {
+        case 201:                     return "network not found";
+        case 2: case 15:
+        case 202: case 204:           return "wrong password";
+        case 203: case 205:           return "network refused the connection";
+        case 200:                     return "no response from the network";
+        default:                      return "could not connect";
+    }
 }
 
 static void cfg_rotate_cb(lv_event_t *e) {
@@ -3472,6 +3738,318 @@ static void cfg_clock_cb(lv_event_t *e) {
     ESP_LOGI(TAG, "lock clock %s", s_clock_24 ? "24-hour" : "12-hour");
 }
 
+/* Defined with the app table, which this file only reaches further down. */
+static int         lock_key_choices(void);
+static int         lock_key_app_at(int slot);
+static const char *lock_key_name(int app);
+static const char *app_symbol(int app);
+
+/* ---- shortcut picker: a CONTROL sub-scene ----
+ *
+ * Modelled on MUSIC's device picker: a full-screen panel over the app's own
+ * screen, hidden rather than rebuilt, popped by the back key. A cycling button
+ * was tried first and was wrong — you cannot see the options, only guess how
+ * many taps away the one you want is. */
+static lv_obj_t *s_cfg_pick, *s_cfg_picklist, *s_cfg_pickmore;
+static int       s_cfg_more_n;      /* last count drawn, to change-gate */
+
+/* How many rows are still below the fold, and say so — or stop saying it once
+ * there is nothing left down there. A fixed "scroll for 2 more" that survives
+ * reaching the bottom is worse than no hint: it tells you the list is lying. */
+static void cfg_pick_more_update(void) {
+    if (!s_cfg_pickmore || !s_cfg_picklist) return;
+    int32_t below = lv_obj_get_scroll_bottom(s_cfg_picklist);
+    int n = (below <= 4) ? 0        /* a little slack: rounding leaves a pixel or two */
+                         : (int)((below + CFG_TOUCH_H + 11) / (CFG_TOUCH_H + 12));
+    if (n == s_cfg_more_n) return;  /* this runs on every scroll frame */
+    s_cfg_more_n = n;
+    if (n == 0) {
+        lv_obj_add_flag(s_cfg_pickmore, LV_OBJ_FLAG_HIDDEN);
+        return;
+    }
+    lv_label_set_text_fmt(s_cfg_pickmore, LV_SYMBOL_DOWN "   scroll for %d more", n);
+    lv_obj_remove_flag(s_cfg_pickmore, LV_OBJ_FLAG_HIDDEN);
+}
+
+static void cfg_pick_scroll_cb(lv_event_t *e) { cfg_pick_more_update(); }
+
+static void cfg_pick_show(bool on) {
+    if (!s_cfg_pick) return;
+    if (on) {
+        /* Always open at the top; a picker that reopens halfway down looks
+         * broken, and the hint would start out already half-spent. */
+        if (s_cfg_picklist) lv_obj_scroll_to_y(s_cfg_picklist, 0, LV_ANIM_OFF);
+        s_cfg_more_n = -1;                    /* force the first recount */
+        cfg_pick_more_update();
+        lv_obj_remove_flag(s_cfg_pick, LV_OBJ_FLAG_HIDDEN);
+    } else {
+        lv_obj_add_flag(s_cfg_pick, LV_OBJ_FLAG_HIDDEN);
+    }
+}
+
+static void cfg_lockkey_label(void) {
+    if (!s_cfg_lockkey_val) return;
+    lv_label_set_text_fmt(s_cfg_lockkey_val, "Shortcut:  %s   " LV_SYMBOL_RIGHT,
+                          lock_key_name(s_lock_key_app));
+}
+
+static void cfg_pick_row_cb(lv_event_t *e) {
+    s_lock_key_app = (int)(intptr_t)lv_event_get_user_data(e);
+    s_req_lock_pref_save = true;
+    cfg_lockkey_label();
+    ESP_LOGI(TAG, "lock middle key -> %s", lock_key_name(s_lock_key_app));
+    cfg_pick_show(false);
+}
+
+static void cfg_pick_cancel_cb(lv_event_t *e) { cfg_pick_show(false); }
+
+/* Opens the picker. */
+static void cfg_lockkey_cb(lv_event_t *e) { cfg_pick_show(true); }
+
+static void cfg_pick_row(lv_obj_t *parent, int app, const char *text,
+                         lv_event_cb_t cb) {   /* text: NULL = name the app */
+    lv_obj_t *b = lv_button_create(parent);
+    lv_obj_set_size(b, lv_pct(100), CFG_TOUCH_H);
+    lv_obj_set_ext_click_area(b, 6);
+    lv_obj_set_style_radius(b, 16, 0);
+    lv_obj_set_style_bg_color(b, lv_color_hex(0x1B2432), 0);
+    lv_obj_set_style_border_width(b, 1, 0);
+    lv_obj_set_style_border_color(b, lv_color_hex(CFG_ACCENT_LOCK), 0);
+    /* The row already in force is drawn at full border opacity — a list of
+     * identical rows does not say which one you are on. */
+    lv_obj_set_style_border_opa(b, (!text && app == s_lock_key_app) ? 255 : 70, 0);
+    lv_obj_set_style_bg_color(b, lv_color_hex(CFG_ACCENT_LOCK), LV_STATE_PRESSED);
+    lv_obj_add_event_cb(b, cb, LV_EVENT_CLICKED, (void *)(intptr_t)app);
+
+    lv_obj_t *l = lv_label_create(b);
+    lv_obj_set_style_text_font(l, &lv_font_montserrat_20, 0);
+    lv_obj_set_style_text_color(l, lv_color_hex(0xE2E8F0), 0);
+    const char *sym = text ? NULL : app_symbol(app);
+    if (text)      lv_label_set_text(l, text);
+    else if (sym)  lv_label_set_text_fmt(l, "%s   %s", sym, lock_key_name(app));
+    else           lv_label_set_text(l, lock_key_name(app));
+    lv_obj_center(l);
+}
+
+/* The Wi-Fi setup scene. Full-screen over CONTROL, hidden until asked for,
+ * popped by the back key or its own close button. Nothing here is inside the
+ * scrolling column, which is the whole point: the QR used to live in a card
+ * between BATTERY and NETWORK, and scrolling past it rebooted the cube. */
+static void cfg_wifi_build(lv_obj_t *scr) {
+    s_cfg_wifi = lv_obj_create(scr);
+    lv_obj_remove_style_all(s_cfg_wifi);
+    lv_obj_set_size(s_cfg_wifi, 480, 480);
+    lv_obj_center(s_cfg_wifi);
+    lv_obj_set_style_bg_color(s_cfg_wifi, lv_color_hex(0x05070B), 0);
+    lv_obj_set_style_bg_opa(s_cfg_wifi, 250, 0);
+    lv_obj_remove_flag(s_cfg_wifi, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(s_cfg_wifi, LV_OBJ_FLAG_HIDDEN);
+    /* Opaque, but it must still swallow taps aimed at the column underneath. */
+    lv_obj_add_flag(s_cfg_wifi, LV_OBJ_FLAG_CLICKABLE);
+
+    lv_obj_t *t = lv_label_create(s_cfg_wifi);
+    lv_obj_set_style_text_font(t, &hud_text_18, 0);
+    lv_obj_set_style_text_color(t, lv_color_hex(CFG_ACCENT_NET), 0);
+    lv_obj_set_style_text_letter_space(t, 4, 0);
+    lv_label_set_text(t, "WI-FI SETUP");
+    lv_obj_align(t, LV_ALIGN_TOP_MID, 0, TOP_MARGIN + 18);
+
+    /* A visible way out, in the corner the device picker uses for the same
+     * job. Closing does NOT stop a session: you can leave and come back. */
+    lv_obj_t *x = lv_button_create(s_cfg_wifi);
+    lv_obj_remove_style_all(x);
+    lv_obj_set_size(x, 64, 64);
+    lv_obj_set_pos(x, 400, 68);
+    lv_obj_set_ext_click_area(x, 10);
+    lv_obj_set_style_radius(x, LV_RADIUS_CIRCLE, 0);
+    lv_obj_set_style_bg_color(x, lv_color_hex(0x10161F), 0);
+    lv_obj_set_style_bg_opa(x, LV_OPA_COVER, 0);
+    lv_obj_set_style_bg_color(x, lv_color_hex(0x64748B), LV_STATE_PRESSED);
+    lv_obj_add_event_cb(x, cfg_wifi_close_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_t *xl = lv_label_create(x);
+    lv_obj_set_style_text_font(xl, &lv_font_montserrat_20, 0);
+    lv_obj_set_style_text_color(xl, lv_color_hex(0x64748B), 0);
+    lv_label_set_text(xl, LV_SYMBOL_CLOSE);
+    lv_obj_center(xl);
+
+    s_cfg_wifi_st = lv_label_create(s_cfg_wifi);
+    lv_obj_set_width(s_cfg_wifi_st, CONTENT_W);
+    lv_obj_set_height(s_cfg_wifi_st, 26);
+    lv_obj_set_style_text_font(s_cfg_wifi_st, &lv_font_montserrat_20, 0);
+    lv_obj_set_style_text_color(s_cfg_wifi_st, lv_color_hex(0xC7D2E0), 0);
+    lv_obj_set_style_text_align(s_cfg_wifi_st, LV_TEXT_ALIGN_CENTER, 0);
+    lv_label_set_long_mode(s_cfg_wifi_st, LV_LABEL_LONG_CLIP);
+    lv_label_set_text(s_cfg_wifi_st, "");
+    lv_obj_align(s_cfg_wifi_st, LV_ALIGN_TOP_MID, 0, 92);
+
+    /* The spinner shares the QR's slot so the scene does not jump when one
+     * replaces the other. Its animation runs on the LVGL task, which is what
+     * lets it keep turning while the main loop is blocked in a scan. */
+    s_cfg_ble_spin = lv_spinner_create(s_cfg_wifi);
+    lv_obj_set_size(s_cfg_ble_spin, 64, 64);
+    lv_obj_set_style_arc_color(s_cfg_ble_spin, lv_color_hex(0x1B2432), LV_PART_MAIN);
+    lv_obj_set_style_arc_color(s_cfg_ble_spin, lv_color_hex(CFG_ACCENT_NET),
+                               LV_PART_INDICATOR);
+    lv_obj_align(s_cfg_ble_spin, LV_ALIGN_TOP_MID, 0, 192);
+    lv_obj_add_flag(s_cfg_ble_spin, LV_OBJ_FLAG_HIDDEN);
+
+    s_cfg_ble_qr = CFG_SETUP_QR ? lv_qrcode_create(s_cfg_wifi) : NULL;
+    if (s_cfg_ble_qr) {
+        lv_qrcode_set_size(s_cfg_ble_qr, 200);
+        /* Black on WHITE, with the quiet zone left on. A QR drawn onto a dark
+         * panel directly -- or with a transparent border -- is the classic
+         * unscannable one: the encoder needs the light modules light and the
+         * four-module margin is part of the symbol, not padding. */
+        lv_qrcode_set_dark_color(s_cfg_ble_qr, lv_color_hex(0x000000));
+        lv_qrcode_set_light_color(s_cfg_ble_qr, lv_color_hex(0xFFFFFF));
+        lv_qrcode_set_quiet_zone(s_cfg_ble_qr, true);
+        lv_obj_align(s_cfg_ble_qr, LV_ALIGN_TOP_MID, 0, 124);
+        lv_obj_add_flag(s_cfg_ble_qr, LV_OBJ_FLAG_HIDDEN);
+    }
+
+    /* The result, in the slot the QR and spinner share: a big green check
+     * you can read from across the desk. montserrat_48 is the largest
+     * compiled-in face carrying LV_SYMBOL_OK; the hud fonts have no symbols.
+     * Same green as the charging bolt and the battery bar, so "good" is one
+     * colour everywhere on this device. */
+    s_cfg_wifi_tick = lv_label_create(s_cfg_wifi);
+    lv_obj_set_style_text_font(s_cfg_wifi_tick, &lv_font_montserrat_48, 0);
+    lv_obj_set_style_text_color(s_cfg_wifi_tick, lv_color_hex(0x22C55E), 0);
+    lv_label_set_text(s_cfg_wifi_tick, LV_SYMBOL_OK);
+    lv_obj_align(s_cfg_wifi_tick, LV_ALIGN_TOP_MID, 0, 196);
+    lv_obj_add_flag(s_cfg_wifi_tick, LV_OBJ_FLAG_HIDDEN);
+
+    s_cfg_ble_code = lv_label_create(s_cfg_wifi);
+    lv_obj_set_width(s_cfg_ble_code, CONTENT_W);
+    lv_obj_set_style_text_font(s_cfg_ble_code, &hud_text_18, 0);
+    lv_obj_set_style_text_color(s_cfg_ble_code, lv_color_hex(0x60A5FA), 0);
+    lv_obj_set_style_text_letter_space(s_cfg_ble_code, 4, 0);
+    lv_obj_set_style_text_align(s_cfg_ble_code, LV_TEXT_ALIGN_CENTER, 0);
+    lv_label_set_text(s_cfg_ble_code, "");
+    lv_obj_align(s_cfg_ble_code, LV_ALIGN_TOP_MID, 0, 334);
+    lv_obj_add_flag(s_cfg_ble_code, LV_OBJ_FLAG_HIDDEN);
+
+    s_cfg_wifi_sub = lv_label_create(s_cfg_wifi);
+    lv_obj_set_width(s_cfg_wifi_sub, CONTENT_W);
+    lv_obj_set_height(s_cfg_wifi_sub, 40);
+    lv_obj_set_style_text_font(s_cfg_wifi_sub, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(s_cfg_wifi_sub, lv_color_hex(0x94A3B8), 0);
+    lv_obj_set_style_text_align(s_cfg_wifi_sub, LV_TEXT_ALIGN_CENTER, 0);
+    lv_label_set_long_mode(s_cfg_wifi_sub, LV_LABEL_LONG_WRAP);
+    lv_label_set_text(s_cfg_wifi_sub, "");
+    lv_obj_align(s_cfg_wifi_sub, LV_ALIGN_TOP_MID, 0, 360);
+
+    /* 48 px plus a 12 px extended hit area: a 76 px control does not fit under
+     * a 200 px QR inside the safe area, and this one is a single tap. */
+    s_cfg_wifi_stop = lv_button_create(s_cfg_wifi);
+    lv_obj_set_size(s_cfg_wifi_stop, CONTENT_W, 48);
+    lv_obj_align(s_cfg_wifi_stop, LV_ALIGN_TOP_MID, 0, 388);
+    lv_obj_set_ext_click_area(s_cfg_wifi_stop, 12);
+    lv_obj_set_style_radius(s_cfg_wifi_stop, 16, 0);
+    lv_obj_set_style_bg_color(s_cfg_wifi_stop, lv_color_hex(0x1B2432), 0);
+    lv_obj_set_style_border_width(s_cfg_wifi_stop, 1, 0);
+    lv_obj_set_style_border_color(s_cfg_wifi_stop, lv_color_hex(CFG_ACCENT_NET), 0);
+    lv_obj_set_style_border_opa(s_cfg_wifi_stop, 150, 0);
+    lv_obj_set_style_bg_color(s_cfg_wifi_stop, lv_color_hex(CFG_ACCENT_NET),
+                              LV_STATE_PRESSED);
+    lv_obj_add_event_cb(s_cfg_wifi_stop, cfg_wifi_stop_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_add_flag(s_cfg_wifi_stop, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_t *sl = lv_label_create(s_cfg_wifi_stop);
+    lv_obj_set_style_text_font(sl, &lv_font_montserrat_20, 0);
+    lv_obj_set_style_text_color(sl, lv_color_hex(0xE2E8F0), 0);
+    lv_label_set_text(sl, LV_SYMBOL_CLOSE "  Stop Wi-Fi setup");
+    lv_obj_center(sl);
+}
+
+static void cfg_pick_build(lv_obj_t *scr) {
+    s_cfg_pick = lv_obj_create(scr);
+    lv_obj_remove_style_all(s_cfg_pick);
+    lv_obj_set_size(s_cfg_pick, 480, 480);
+    lv_obj_center(s_cfg_pick);
+    lv_obj_set_style_bg_color(s_cfg_pick, lv_color_hex(0x05070B), 0);
+    lv_obj_set_style_bg_opa(s_cfg_pick, 250, 0);
+    lv_obj_remove_flag(s_cfg_pick, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(s_cfg_pick, LV_OBJ_FLAG_HIDDEN);
+    /* Opaque, but it must still swallow taps aimed at the card underneath. */
+    lv_obj_add_flag(s_cfg_pick, LV_OBJ_FLAG_CLICKABLE);
+
+    lv_obj_t *t = lv_label_create(s_cfg_pick);
+    lv_obj_set_style_text_font(t, &hud_text_18, 0);
+    lv_obj_set_style_text_color(t, lv_color_hex(CFG_ACCENT_LOCK), 0);
+    lv_obj_set_style_text_letter_space(t, 4, 0);
+    lv_label_set_text(t, "MIDDLE KEY ON LOCK");
+    lv_obj_align(t, LV_ALIGN_TOP_MID, 0, TOP_MARGIN + 18);
+
+    s_cfg_picklist = lv_obj_create(s_cfg_pick);
+    lv_obj_remove_style_all(s_cfg_picklist);
+    /* Exactly three 76 px rows plus their two 12 px gutters. A window that
+     * cuts a row in half is the honest way to say the list continues, and it
+     * pairs with the hint below. */
+    lv_obj_set_size(s_cfg_picklist, CONTENT_W, CFG_TOUCH_H * 3 + 24);
+    lv_obj_align(s_cfg_picklist, LV_ALIGN_TOP_MID, 0, 88);
+    lv_obj_set_flex_flow(s_cfg_picklist, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_style_pad_row(s_cfg_picklist, 12, 0);
+    lv_obj_set_scroll_dir(s_cfg_picklist, LV_DIR_VER);
+    lv_obj_set_scrollbar_mode(s_cfg_picklist, LV_SCROLLBAR_MODE_OFF);
+    /* Same reason as MUSIC's device list: scrolling this is a vertical drag,
+     * and letting it bubble would swipe CONTROL home out from under the finger. */
+    lv_obj_remove_flag(s_cfg_picklist, LV_OBJ_FLAG_GESTURE_BUBBLE);
+
+    for (int slot = 0; slot < lock_key_choices(); slot++) {
+        cfg_pick_row(s_cfg_picklist, lock_key_app_at(slot), NULL, cfg_pick_row_cb);
+    }
+
+    /* A visible way out, because a full-screen panel whose only exit is a key
+     * nobody told you about is one people feel trapped in — the device picker
+     * learned that too.
+     *
+     * Outside the list and deliberately unlike a row: the first version was a
+     * sixth entry styled exactly like the apps above it, and it read as an app
+     * called Cancel. Chrome has to look like chrome. */
+    /* Five options in a three-row window read as a list of three — the two
+     * below the fold may as well not exist. The label is built unconditionally
+     * and cfg_pick_more_update() decides whether it says anything, so the one
+     * place that knows the scroll position is the only place that decides. */
+    s_cfg_pickmore = lv_label_create(s_cfg_pick);
+    lv_obj_set_style_text_font(s_cfg_pickmore, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(s_cfg_pickmore, lv_color_hex(0x64748B), 0);
+    lv_label_set_text(s_cfg_pickmore, "");
+    lv_obj_align(s_cfg_pickmore, LV_ALIGN_TOP_MID, 0, 346);
+    lv_obj_remove_flag(s_cfg_pickmore, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_flag(s_cfg_pickmore, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_event_cb(s_cfg_picklist, cfg_pick_scroll_cb, LV_EVENT_SCROLL, NULL);
+    lv_obj_add_event_cb(s_cfg_picklist, cfg_pick_scroll_cb, LV_EVENT_SCROLL_END, NULL);
+
+    /* A hairline, then bare text. Two earlier tries both read as another
+     * choice: a sixth list row styled like the apps (taken for an app called
+     * Cancel), then a bordered pill below them (still a card, still tappable-
+     * looking). Anything with a border belongs to the list. The rule the panel
+     * settles on: bordered card = a thing you can pick, bare text below a rule
+     * = a way out. */
+    lv_obj_t *rule = lv_obj_create(s_cfg_pick);
+    lv_obj_remove_style_all(rule);
+    lv_obj_set_size(rule, CONTENT_W, 1);
+    lv_obj_align(rule, LV_ALIGN_TOP_MID, 0, 368);
+    lv_obj_set_style_bg_color(rule, lv_color_hex(0x64748B), 0);
+    lv_obj_set_style_bg_opa(rule, 60, 0);
+    lv_obj_remove_flag(rule, LV_OBJ_FLAG_CLICKABLE);
+
+    lv_obj_t *back = lv_button_create(s_cfg_pick);
+    /* First: it clears every local style, so size and align have to follow it
+     * or they are wiped along with the fill and border. */
+    lv_obj_remove_style_all(back);            /* no fill, no border, no radius */
+    lv_obj_set_size(back, CONTENT_W, 56);
+    lv_obj_align(back, LV_ALIGN_TOP_MID, 0, 380);
+    lv_obj_set_ext_click_area(back, 10);
+    lv_obj_add_event_cb(back, cfg_pick_cancel_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_t *bl = lv_label_create(back);
+    lv_obj_set_style_text_font(bl, &lv_font_montserrat_20, 0);
+    lv_obj_set_style_text_color(bl, lv_color_hex(0x64748B), 0);
+    lv_obj_set_style_text_color(bl, lv_color_hex(0xC7D2E0), LV_STATE_PRESSED);
+    lv_label_set_text(bl, LV_SYMBOL_LEFT "   Back");
+    lv_obj_center(bl);
+}
+
 static void cfg_always_cb(lv_event_t *e) {
     s_always_on = lv_obj_has_state(lv_event_get_target(e), LV_STATE_CHECKED);
     s_req_lock_pref_save = true;
@@ -3480,6 +4058,14 @@ static void cfg_always_cb(lv_event_t *e) {
 
 static void cfg_rings_cb(lv_event_t *e) {
     s_lock_rings = lv_obj_has_state(lv_event_get_target(e), LV_STATE_CHECKED);
+    /* Drop always-on with them. Leaving it set would strand a faded switch in
+     * the ON position with no way to clear it, and keep the panel awake with
+     * nothing on screen explaining why. */
+    if (!s_lock_rings && s_always_on) {
+        s_always_on = false;
+        if (s_cfg_always_sw) lv_obj_remove_state(s_cfg_always_sw, LV_STATE_CHECKED);
+        ESP_LOGI(TAG, "always-on OFF (rings off, it has no indicator)");
+    }
     s_req_lock_pref_save = true;
     ESP_LOGI(TAG, "lock-screen rings %s", s_lock_rings ? "ON" : "OFF");
 }
@@ -3700,6 +4286,16 @@ static void cfg_timer_cb(lv_timer_t *t) {
         cfg_button_live(s_cfg_rot_btn, s_autorot);
     }
 
+    /* Always-on has no standing indicator once the rings are off: the amber
+     * base ring IS the readout, and lock_refresh() hides it with the rest.
+     * The mode would still run, which is worse than it not running — a lit
+     * panel with nothing saying why. Same fade-not-hide treatment the
+     * calibration button gets, and change-gated for the same reason. */
+    if (s_cfg_always_sw &&
+        s_lock_rings != lv_obj_has_flag(s_cfg_always_sw, LV_OBJ_FLAG_CLICKABLE)) {
+        cfg_switch_live(s_cfg_always_sw, s_lock_rings);
+    }
+
     /* ---- battery ---- */
     int pct = s_batt_pct;
     bar_set_changed(s_cfg_batt_bar, pct < 0 ? 100 : pct);
@@ -3760,36 +4356,118 @@ static void cfg_timer_cb(lv_timer_t *t) {
             "idle", "waiting for phone", "phone connected", "ready",
             "wi-fi received", "finishing", "could not connect",
         };
-        static int  last_key = -1;
         bool act = ble_prov_active();
-        int  key = act ? (100 + (int)ble_prov_state())
-                       : (s_wifi_torn_down ? 1 : s_wifi_up ? 2 : 3);
+        ble_prov_state_t st = act ? ble_prov_state() : BLE_PROV_OFF;
+        bool joining = !act && !s_wifi_torn_down && s_creds_pending && !s_wifi_up;
+        bool failed  = joining && s_wifi_reason != 0;
 
-        if (key != last_key) {
-            last_key = key;
-            if (act) {
-                ble_prov_state_t st = ble_prov_state();
-                lv_label_set_text(s_cfg_ble_val,
-                                  st <= BLE_PROV_ERR ? ble_st[st] : "idle");
-                lv_obj_remove_flag(s_cfg_ble_code, LV_OBJ_FLAG_HIDDEN);
-                lv_label_set_text(lv_obj_get_child(s_cfg_ble_btn, 0),
-                                  LV_SYMBOL_CLOSE "  Stop Wi-Fi setup");
-            } else {
-                /* The join happens after the radio is down, so this card is
-                 * where the result shows — the phone cannot be told. */
-                lv_label_set_text(s_cfg_ble_val,
-                                  s_wifi_torn_down ? "restoring wi-fi" :
-                                  s_wifi_up        ? "wi-fi connected\n"
-                                                     "tap below to change network"
-                                                   : "tap below to set up wi-fi");
-                lv_obj_add_flag(s_cfg_ble_code, LV_OBJ_FLAG_HIDDEN);
-                lv_label_set_text(lv_obj_get_child(s_cfg_ble_btn, 0),
-                                  "Set up / change Wi-Fi");
+        /* The scene. Every setter below is change-gated, and none of these
+         * widgets sit in a content-sized flex card, so writing them each tick
+         * costs nothing when nothing moved. */
+        const char *text, *sub = "";
+        char subbuf[96];
+        bool spin = false, show_qr = false, show_stop = false;
+        bool in_flight = s_cfg_ble_starting || act || s_wifi_torn_down || joining;
+        if (in_flight) s_cfg_wifi_phase = 1;
+        else if (s_cfg_wifi_phase == 1) s_cfg_wifi_phase = 2;
+        bool result = (s_cfg_wifi_phase == 2);
+        int glyph = 0;                 /* 0 none, 1 green check, 2 red cross */
+        if (s_cfg_ble_starting) {
+            text = "starting bluetooth..."; spin = true; show_stop = true;
+        } else if (act) {
+            text = st <= BLE_PROV_ERR ? ble_st[st] : "idle";
+            show_stop = true;
+            if (st == BLE_PROV_ADV || st == BLE_PROV_LINKED ||
+                st == BLE_PROV_AUTHED) {
+                show_qr = true;
+                sub = "scan the code with your phone, or type it";
+            } else if (st == BLE_PROV_HANDOFF || st == BLE_PROV_DONE) {
+                spin = true;
+                sub = "switching networks...";
+            } else if (st == BLE_PROV_ERR) {
+                sub = "the phone could not pair - try again";
+            }
+        } else if (s_wifi_torn_down) {
+            text = "restoring wi-fi..."; spin = true;
+        } else if (failed) {
+            text = wifi_fail_text(s_wifi_reason);
+            snprintf(subbuf, sizeof(subbuf), "%.32s  (reason %d)  -  retrying",
+                     s_ssid, s_wifi_reason);
+            sub = subbuf; glyph = 2;
+        } else if (joining) {
+            snprintf(subbuf, sizeof(subbuf), "connecting to  %.32s", s_ssid);
+            text = subbuf; spin = true;
+        } else if (s_wifi_up) {
+            text = "connected"; glyph = result ? 1 : 0;
+            snprintf(subbuf, sizeof(subbuf), "%.32s   %s", s_ssid, s_ip);
+            sub = subbuf;
+        } else if (s_wifi_disabled) {
+            text = "wi-fi is off";
+            sub = "you chose to disconnect - set up to reconnect";
+            glyph = result ? 2 : 0;
+        } else {
+            text = "not connected";
+            sub = s_wifi_reason ? wifi_fail_text(s_wifi_reason) : "";
+            glyph = result ? 2 : 0;
+        }
+        label_set_changed(s_cfg_wifi_st, text);
+        label_set_changed(s_cfg_wifi_sub, sub);
+        obj_set_hidden_changed(s_cfg_ble_spin, !spin);
+        obj_set_hidden_changed(s_cfg_ble_code, !show_qr);
+        if (s_cfg_ble_qr) obj_set_hidden_changed(s_cfg_ble_qr, !show_qr);
+        obj_set_hidden_changed(s_cfg_wifi_stop, !show_stop);
+        if (glyph && s_cfg_wifi_tick) {
+            /* One label, two faces. Colour is change-gated by hand: a style
+             * setter invalidates even when the value is unchanged. */
+            lv_color_t want = lv_color_hex(glyph == 1 ? 0x22C55E : 0xEF4444);
+            if (!lv_color_eq(lv_obj_get_style_text_color(s_cfg_wifi_tick, 0), want)) {
+                lv_obj_set_style_text_color(s_cfg_wifi_tick, want, 0);
+            }
+            label_set_changed(s_cfg_wifi_tick,
+                              glyph == 1 ? LV_SYMBOL_OK : LV_SYMBOL_CLOSE);
+        }
+        obj_set_hidden_changed(s_cfg_wifi_tick, glyph == 0);
+
+        /* The card in the column: one line, and a button that only ever OPENS
+         * the scene. Change-gated for the reason the comment above gives. */
+        label_set_changed(s_cfg_ble_val,
+                          s_cfg_ble_starting || act ? "pairing in progress" :
+                          s_wifi_torn_down || joining ? "connecting..." :
+                          s_wifi_up ? "wi-fi connected" : "not connected");
+        label_set_changed(lv_obj_get_child(s_cfg_ble_btn, 0),
+                          s_cfg_ble_starting || act ? "Open Wi-Fi setup"
+                                                    : "Set up / change Wi-Fi");
+
+        /* The code itself changes only per session, but it is cheap to keep in
+         * step and it must be right the moment the scene is shown. */
+        if (act) {
+            label_set_fmt_changed(s_cfg_ble_code, "CODE  %s", ble_prov_code());
+
+            /* The QR is not cheap the same way a label is: an update re-runs the
+             * encoder and repaints a 33x33 bitmap, so it is gated on the code
+             * rather than refreshed per tick. The URL carries the code in a
+             * FRAGMENT, which never reaches the page's host, so scanning it does
+             * not hand the pairing code to GitHub's logs. It is no more secret
+             * than the digits printed directly below the QR. */
+            if (CFG_SETUP_QR && s_cfg_ble_qr &&
+                strcmp(s_cfg_ble_qr_code, ble_prov_code()) != 0) {
+                char url[160];
+                int n = snprintf(url, sizeof(url), "%s#c=%s",
+                                 SETUP_URL, ble_prov_code());
+                if (n > 0 && n < (int)sizeof(url) &&
+                    lv_qrcode_update(s_cfg_ble_qr, url, (uint32_t)n) == LV_RESULT_OK) {
+                    snprintf(s_cfg_ble_qr_code, sizeof(s_cfg_ble_qr_code),
+                             "%s", ble_prov_code());
+                    /* Once per session, and it is the only way to tell from the
+                     * console that the panel is showing a scannable symbol for
+                     * the right code -- a QR is not something the status line
+                     * can summarise, and the alternative is a photograph. */
+                    ESP_LOGI(TAG, "setup QR -> %s", url);
+                } else {
+                    ESP_LOGW(TAG, "setup QR encode failed (%d bytes)", n);
+                }
             }
         }
-        /* The code itself changes only per session, but it is cheap to keep in
-         * step and it must be right the moment the card is built. */
-        if (act) label_set_fmt_changed(s_cfg_ble_code, "CODE  %s", ble_prov_code());
     }
 
     /* ---- network ---- */
@@ -3852,6 +4530,12 @@ static void build_control_app(lv_obj_t *scr) {
     lv_obj_set_style_bg_color(scr, lv_color_hex(0x05070B), 0);
     lv_obj_remove_flag(scr, LV_OBJ_FLAG_SCROLLABLE);
 
+    /* The previous screen's sliders are already deleted by the time we get here
+     * (free first, build second), so the table holds dangling pointers until the
+     * cards below repopulate it. Reset before anything can walk it. */
+    s_cfg_slider_n = 0;
+    memset(s_cfg_sliders, 0, sizeof(s_cfg_sliders));
+
     lv_obj_t *title = lv_label_create(scr);
     lv_obj_set_style_text_font(title, &hud_text_18, 0);
     lv_obj_set_style_text_color(title, lv_color_hex(0xE8FBFF), 0);
@@ -3874,6 +4558,10 @@ static void build_control_app(lv_obj_t *scr) {
     lv_obj_set_style_pad_bottom(col, CFG_TOUCH_H + 24, 0);
     lv_obj_set_scroll_dir(col, LV_DIR_VER);
     lv_obj_set_scrollbar_mode(col, LV_SCROLLBAR_MODE_ACTIVE);
+    /* Registered on the column rather than on each slider: SCROLL_BEGIN/END are
+     * raised by whatever is scrolling, and the sliders are not it. */
+    lv_obj_add_event_cb(col, cfg_scroll_guard_cb, LV_EVENT_SCROLL_BEGIN, NULL);
+    lv_obj_add_event_cb(col, cfg_scroll_guard_cb, LV_EVENT_SCROLL_END, NULL);
 
     /* ---- wallpaper ---- */
     lv_obj_t *c = cfg_card(col, "WALLPAPER", CFG_ACCENT_WALL);
@@ -3939,6 +4627,22 @@ static void build_control_app(lv_obj_t *scr) {
     s_cfg_time_sw = cfg_switch(c, "24-hour time", CFG_ACCENT_LOCK,
                                s_clock_24, cfg_clock_cb);
 
+    /* The middle key is the only one genuinely free on the lock screen: the
+     * left key locks, the right key's HOLD is the desk-clock toggle, and PWR
+     * falls through to nothing at all. Point it at an app.
+     *
+     * The right key's tap was tried and reverted. It is nominally free, but
+     * the same key's hold is always-on, so a hold that came up a little short
+     * launched an app instead of toggling the clock — two unrelated verbs on
+     * one key, separated only by how long you held it.
+     *
+     * PWR being a PMU key is safe here: we read only the latched SHORT-press
+     * IRQ (reg 0x49 bit 3) and never enable long-press, so this adds no reboot
+     * risk. The PMU's own ~10 s hard cut is hardware and stays either way. */
+    s_cfg_lockkey_btn = cfg_button(c, "", CFG_ACCENT_LOCK, cfg_lockkey_cb);
+    s_cfg_lockkey_val = lv_obj_get_child(s_cfg_lockkey_btn, 0);   /* its label */
+    cfg_lockkey_label();
+
     /* ---- audio ---- */
     c = cfg_card(col, "AUDIO", CFG_ACCENT_SND);
     s_cfg_vol_val = cfg_text(c, 0xC7D2E0);
@@ -3985,13 +4689,13 @@ static void build_control_app(lv_obj_t *scr) {
      * below says "offline" or you want to change networks. BLE is only the
      * transport, so the user-facing wording names the task instead. */
     c = cfg_card(col, "WI-FI SETUP", CFG_ACCENT_NET);
-    s_cfg_ble_val  = cfg_text(c, 0xC7D2E0);
-    s_cfg_ble_code = cfg_text(c, 0x60A5FA);
-    lv_obj_set_style_text_font(s_cfg_ble_code, &hud_text_18, 0);
-    lv_obj_set_style_text_letter_space(s_cfg_ble_code, 4, 0);
-    lv_obj_add_flag(s_cfg_ble_code, LV_OBJ_FLAG_HIDDEN);
+    s_cfg_ble_val = cfg_text(c, 0xC7D2E0);
+    lv_obj_set_height(s_cfg_ble_val, 26);      /* one montserrat_20 line, uncl'd */
     s_cfg_ble_btn = cfg_button(c, "Set up / change Wi-Fi",
                                CFG_ACCENT_NET, cfg_ble_cb);
+    /* The card is rebuilt on every app open, so the cache of what the QR holds
+     * has to be cleared with it or the update is skipped as a no-op. */
+    s_cfg_ble_qr_code[0] = '\0';
 
     /* ---- network ---- */
     c = cfg_card(col, "NETWORK", CFG_ACCENT_NET);
@@ -4003,6 +4707,12 @@ static void build_control_app(lv_obj_t *scr) {
     s_cfg_log = cfg_text(c, 0x475569);
 
     lv_obj_add_event_cb(scr, gesture_home_cb, LV_EVENT_GESTURE, NULL);
+    /* Last, so the panel is the topmost child and covers the whole column when
+     * it is shown. Built once with the screen and hidden, never created per
+     * open — the same shape as MUSIC's device picker. */
+    cfg_wifi_build(scr);
+    cfg_pick_build(scr);
+
     s_app_timer = lv_timer_create(cfg_timer_cb, 400, NULL);
     cfg_timer_cb(NULL);
 }
@@ -6831,6 +7541,43 @@ static bool app_enabled(int i) {
     return i >= 0 && i < APP_COUNT && s_apps[i].build != NULL;
 }
 
+/* The lock-screen quick-action menu: "off", then every compiled-in app in enum
+ * order. Built from the table rather than listed by hand, so it cannot drift
+ * from it and a compiled-out app leaves no dead slot. The stored value is the
+ * app index; these only convert to and from the menu position. */
+static int lock_key_choices(void) {
+    int n = 1;
+    for (int i = 0; i < APP_COUNT; i++) if (app_enabled(i)) n++;
+    return n;
+}
+
+static int lock_key_app_at(int slot) {
+    if (slot <= 0) return LOCK_KEY_OFF;
+    for (int i = 0; i < APP_COUNT; i++) {
+        if (!app_enabled(i)) continue;
+        if (--slot == 0) return i;
+    }
+    return LOCK_KEY_OFF;
+}
+
+static const char *lock_key_name(int app) {
+    return app_enabled(app) ? s_apps[app].name : "off";
+}
+
+/* A montserrat symbol per app, for the glyph inside the middle bezel lobe. The
+ * table's own icons are app_icons_64 glyphs — 64 px against a 26 px arc — so
+ * they cannot be reused here. NULL means "draw nothing". */
+static const char *app_symbol(int app) {
+    switch (app) {
+        case APP_CONTROL: return LV_SYMBOL_SETTINGS;
+        case APP_MUSIC:   return LV_SYMBOL_AUDIO;
+        case APP_DAYS:    return LV_SYMBOL_BELL;
+        case APP_POMO:    return LV_SYMBOL_LOOP;
+        case APP_PET:     return LV_SYMBOL_HOME;
+        default:          return NULL;
+    }
+}
+
 static void tile_cb(lv_event_t *e) {
     app_request((int)(intptr_t)lv_obj_get_user_data(lv_event_get_target(e)));
 }
@@ -7643,12 +8390,32 @@ static int battery_drain_mv_h(void) {
  * in a fixed card below them. Desk-clock mode colours the base ring amber.
  */
 
+/* Idempotent, and it has to be: lwIP asserts outright if the operating mode is
+ * set while the client is already running, which is a panic and a reboot.
+ *
+ * The caller's gate is `!s_time_synced` (the GOT_IP handler), and that is NOT
+ * the same question. A Wi-Fi provisioning session tears the radio down for as
+ * long as the pairing takes, so SNTP can easily be started at boot and still
+ * not have synced 30 s later when the rejoin fires a second GOT_IP. That is the
+ * exact sequence that rebooted the cube every time a network was changed from
+ * the phone: started at 4.4 s, never synced, re-initialised at 37.7 s, assert.
+ *
+ * Stop rather than skip: the netif is destroyed and rebuilt across a session,
+ * so the running client is bound to something that no longer exists. */
+static bool s_sntp_up;
+
 static void time_sync_start(void) {
     setenv("TZ", TIMEZONE, 1);
     tzset();
+    if (s_sntp_up) {
+        esp_sntp_stop();
+        s_sntp_up = false;
+        ESP_LOGI(TAG, "SNTP stopped before re-init (netif was replaced)");
+    }
     esp_sntp_setoperatingmode(ESP_SNTP_OPMODE_POLL);
     esp_sntp_setservername(0, NTP_SERVER);
     esp_sntp_init();
+    s_sntp_up = true;
     ESP_LOGI(TAG, "SNTP started (%s, TZ=%s)", NTP_SERVER, TIMEZONE);
 }
 
@@ -8333,6 +9100,13 @@ static void lock_engage(void) {
  * indefinitely. A banner confirms which way it just went, then fades itself
  * out and deletes itself — no timer to own or tear down. */
 static void always_on_toggle(void) {
+    /* Rings off means always-on has no standing indicator, so CONTROL greys
+     * the switch. The right-key hold has to agree, or the key quietly
+     * enables a mode the UI says is unavailable. */
+    if (!s_lock_rings && !s_always_on) {
+        ESP_LOGI(TAG, "always-on refused: lock-screen rings are off");
+        return;
+    }
     s_always_on = !s_always_on;
     s_req_lock_pref_save = true;
     ESP_LOGI(TAG, "always-on %s", s_always_on ? "ON" : "OFF");
@@ -8374,6 +9148,17 @@ static void always_on_toggle(void) {
 
 /* true if the app consumed the Back itself (it had a sub-scene to pop) */
 static bool app_back(void) {
+    if (s_app == APP_CONTROL) {
+        if (s_cfg_wifi && !lv_obj_has_flag(s_cfg_wifi, LV_OBJ_FLAG_HIDDEN)) {
+            if (ui_lock()) { cfg_wifi_show(false); bsp_display_unlock(); }
+            return true;
+        }
+        if (s_cfg_pick && !lv_obj_has_flag(s_cfg_pick, LV_OBJ_FLAG_HIDDEN)) {
+            if (ui_lock()) { cfg_pick_show(false); bsp_display_unlock(); }
+            return true;
+        }
+        return false;
+    }
     if (s_app == APP_MUSIC) {
         if (s_sp_devpanel && !lv_obj_has_flag(s_sp_devpanel, LV_OBJ_FLAG_HIDDEN)) {
             if (ui_lock()) { sp_show_devices(false); bsp_display_unlock(); }
@@ -8465,6 +9250,8 @@ static void app_open(int idx) {
     s_cfg_days_val = NULL;
     s_cfg_rot_val = NULL; s_cfg_vol_val = NULL;
     s_cfg_rot_sw = NULL; s_cfg_rot_btn = NULL; s_cfg_time_sw = NULL;
+    s_cfg_lockkey_val = NULL; s_cfg_lockkey_btn = NULL;
+    s_cfg_pick = NULL; s_cfg_picklist = NULL; s_cfg_pickmore = NULL;
     s_cfg_always_sw = NULL; s_cfg_rings_sw = NULL;
     s_cfg_bright_val = NULL;
     s_cfg_batt_bar = NULL;
@@ -8472,7 +9259,19 @@ static void app_open(int idx) {
     s_cfg_care_val = NULL; s_cfg_care_sub = NULL;
     s_cfg_care_sld = NULL; s_cfg_care_btn = NULL;
     s_cfg_net_val = NULL; s_cfg_sys_val = NULL; s_cfg_log = NULL;
+    /* Same rule as every pointer above: nothing walks this table after the
+     * screen is gone today, but a table of freed objects is the exact shape of
+     * bug that is expensive to find later, so it does not get to be the one
+     * exception. */
+    s_cfg_slider_n = 0;
+    memset(s_cfg_sliders, 0, sizeof(s_cfg_sliders));
     s_cfg_ble_val = NULL; s_cfg_ble_code = NULL; s_cfg_ble_btn = NULL;
+    s_cfg_ble_qr = NULL; s_cfg_ble_qr_code[0] = '\0';
+    /* The widgets are gone, so the next build must repaint from scratch rather
+     * than compare against a key describing a card that no longer exists. */
+    s_cfg_ble_spin = NULL; s_cfg_ble_key = -1;
+    s_cfg_wifi = NULL; s_cfg_wifi_st = NULL; s_cfg_wifi_sub = NULL;
+    s_cfg_wifi_stop = NULL; s_cfg_wifi_tick = NULL; s_cfg_wifi_phase = 0;
     s_sp_art = NULL; s_sp_art_ph = NULL; s_sp_lbl_track = NULL;
     s_sp_lbl_artist = NULL; s_sp_btn_play_lbl = NULL; s_sp_btn_shuf = NULL;
     s_sp_btn_dev = NULL; s_sp_devpanel = NULL; s_sp_devlist = NULL;
@@ -8521,6 +9320,14 @@ static void app_open(int idx) {
     /* Free the outgoing app BEFORE building the next one. Keeping both alive
      * once drove internal heap to 16 bytes, wedging the flush path. */
     lv_obj_t *old_scr = lv_screen_active();
+    /* Forget whatever the touch driver was holding on the outgoing screen
+     * BEFORE it is freed. The indev keeps pointer.scroll_obj and a scroll-throw
+     * animation keyed on the INDEV, not the object, so a screen deleted with a
+     * throw still in flight leaves a live pointer into freed memory until the
+     * next touch release. That is a dangling reference on exactly this path
+     * and it is stock LVGL. Cheap, and it was the leading candidate for the
+     * 2026-08-23 scroll-and-leave-CONTROL reboots. */
+    lv_indev_reset(NULL, NULL);
     lv_obj_t *scr = lv_obj_create(NULL);
     lv_screen_load(scr);
     if (old_scr && old_scr != scr) lv_obj_delete(old_scr);
@@ -8666,6 +9473,12 @@ void app_main(void) {
         log_mem("display-up");
 
         if (ui_lock()) {
+            /* The display stays plain RGB565 and esp_lvgl_adapter byte-swaps
+             * every flush for the big-endian CO5300 (~0.5 ms per 15,360 px
+             * slice, ~10% of a scroll frame). Rendering RGB565_SWAPPED directly
+             * would remove that pass, but the ESP32-S3 SIMD blenders only exist
+             * for plain RGB565, and they are worth far more than the swap. Do
+             * not switch the format without a swapped-target SIMD set. */
             lv_display_add_event_cb(disp, render_perf_cb, LV_EVENT_ALL, NULL);
 
             /* LVGL only emits a gesture once the finger has travelled 50 px AND
@@ -8761,6 +9574,7 @@ void app_main(void) {
         btn_ev_t kleft  = btn_poll(&s_key_left,  t);   /* BOOT / minus */
         btn_ev_t kright = btn_poll(&s_key_right, t);   /* plus         */
         bool pwr = pmu_pwrkey_pressed();               /* PWR          */
+        uint8_t pwr_edge = pmu_pwrkey_edges();         /* PWR down/up  */
 
         /* left = lock (always) | middle = home | right: tap = back, hold = action */
         if (kleft || kright || pwr) s_last_btn = t;
@@ -8776,7 +9590,7 @@ void app_main(void) {
                 screen_toggle_power();                 /* first press only wakes */
                 btn_swallow(&s_key_left);
                 btn_swallow(&s_key_right);
-                kleft = BTN_NONE; kright = BTN_NONE; pwr = false;
+                kleft = BTN_NONE; kright = BTN_NONE; pwr = false; pwr_edge = 0;
                 s_last_btn = t;
             }
         }
@@ -8785,11 +9599,23 @@ void app_main(void) {
          * classified event, which is 50-70 ms late — far too slow to feel
          * caused by the finger. Skipped while the screen is off: that press is
          * a wake, and the block above has already swallowed it. */
-        if (s_screen_on && (s_key_left.raw_edge || s_key_right.raw_edge || pwr)) {
+        if (s_screen_on && (s_key_left.raw_edge || s_key_right.raw_edge || pwr_edge)) {
             if (ui_lock()) {
                 if (s_key_left.raw_edge)  bezel_press(0, s_key_left.raw_edge > 0);
                 if (s_key_right.raw_edge) bezel_press(2, s_key_right.raw_edge > 0);
-                if (pwr)                  bezel_pop(1);
+                if (pwr_edge & 1) {
+                    /* Only the lock screen gives this key a configurable
+                     * destination, so only there does the lobe name one.
+                     * Elsewhere PWR is plain Home and an app glyph would be a
+                     * lie. Set on the way down, with the arc. */
+                    bezel_icon_set((s_app == APP_LOCK && app_enabled(s_lock_key_app))
+                                   ? app_symbol(s_lock_key_app) : NULL);
+                }
+                /* A tap shorter than one 20 ms poll delivers both edges at
+                 * once; pop out-and-back rather than dropping one of them. */
+                if ((pwr_edge & 3) == 3)   bezel_pop(1);
+                else if (pwr_edge & 1)     bezel_press(1, true);
+                else if (pwr_edge & 2)     bezel_press(1, false);
                 bsp_display_unlock();
             }
         }
@@ -8820,6 +9646,20 @@ void app_main(void) {
             if (kright == BTN_LONG) {
                 ESP_LOGI(TAG, "RIGHT hold on lock -> desk clock toggle");
                 app_action();
+            }
+            /* Second exception, and an opt-in the rule above did not anticipate
+             * rather than a hole in it: the middle key does nothing at all here
+             * otherwise, so it opens whichever app CONTROL points it at. Off by
+             * default, and it is the user asking for the shortcut rather than a
+             * stray press finding one. Scoped to this branch — everywhere else
+             * PWR stays plain Home. */
+            /* On the LIFT, not the press. The arc and its glyph are already up
+             * by then — you see what the key is about to do, and taking your
+             * finger off is what commits it. Holding shows the shortcut
+             * without firing it, which is the whole point of the affordance. */
+            if ((pwr_edge & 2) && app_enabled(s_lock_key_app)) {
+                ESP_LOGI(TAG, "MID lift on lock -> %s", lock_key_name(s_lock_key_app));
+                app_request(s_lock_key_app);
             }
         } else {
             if (pwr) {
@@ -9001,6 +9841,9 @@ void app_main(void) {
                 /* wifi_driver_up() happens in the restore block below, which
                  * every exit route funnels through. */
             }
+            /* Cleared on both outcomes: the wait is over either way, and the
+             * CONTROL tick decides what the card says from here. */
+            s_cfg_ble_starting = false;
         }
 
         if (s_req_ble_off) {
@@ -9052,6 +9895,7 @@ void app_main(void) {
                      * after the BLE controller is down. */
                     s_creds_pending = true;
                     s_wifi_tries = 0;
+                    s_wifi_reason = 0;    /* stale: our own pre-scan disconnect */
                     log_event("ble join %s", s_ssid);
                 } else {
                     s_wifi_disabled = true;   /* the "stay off" hand-off */

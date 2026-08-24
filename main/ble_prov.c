@@ -172,6 +172,8 @@ typedef struct {
 
     uint64_t tx_ctr;
     uint64_t rx_ctr;                /* highest accepted; replays are dropped */
+    uint16_t key_conn;              /* connection the current key belongs to  */
+    bool     rx_seen;               /* a frame has been accepted on this key  */
 
     mbedtls_ecp_group grp;
     mbedtls_mpi       d;            /* our private scalar                    */
@@ -279,7 +281,15 @@ static bool unseal(const uint8_t *in, size_t in_len,
     if (in[0] != 0x01) return false;
     uint64_t ctr = 0;
     for (int i = 0; i < 8; i++) ctr = (ctr << 8) | in[NONCE_LEN - 8 + i];
-    if (ctr <= s_sess->rx_ctr) return false;
+    /* `>` only AFTER a frame has been accepted. The floor starts at 0 and the
+     * page numbers its first frame 0, so a bare `ctr <= rx_ctr` rejected the
+     * very first HELLO of every session — and because unseal() returning
+     * false on a hello-shaped frame is counted as a wrong code, the user was
+     * told the six digits were wrong while looking at those exact digits on
+     * the cube. Pressing Unlock again sent ctr=1, which cleared the floor,
+     * which is why the identical code worked on the second press every time.
+     * Replay protection is unchanged once anything has been accepted. */
+    if (s_sess->rx_seen && ctr <= s_sess->rx_ctr) return false;
 
     mbedtls_gcm_context gcm;
     mbedtls_gcm_init(&gcm);
@@ -293,7 +303,8 @@ static bool unseal(const uint8_t *in, size_t in_len,
     mbedtls_gcm_free(&gcm);
     if (!ok) return false;
 
-    s_sess->rx_ctr = ctr;
+    s_sess->rx_ctr  = ctr;
+    s_sess->rx_seen = true;
     *pt_len = ct_len;
     return true;
 }
@@ -344,10 +355,46 @@ static bool derive_key(const uint8_t *peer_pub)
          * would otherwise re-zero rx_ctr and let every frame captured after it
          * be replayed too. A genuine re-handshake always brings a fresh
          * ephemeral point, so this costs nothing legitimate. */
-        if (memcmp(s_sess->last_peer, peer_pub, PUBKEY_LEN) != 0) {
+        /* A new CONNECTION, or a peer point we have not seen, is a genuine
+         * re-handshake. A replayed SESSION write arrives on the SAME
+         * connection carrying the SAME point, so it still cannot re-zero
+         * the replay floor — which is the whole reason this guard exists.
+         *
+         * The connection test is not redundant: the original code keyed only
+         * on the point, on the stated assumption that "a genuine re-handshake
+         * always brings a fresh ephemeral point". The phone page reuses its
+         * keypair across reconnects, so that assumption is false here. The
+         * page restarted its counter at zero while rx_ctr still held the
+         * previous connection's high-water mark, unseal() dropped the first
+         * HELLO at the `ctr <= rx_ctr` test before decrypting it, and a
+         * dropped hello-shaped frame is counted as a wrong code. That is why
+         * pairing failed on the first try with the correct six digits and
+         * succeeded on the second. */
+        if (memcmp(s_sess->last_peer, peer_pub, PUBKEY_LEN) != 0 ||
+            s_sess->key_conn != s_conn) {
             memcpy(s_sess->last_peer, peer_pub, PUBKEY_LEN);
-            s_sess->tx_ctr = 0;
-            s_sess->rx_ctr = 0;
+            s_sess->key_conn = s_conn;
+            s_sess->tx_ctr  = 0;
+            s_sess->rx_ctr  = 0;
+            s_sess->rx_seen = false;
+            /* A NEW peer point is a new connection proving itself from
+             * scratch, so the code has to be proved again on this key.
+             *
+             * Without this, `authed` was set once and never cleared. A phone
+             * that dropped and came back re-did the ECDH, sent HELLO, and hit
+             * `if (!s_sess->authed)` as false — so HELLO fell past its
+             * handler into the command switch and was answered with "unknown
+             * command 0x01". The phone never got a verdict and sat on
+             * "Scanning..." forever, with the code it typed being correct.
+             * That is the symptom; the hole underneath it was worse, because
+             * a DIFFERENT phone could complete the ECDH and inherit authed
+             * without ever knowing the six digits.
+             *
+             * Deliberately inside the same not-a-replay guard: a replayed
+             * SESSION write carries the OLD point, so it cannot use this to
+             * knock a live session back out of authed. */
+            s_sess->authed = false;
+            s_sess->auth_attempts = 0;
         }
     } else {
         ESP_LOGW(TAG, "key agreement failed");

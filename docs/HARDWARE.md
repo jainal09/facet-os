@@ -81,6 +81,27 @@ Reading PWR: enable the short-press IRQ (reg `0x41` bit 3), then poll status reg
 `0x49` bit 3 and **write 1 to clear**. Leave long-press alone — the PMU may act
 on it itself.
 
+**PWR is not short-press-only, and believing it was cost a feature its whole
+design.** The PMU identifies four PWRKEY states, and two of them are edges:
+
+| reg `0x41` | reg `0x49` | meaning | default |
+|---|---|---|---|
+| bit 3 | bit 3 | short press (completed) | **enabled** |
+| bit 2 | bit 2 | long press | enabled — leave alone |
+| bit 1 | bit 1 | **negative edge — key went down** | **disabled** |
+| bit 0 | bit 0 | **positive edge — key came up** | **disabled** |
+
+Enable bits 1 and 0 and the middle key gains a real press-down and release, the
+same as the two GPIO keys. They are simply off at power-up, so a firmware that
+only ever enabled bit 3 sees a completed press and concludes — as this one did,
+in a commit message and in ARCHITECTURE.md — that press-down is impossible on
+this key. It is not. Status bits are RW1C like the rest.
+
+This is worth more than the register: the bezel pop-out was built with a 380 ms
+timer to paper over the "missing" press-down, and the timer existed only because
+of the wrong belief. Reading the IRQ table instead of the one bit already in use
+deleted the workaround.
+
 ## 2. Toolchain
 
 - ESP-IDF **v5.5.5** works. On macOS with Python 3.14, `install.sh` silently
@@ -114,7 +135,7 @@ CONFIG_BSP_ERROR_CHECK=n                 # init failures return instead of abort
 CONFIG_LV_USE_CLIB_MALLOC=y
 CONFIG_LV_DRAW_SW_DRAW_UNIT_CNT=2        # 1 unit + LV_USE_OS gives fps=0.0
 CONFIG_LV_USE_PERF_MONITOR=n             # otherwise LVGL paints its own grey box
-CONFIG_LV_CACHE_DEF_SIZE=3145728         # defaults to 0 — see §7c
+CONFIG_LV_CACHE_DEF_SIZE=5242880         # defaults to 0 — see §7c
 
 CONFIG_PM_ENABLE=y
 CONFIG_FREERTOS_USE_TICKLESS_IDLE=y
@@ -291,6 +312,31 @@ specific to BLE — treat "it fits, just" as unproven rather than as a result.
   full-width 480×96 band is three. Size any press/hover effect against this
   number before designing it, and confirm with `render perf:` — **`flushes /
   redraws` must be ~1**, measured under the interaction, never at idle.
+- `get_max_row()` runs the rounder in a loop and forces `max_row` **even** (the
+  CO5300 needs even x/y and even width/height), so it rounds *down*. Strip count
+  is therefore not smooth in the width: CONTROL's 424 px column gives 36 rows and
+  11 strips, but a width that lands `max_row` on an odd number drops a whole row
+  per flush and the count jumps. Worth knowing before tuning a column width.
+- **There is no tear gate because this board has no TE pin, and there is no way
+  to add one.** The panel's init table *does* enable the tearing signal (`0x35`
+  TEON, V-blank only), and `esp_lvgl_adapter` ships a complete GPIO-TE
+  implementation (`display_te_sync.c`,
+  `ESP_LV_ADAPTER_TEAR_AVOID_MODE_TE_SYNC`), so both halves look present and it
+  is tempting to spend a session wiring them together. **The signal never
+  reaches the MCU.** In the schematic (`ws-amoled-216/schematic/`, page 1)
+  `LCD_TE` runs to display FPC **J4 pin 3** and stops: in the net-to-GPIO table
+  printed beside that connector every neighbour is assigned — `LCD_CS`→GPIO12,
+  `QSPI_SCL`→GPIO38, `LCD_RESET`→GPIO39, `TP_INT`→GPIO11 — and the `LCD_TE` row
+  is **blank**. So `TEAR_AVOID_MODE_NONE` is not a default anyone forgot to
+  change; it is the only mode available. Note also that `TE_SYNC` forces
+  `RENDER_MODE_FULL` with one 460,800 B frame buffer, which internal SRAM could
+  not hold anyway.
+  **Consequence for design:** a full-viewport scroll or repaint cannot be made
+  coherent on this panel, only *fast*. Anything whose dirty rect exceeds one
+  draw buffer will be revealed strip by strip, and the only remedies are to
+  shrink the dirty rect under 15,360 px, to hide the repaint (the rotation fade
+  in `main.c` blanks the panel and is the pattern to copy), or to raise the
+  frame rate until the sweep stops registering.
 - A shape can be far larger than its dirty rect: LVGL clips invalidation to the
   panel, so a 300 px circle parked mostly off-screen and dipped 26 px in costs
   300×26, not 300×300. That is how the bezel pop-out draws a smooth arc cheaply.
@@ -371,7 +417,10 @@ re-laying out.
   while the panel transposes the pixel stream. Skipping the driver half
   misplaces *partial* updates once rotated.
 - After rotating, `lv_obj_invalidate(lv_screen_active())` — the existing frame
-  is scrambled.
+  is scrambled. That repaint is full-screen, so it lands as 15 sequential
+  strips and cannot be made coherent: there is no TE pin on this board (§5).
+  Blanking the panel with `bright_apply(0)` and ramping back is therefore not
+  belt-and-braces, it is the **only** way to hide a full-frame repaint here.
 - For QSPI panels LVGL 9 software rotation is unavailable and `esp_lv_adapter`
   refuses rotation, so hardware swap/mirror is the only route.
 - **Diagnostic:** "two of the four orientations are wrong" means the rotation
@@ -869,6 +918,26 @@ it independently will need the same ones:
    invariant "brightness only ever comes from `s_bright`" would have been
    enforced by nothing but the absence of callers.
 
+A second fork, `esp_lcd_touch_cst9217` (from `waveshare/esp_lcd_touch_cst9217`
+v2.0.0), is **prepared but not yet in the tree** — it was held out while a
+touch-scroll crash repro ran, because a driver with changed sample latency is a
+variable that repro cannot carry. To reinstate: put the directory back under
+`components/` and replace the BSP manifest's
+`waveshare/esp_lcd_touch_cst9217: '*'` with
+`esp_lcd_touch_cst9217: { path: ../esp_lcd_touch_cst9217 }`, then
+`idf.py reconfigure`. Its one change:
+
+1. **Every touch sample parked the LVGL task for 2-3 ms.** `cst9217_read_reg()`
+   wrote the 16-bit register address, `vTaskDelay(pdMS_TO_TICKS(2))`, then read
+   — inside LVGL's indev timer, on the LVGL task, at `FREERTOS_HZ=1000`. The
+   chip does not need the gap: Waveshare's own SensorLib reads the same report
+   with one `i2c_master_transmit_receive` (`TouchDrvCST92xx.cpp:128`). Set
+   `lcd_cmd_bits = 16` so `esp_lcd_panel_io_rx_param(io, reg, buf, len)` issues
+   register + repeated-start + read as a single transaction (IDF serialises the
+   command big-endian, `esp_lcd_panel_io_i2c_v2.c:149`), and drop the delay.
+   `write_reg` gets the same treatment (SensorLib writes reg+data as one buffer,
+   `:137`). The retry back-off stays on the failure path only.
+
 ## 10. Pitfalls index
 
 1. **Silent boot hang — the single most expensive trap on this board.** The
@@ -1111,6 +1180,44 @@ it independently will need the same ones:
     a widget's *absence* has two causes — hidden flag or failed draw — and they
     need different tools; check the flag from code, and let LVGL's own log rule
     the draw in or out, rather than reasoning about either from a photo.
+
+28. **A filter that cannot fail looks exactly like a clean run.** Two of them bit
+    two sessions in one evening, and neither made a sound. A build-log filter of
+    `grep -E "warning: .*main\.c"` can never match a warning in `main.c`, because
+    gcc prints the *filename before* `warning:` — so every "zero warnings" it
+    reported was unverified by construction. Use `^/Users.*(warning|error):`. And
+    a serial capture that whitelists `render perf` / `uptime=` / `rst:` faithfully
+    recorded a reboot and threw away the panic and backtrace that preceded it.
+    Log every line raw to a file and only narrow what is *printed*. The common
+    shape: the tool is structurally incapable of the failing case, so its silence
+    proves nothing — check that a filter can produce the bad output before
+    believing its clean output.
+29. **`lsof` the serial port before flashing.** A second Claude session, or a
+    forgotten pyserial capture from one, holds `/dev/cu.usbmodem*` invisibly and
+    esptool fails with "device reports readiness to read but returned no data" —
+    which reads as a dead board. `lsof /dev/cu.usbmodem*` names the holder in one
+    line. Worse than the failed flash is the *successful* one: flashing resets
+    the board and destroys whatever repro the other session was capturing.
+    Ask before taking the port, and commit before handing the tree over (#21).
+30. **Fast scrolling looks torn, like a game with vsync off.** The analogy is
+    literally correct and there is no vsync to turn on (§5: no TE pin). A
+    full-height list invalidates its whole viewport per step, and CONTROL's
+    424 px-wide column lands as `ceil(372 / (15360/424 = 36)) = 11` sequential
+    strips per frame — measured 10.9-11.0 flushes/redraw at ~157k px. At
+    ~17 fps that is a ~100 px jump per frame, revealed top to bottom. Measured
+    where the frame goes (`render perf:` under a drag): **94% software render,
+    QSPI ~10%, `wait=0.0`** — the bus never stalls, so raising pclk is worth
+    ~5% and was dropped. Render is a straight line through the origin at
+    **2.77 Mpx/s = 87 CPU cycles/px** with no fixed per-frame cost; do not
+    compare against another scene's numbers to find one — that measures the
+    content difference, not a constant. Rounded corners and the translucent
+    card border cost nothing (2.75 vs 2.77 with both removed). The per-flush
+    byte swap is ~6%. What is left is the flat fill/blend path itself, which
+    is why the ESP32-S3 PIE blenders are the lever. Separately, every touch
+    sample used to park the LVGL task 2-3 ms (§9 fork 2), and a slider under
+    the finger commits on touch-down because `lv_slider` jumps to the press
+    point — `cfg_bright_cb` applied brightness above its RELEASED guard; the
+    guards in `cfg_slider()` / `cfg_scroll_guard_cb()` are the fix.
 
 ## 11. Debugging method that worked
 

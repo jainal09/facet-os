@@ -802,10 +802,18 @@ Three properties make it cheap enough to feel instant, and none is optional:
 cause. `btn_t.raw_edge` reports the first poll on which the pin changed, ≤20 ms.
 A contact bounce can flash a lobe once; it is self-clearing and worth it.
 
-**PWR is asymmetric and cannot be fixed.** The AXP2101 hands us a *completed*
-short press over I2C — there is no level register and no press-down bit — so the
-middle lobe can only pop and retract after the key is already back up. It reads
-a beat behind the other two. No register would change that.
+**PWR was thought to be asymmetric, and it is not.** This section previously
+said the AXP2101 hands us only a *completed* short press, that there is no
+press-down bit, and that "no register would change that". All three were wrong,
+and the error had a cost: the lock-screen shortcut was built with a 380 ms timer
+to compensate for feedback that arrived after the finger had already lifted.
+
+The PMU identifies four PWRKEY states. `reg 0x41` bit 1 is the negative edge —
+the key going down — and bit 0 is the positive edge. Both ship **disabled**,
+which is why only the completed press was ever visible to a firmware that
+enabled bit 3 alone. Enabling them gives the middle key the same press-down and
+release as the two GPIO keys, so the lobe rises as the finger lands and the
+shortcut fires on the lift. The timer is gone. See HARDWARE.md §1.
 
 The lobes live on `lv_layer_top()`, which belongs to the display rather than to
 a screen, so they survive every app teardown and lock cycle. That also makes

@@ -236,7 +236,13 @@ CONFIG_BT_CTRL_RUN_IN_FLASH_ONLY=y
 # Host allocations to PSRAM. The host *task stack* cannot follow — the port
 # uses a plain xTaskCreatePinnedToCore — so that is trimmed instead.
 CONFIG_BT_NIMBLE_MEM_ALLOC_MODE_EXTERNAL=y
-CONFIG_BT_NIMBLE_HOST_TASK_STACK_SIZE=3072
+# 5120, not the 3072 default. FreeRTOS caught the overflow by name — "A stack
+# overflow in task nimble_host has been detected" — and it rebooted the cube
+# every time a phone dropped while a session was live: closing the browser tab,
+# pasting a new URL, or opening the setup page in a second tab. Disconnect
+# teardown followed immediately by re-advertise is this task's deepest path.
+# The cost is transient; the stack only exists while pairing is open.
+CONFIG_BT_NIMBLE_HOST_TASK_STACK_SIZE=5120
 # One phone, peripheral only. Central and observer are dead weight here.
 CONFIG_BT_NIMBLE_MAX_CONNECTIONS=1
 CONFIG_BT_NIMBLE_ROLE_CENTRAL=n
