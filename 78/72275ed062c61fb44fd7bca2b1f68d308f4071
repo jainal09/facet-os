@@ -1,0 +1,21 @@
+README.md
+  s_50feeff784e1f2::t_7ef101aad6f784 11-12,66-67,70-71,73-75,78-85
+  s_50feeff784e1f2::t_84e8de9b0e3181 10,13,62-65,68-69,72,76-77
+  s_50feeff784e1f2::t_4bec7073b7cfb4 86
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.24",
+  "base_commit_sha": "7872275ed062c61fb44fd7bca2b1f68d308f4071",
+  "prompts": {},
+  "sessions": {
+    "s_50feeff784e1f2": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "4fd2c98c-653c-447f-bb5d-45ae59b02a82",
+        "model": "unknown"
+      },
+      "human_author": "Jainal Gosaliya <jainal09gosalia@gmail.com>"
+    }
+  }
+}
