@@ -1,0 +1,21 @@
+README.md
+  s_19efbd24d01d75::t_c439dc9615fd1e 3,12,38-47,69,77,85,96-100,136-153
+docs/images/facet-wordmark.svg
+  s_19efbd24d01d75::t_e7438a1d344212 6-7,11-26,29
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.24",
+  "base_commit_sha": "51fe375c8b2cbf04f05e3bda34c782e3ee94f827",
+  "prompts": {},
+  "sessions": {
+    "s_19efbd24d01d75": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a03498-4b19-73e0-8825-ea6aa9305805",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "Jainal Gosaliya <jainal09gosalia@gmail.com>"
+    }
+  }
+}
