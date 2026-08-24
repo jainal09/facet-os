@@ -362,6 +362,63 @@ its bar and headline interpolate from cyan through violet and amber to coral as
 the target approaches. Today, local time, the target, and the saved message all
 remain useful when the broker is unavailable.
 
+## PET: a life the cube simulates and the phone dresses
+
+The pet is two things with a hard boundary between them: an **engine** — file-
+scope state ticked ~1 Hz from the main loop, alive on every screen — and a
+**view** (`build_pet_app`), which renders whatever the engine says and never
+owns truth. The FOCUS pattern taken further: the session there outlives the
+screen; the pet outlives *power*, because every duration in it is anchored to
+wall-clock time the RTC makes trustworthy from early boot.
+
+**Authority is split by who is good at what.** The broker owns what the owner
+DESIGNS — name, species, world, theme, hat, sleep window, birthday, weather
+city — behind a `cfg_ver` the cube uses as its whole re-apply gate. The cube
+owns the life actually LIVED — stage, meters, care mistakes, stardust — and
+reports it up (`POST /pet/st`, hourly, on app close, and on events) so the
+phone page shows a live pet. The report's response carries the current
+`cfg_ver`, so a state push doubles as a drift check and a design saved on the
+phone is noticed in minutes, not on the 2 h fetch cycle. All of it rides the
+DAYS keep-alive handle on the net task; the net task never touches the blob —
+it publishes a parsed config into a staging struct the engine consumes on its
+own tick (the same publish/snapshot discipline DAYS uses, and the same
+main-loop-only store_save rule the DAYS PSRAM-stack crash taught).
+
+**Care is the Tamagotchi Uni model with the pressure where it is fair.** Two
+coupled meters (hunger, happiness) decay per stage; a need raises a cue, a cue
+ignored for 15 minutes becomes one care mistake, and mistakes pick the adult
+form while childhood happiness (an EWMA) picks the teen. The window only
+counts down while the pet is awake AND the screen is on — mistakes never
+accrue where nobody could have seen the ask, which is both the no-guilt rule
+from the research and what makes offline time safe to credit. Crediting is
+capped at 4 days of decay (a cube found in a drawer resumes hungry-but-alive)
+but promotion uses wall time uncapped, so a pet hatches and grows while away
+exactly like the 1996 toy. Sustained adult neglect is departure, not death;
+the way home is a coax-back ritual on the designer page, and the apology text
+deliberately never leaves the phone — only the completed gesture travels.
+
+**The cube is the joystick.** Tilt walks the pet downhill — the gravity
+component along the screen edge, read through `rot_from_base()` so all eight
+mounting calibrations work, analog so steeper is faster; shake hops it; the
+panel rotation pins while PET is open (FOCUS gates the same commit) so the
+ground cannot rotate out from under a walk. The IMU polls at 50 Hz only
+inside PET; see HARDWARE.md pitfalls #32 and #33 for the two ways this went
+wrong first.
+
+**The designer QR lives under the pet's name.** Same single-use-code flow as
+DAYS (`/pet/link` → `/pet/session`); the page shows every option as a picture
+— species, worlds, themes and hats are drawn, not named — because a dropdown
+reading "WORLD 2" asks the user to already know the answer. Closing the QR on
+the cube forces the fetch, and the panel says so, because a sync with no
+visible acknowledgement reads as a design that was lost.
+
+The blob is v2 (~100 B, natural alignment, no packing — int64s at odd offsets
+are not worth a smaller file); v1 blobs migrate in place, mapping age onto the
+stage table so the original astronaut kept its life. Species can be vector
+(parameterised builders) or pixel sprites the broker renders from character
+grids into LVGL RGB565 `.bin` sheets — frames stacked vertically, each frame
+sized under the one-flush budget by construction.
+
 ## MUSIC: a remote for whatever is already playing
 
 The cube never plays the audio. It drives whichever Spotify endpoint is active —

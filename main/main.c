@@ -3130,7 +3130,10 @@ static int pet_base_accel(int b) {  /* accel component toward base edge b */
 }
 
 /* Gravity along the screen edge that autorotate would call rotation
- * (s_rot + rot_delta): +3 is the screen's left edge, +1 its right. */
+ * (s_rot + rot_delta): +1 is the screen's left edge, +3 its right. Derived
+ * as +3/+1 from the bezel's edge arithmetic and shipped inverted — the
+ * mapping has exactly one free handedness bit, and the user's hands settled
+ * it in one test where four orientations of derivation kept lying. */
 static int pet_lean_signal(int rot_delta) {
     int want = (s_rot + rot_delta) & 3;
     for (int b = 0; b < 4; b++)
@@ -3142,16 +3145,18 @@ static void pet_motion_poll(void) {
     static int16_t px, py, pz;
     static bool primed, tilt_walking;
     static int64_t last_shake_ms;
+    static int8_t logged_dir;
 
     if (pet_absent() || !s_screen_on || s_doze || !s_ch_wrap) {
         primed = false;
         tilt_walking = false;
+        logged_dir = 0;
         return;
     }
 
+    int64_t t = now_ms();
     if (primed) {
         int jerk = abs(s_acc_x - px) + abs(s_acc_y - py) + abs(s_acc_z - pz);
-        int64_t t = now_ms();
         if (jerk > 6500 && t - last_shake_ms > 1200) {
             last_shake_ms = t;
             set_act(ACT_JUMP, 34);
@@ -3165,30 +3170,50 @@ static void pet_motion_poll(void) {
     px = s_acc_x; py = s_acc_y; pz = s_acc_z;
     primed = true;
 
-    int left = pet_lean_signal(3), right = pet_lean_signal(1);
+    /* A shake IS a violent transient lean; let it be a hop, not a sprint.
+     * The window also swallows the rebound of the hand arresting the shake. */
+    if (t - last_shake_ms < 400) return;
+
+    int left = pet_lean_signal(1), right = pet_lean_signal(3);
     int mag = left > right ? left : right;
     int tx = -1;
     if (left > PET_LEAN_TH && left >= right)  tx = WALK_MIN_X;
     else if (right > PET_LEAN_TH)             tx = WALK_MAX_X;
 
+    /* A hop in flight is never preempted by a tilt: walk_to() would cut the
+     * jump on its first frames, which on hardware read as "shaking does
+     * nothing" — the reaction fired and was instantly overwritten. */
+    if (s_act == ACT_JUMP) return;
+
     if (tx >= 0) {
-        /* Analog, like a marble: steeper is faster. Steer only when it
-         * changes something — walk_to() resets the activity clock, and
-         * re-issuing it every poll would pin the animation's first frame. */
+        /* Analog, like a marble: steeper is faster. */
         int speed = clampi(2 + (mag - PET_LEAN_TH) / 2500, 2, 6);
-        if (s_act != ACT_WALK || s_tx != tx) {
+        /* Steer only when it changes something. Both clauses matter:
+         * walk_to() resets the activity clock, so re-issuing it every poll
+         * pins the animation on its first frame — and a pet already standing
+         * AT the tilted-toward wall re-completes its walk instantly, which
+         * without the s_cx check re-triggered (and logged) at 50 Hz. */
+        if (abs(s_cx - tx) > speed && (s_act != ACT_WALK || s_tx != tx)) {
             walk_to(tx);
             pet_seen();
-            ESP_LOGI(TAG, "pet imu: lean %s (L=%d R=%d)",
-                     tx == WALK_MIN_X ? "left" : "right", left, right);
         }
         s_walk_speed = speed;
         tilt_walking = true;
-    } else if (tilt_walking && mag < PET_LEAN_RELEASE) {
-        /* The cube levelled out: the marble stops rolling. Only a walk WE
-         * started is stopped — a tap-commanded walk keeps its target. */
-        tilt_walking = false;
-        if (s_act == ACT_WALK) set_act(ACT_IDLE, 40);
+        int8_t dir = (tx == WALK_MIN_X) ? -1 : 1;
+        if (dir != logged_dir) {         /* diagnostics on change, not cadence */
+            logged_dir = dir;
+            ESP_LOGI(TAG, "pet imu: lean %s (L=%d R=%d)",
+                     dir < 0 ? "left" : "right", left, right);
+        }
+    } else if (mag < PET_LEAN_RELEASE) {
+        logged_dir = 0;
+        if (tilt_walking) {
+            /* The cube levelled out: the marble stops rolling. Only a walk
+             * WE started is stopped — a tap-commanded walk keeps its
+             * target. */
+            tilt_walking = false;
+            if (s_act == ACT_WALK) set_act(ACT_IDLE, 40);
+        }
     }
 }
 

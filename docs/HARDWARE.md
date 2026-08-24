@@ -1252,6 +1252,28 @@ parked fork's intent, if anyone retries with the chip's datasheet in hand:
     Two lessons: read the register dump before theorising — EXCVADDR 0 in a
     ROM string loop is a five-second diagnosis; and a harness that drives the
     firmware by enum must skip what the build compiled out.
+32. **Tilt-as-input read from the autorotate base detector is dead on
+    arrival, and it dies silently.** `s_base_rot` only flips once an axis
+    DOMINATES: 45 degrees plus `QMI_TILT_MARGIN`, so "tilt to steer" built on
+    it ignores every tilt short of tipping the cube onto its edge — on the
+    glass it reads as "motion controls don't work at all", with zero errors
+    anywhere. Steering needs the raw gravity COMPONENT along the screen edge
+    (see `pet_lean_signal()`), with the direction-to-axis mapping still routed
+    through `rot_from_base()` so all 8 mounting calibrations keep working.
+    Related: that mapping has exactly ONE free handedness bit ("does screen-
+    left correspond to rotation +1 or +3"), it cannot be settled from the
+    bezel edge arithmetic on paper — the derivation produced the wrong bit
+    with full confidence — and one hardware test settles it instantly. Budget
+    the test, not the proof.
+33. **An event reaction that is overwritten in the same frame looks like the
+    event never fired.** Shake detection worked from day one — the log said
+    so — while the user reported "shaking does nothing": the tilt handler ran
+    right after the shake handler and its `walk_to()` replaced the jump
+    animation before a single frame drew. When an input's visible effect is
+    an activity/animation, every OTHER input path must yield until it
+    finishes; a log line proving the event fired says nothing about whether
+    its effect survived to the panel. Same family as pitfall #23 (one writer
+    per output), applied to animations.
 
 ## 11. Debugging method that worked
 
