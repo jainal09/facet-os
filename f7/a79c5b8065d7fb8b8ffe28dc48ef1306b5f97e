@@ -1,0 +1,38 @@
+main/main.c
+  s_bd4d271118eabc::t_940f2cd6a077bd 1892
+  s_bd4d271118eabc::t_dc5b39c5cecb4c 4121,4125,4130,4132,4134,4142,4144,4150
+  s_bd4d271118eabc::t_cde16d388f0dd1 11479-11484
+  s_bd4d271118eabc::t_30498f01a1239b 10937-10938
+  s_bd4d271118eabc::t_37d7825ce0d9e8 738-741
+  s_bd4d271118eabc::t_c58a99adfebc7a 640-641
+  s_bd4d271118eabc::t_b955cc720f3dd5 3904-4015,4019-4020,4024-4028,4035,4040,4042-4043,4045,4047,4050-4052,4054,4057-4058,4061,4064,4066,4068,4071-4097,4099,4101,4103,4106,4109,4116-4118
+  s_bd4d271118eabc::t_38c61b226860f8 4162-4165,4170
+  s_bd4d271118eabc::t_5ebfba8667f287 4184-4187
+  s_bd4d271118eabc::t_ed477f64a9a353 3240-3253,3262-3279
+  s_bd4d271118eabc::t_b8a2befde60720 3089,3092-3096
+  s_bd4d271118eabc::t_b059687e27ae8e 3740-3759,3762-3763
+  s_bd4d271118eabc::t_17c4926b7ea33f 3782-3785,3788-3790,3794-3796,3798-3799
+  s_bd4d271118eabc::t_fc56d921167e6e 3892-3895
+  s_bd4d271118eabc::t_de78de4276c4bd 4221-4252
+  s_bd4d271118eabc::t_a7b0ccdb7674bd 9255-9257
+  s_bd4d271118eabc::t_1cf96cab591495 3457-3458,3462-3488,3502,3523,3525-3527,3533-3542,3545-3547,3549-3555
+  s_bd4d271118eabc::t_17525853802d64 11562-11566
+  s_bd4d271118eabc::t_a165e37dfef2b3 693-696
+  s_bd4d271118eabc::t_d2abb7414a34af 2960-3025
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.24",
+  "base_commit_sha": "f7a79c5b8065d7fb8b8ffe28dc48ef1306b5f97e",
+  "prompts": {},
+  "sessions": {
+    "s_bd4d271118eabc": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "d96b6df7-9f4d-4c00-8b11-0494e1b58cb8",
+        "model": "claude-fable-5"
+      },
+      "human_author": "Jainal Gosaliya <jainal09gosalia@gmail.com>"
+    }
+  }
+}
