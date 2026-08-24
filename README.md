@@ -7,7 +7,10 @@ A small operating system for a cube-shaped ESP32-S3 device with a round-cornered
 A cube has facets; so does this. Apps are faces of one system rather than
 separate firmwares, and only the one you are looking at costs any RAM.
 
-<!-- TODO: photo / screen capture of the lock screen and drawer -->
+<p align="center">
+  <img src="docs/images/lock.png" width="300" alt="Lock screen, now playing" />
+  <img src="docs/images/lock_ring.png" width="300" alt="Lock screen" />
+</p>
 
 ## What it is
 
@@ -55,6 +58,31 @@ The two radios cannot run at once on this board, so pairing takes Wi-Fi down for
 the duration and restores it however the session ends. See
 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the shape and
 [docs/HARDWARE.md §7g](docs/HARDWARE.md) for the measurements behind it.
+
+## Screens
+
+<p align="center">
+  <img src="docs/images/music.png" width="180" alt="MUSIC" />
+  <img src="docs/images/music_liked.png" width="180" alt="MUSIC, liked" />
+  <img src="docs/images/devices.png" width="180" alt="Device picker" />
+</p>
+<p align="center">
+  <img src="docs/images/control.png" width="180" alt="CONTROL" />
+  <img src="docs/images/focus.png" width="180" alt="FOCUS" />
+  <img src="docs/images/days.png" width="180" alt="DAYS" />
+</p>
+<p align="center">
+  <img src="docs/images/bezel.png" width="300" alt="Bezel pop-out on a key press" />
+</p>
+
+That last one is the bezel pop-out: press a side key and the black bezel
+swells into the screen. Every image here was taken by the device itself —
+hold LEFT+RIGHT and it saves a screenshot of its own framebuffer to the card
+(see CLAUDE.md, *Autonomous hardware verification*). No camera, no emulator;
+these are the real pixels.
+
+<!-- drawer screenshot: regenerate via the harness after the scrollable-drawer
+     rework lands - the current drawer is about to change shape. -->
 
 ## The three keys
 
