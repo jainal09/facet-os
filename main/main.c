@@ -1107,6 +1107,7 @@ static bool s_req_days_fetch = true;
 static bool s_req_days_link;
 static bool s_days_fetching;
 static bool s_days_link_fetching;
+static bool s_req_days_save;
 static portMUX_TYPE s_days_lock = portMUX_INITIALIZER_UNLOCKED;
 static int64_t s_days_last_ok_ms;
 static int64_t s_days_last_attempt_ms;
@@ -1248,7 +1249,10 @@ static bool days_fetch(void) {
     cJSON_Delete(root);
 
     days_publish(&next);
-    store_save("days", &next, sizeof(next));
+    /* Saving here would write NVS on this task, whose stack is in PSRAM and so is
+     * unreachable the moment a flash write disables the cache. Hand it to the
+     * main loop, which runs on an internal stack. */
+    __atomic_store_n(&s_req_days_save, true, __ATOMIC_RELEASE);
     ESP_LOGI(TAG, "days: synced %s, %u B", next.target[0] ? next.target : "unset",
              (unsigned)s_days_rx.len);
     return true;
@@ -1317,8 +1321,11 @@ static void days_service(void) {
  * times a minute, for information nobody read.
  *
  * Its stack lives in PSRAM. As plain xTaskCreate it took 8 KB of internal SRAM —
- * the scarcest pool on the board — for a task that does nothing time-critical
- * and never runs with the cache disabled.
+ * the scarcest pool on the board — for a task that does nothing time-critical.
+ *
+ * That stack is unreachable while the flash cache is disabled, so nothing on this
+ * task may write NVS. Persistence is deferred to the main loop; the card is fine,
+ * being SDMMC rather than SPI flash.
  */
 static void net_task(void *arg) {
     while (1) {
@@ -8068,7 +8075,14 @@ static void wall_scan(void) {
         wall_png(i, p, sizeof(p));
         if (wallpaper_valid(p)) s_wall_have |= (uint16_t)(1u << i);
         else remove(p);                  /* truncated or wrong format */
+
+        /* A reset mid-download leaves the streaming target behind; the normal
+         * failure path already removes it. */
+        char part[80];
+        snprintf(part, sizeof(part), "%s.part", p);
+        remove(part);
     }
+    remove(UNSPLASH_JSON ".part");
     ESP_LOGI(TAG, "wallpaper pool: %d/%d slots", __builtin_popcount(s_wall_have),
              WALL_SLOTS);
 }
@@ -8244,50 +8258,61 @@ static bool broker_fetch(const char *path, const char *xname, const char *xval,
 static bool asset_fetch_auth(const char *url, const char *path, const char *bearer) {
     if (!s_sd_ok) return false;
 
-    s_dl_total = 0;
-    s_dl_got = 0;
-    s_dl_pct = 0;
-    s_dl_kb = 0;
-    s_dl_accent = 0;
-
     char tmp[80];
     snprintf(tmp, sizeof(tmp), "%s.part", path);
-    s_dl_file = fopen(tmp, "wb");
-    if (!s_dl_file) {
-        ESP_LOGW(TAG, "asset: cannot open %s (%s)", tmp, strerror(errno));
-        return false;
-    }
 
-    esp_http_client_config_t cfg = {
-        .url = url,
-        .crt_bundle_attach = esp_crt_bundle_attach,
-        .timeout_ms = 12000,     /* per socket read, not total */
-        .event_handler = dl_evt,
-        .max_redirection_count = 5,
-    };
-    esp_http_client_handle_t c = esp_http_client_init(&cfg);
     bool ok = false;
-    if (c) {
-        if (bearer && bearer[0]) {
-            char auth[96];
-            snprintf(auth, sizeof(auth), "Bearer %.72s", bearer);
-            esp_http_client_set_header(c, "Authorization", auth);
+    /* A truncated body is a link event rather than a server one (HARDWARE.md #26):
+     * the far end has not given up, so one immediate retry is cheap and usually
+     * lands. Log the byte count with the RSSI so the next one explains itself. */
+    for (int attempt = 0; attempt < 2 && !ok; attempt++) {
+        s_dl_total = 0;
+        s_dl_got = 0;
+        s_dl_pct = 0;
+        s_dl_kb = 0;
+        s_dl_accent = 0;
+
+        s_dl_file = fopen(tmp, "wb");
+        if (!s_dl_file) {
+            ESP_LOGW(TAG, "asset: cannot open %s (%s)", tmp, strerror(errno));
+            return false;
         }
-        esp_err_t err = esp_http_client_perform(c);
-        int status = esp_http_client_get_status_code(c);
-        ok = (err == ESP_OK && status == 200);
-        ESP_LOGI(TAG, "asset: HTTP %d, heap %u", status,
-                 (unsigned)hp_free());
-        esp_http_client_cleanup(c);
+
+        esp_http_client_config_t cfg = {
+            .url = url,
+            .crt_bundle_attach = esp_crt_bundle_attach,
+            .timeout_ms = 12000,     /* per socket read, not total */
+            .event_handler = dl_evt,
+            .max_redirection_count = 5,
+        };
+        esp_http_client_handle_t c = esp_http_client_init(&cfg);
+        if (c) {
+            if (bearer && bearer[0]) {
+                char auth[96];
+                snprintf(auth, sizeof(auth), "Bearer %.72s", bearer);
+                esp_http_client_set_header(c, "Authorization", auth);
+            }
+            esp_err_t err = esp_http_client_perform(c);
+            int status = esp_http_client_get_status_code(c);
+            ok = (err == ESP_OK && status == 200);
+            ESP_LOGI(TAG, "asset: HTTP %d, heap %u", status,
+                     (unsigned)hp_free());
+            esp_http_client_cleanup(c);
+        }
+        fclose(s_dl_file);
+        s_dl_file = NULL;
+
+        if (!ok) {
+            remove(tmp);
+            ESP_LOGW(TAG, "asset: %lld/%lld B, rssi %d%s",
+                     (long long)s_dl_got, (long long)s_dl_total, wifi_rssi(),
+                     attempt == 0 ? " - retrying once" : " - giving up");
+        }
     }
-    fclose(s_dl_file);
-    s_dl_file = NULL;
 
     if (ok) {
         remove(path);
         ok = (rename(tmp, path) == 0);
-    } else {
-        remove(tmp);
     }
     return ok;
 }
@@ -10092,6 +10117,17 @@ void app_main(void) {
             chg_save();
             chg_apply();        /* don't make the user wait for the next poll */
             telemetry_row("chgmode");
+        }
+
+        /* The network task fetched DAYS but must not touch flash from a PSRAM
+         * stack. Clear before snapshotting: a fetch landing mid-save re-raises
+         * the flag and is written on the next pass rather than being lost. */
+        if (__atomic_load_n(&s_req_days_save, __ATOMIC_ACQUIRE) &&
+            !ble_prov_nvs_blocked()) {
+            __atomic_store_n(&s_req_days_save, false, __ATOMIC_RELEASE);
+            days_blob_t snap;
+            days_snapshot(&snap, NULL);
+            store_save("days", &snap, sizeof(snap));
         }
 
         if (s_req_ble_on) {

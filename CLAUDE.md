@@ -84,6 +84,17 @@ the pitfalls index compiled perfectly.
   character renders as an empty box — `·` and `—` are the easy mistakes, and
   `hud_text_18` (0x20-0x7F) and `hud_clock_76` (digits and colon only) are
   narrower still. Non-ASCII in `ESP_LOG` strings is fine; that goes to serial.
+- **Never give a second cube an existing cube's `BROKER_TOKEN`, and say so before
+  anyone sets one up.** The bearer *is* the identity, so the two cubes become one
+  broker user and silently share the Spotify account and the DAYS countdown — the
+  new cube opens MUSIC already playing someone else's music, and nothing errors.
+  Mint a fresh `openssl rand -hex 32` per cube and add a `BROKER_USERS` entry.
+  `SPOTIFY_CLIENT_ID` is global to the broker: N cubes are one Spotify app, N
+  bearers, up to N accounts. Tell the user that a Development-mode app admits only
+  five hand-added accounts, that the app must be matched by Client ID rather than
+  by name, and that a missing allowlist entry surfaces only as
+  `403 The user is not registered for this application` on every Spotify endpoint
+  — long after the login appeared to succeed. See README and ARCHITECTURE.md.
 
 ## Keep the docs hot
 

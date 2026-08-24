@@ -397,6 +397,26 @@ request accepts a user ID that could be changed to read another account. DAYS
 uses the same identity to keep its persisted countdown per user. The legacy
 single `BROKER_TOKEN` remains as a one-user migration mode named `default`.
 
+**The Spotify app is global; only the account and the bearer are per cube.**
+`b.cfg.clientID` is one value read from `SPOTIFY_CLIENT_ID`, while credentials are
+stored per user by `storeSpotifyCredential(user, refresh)`. So N cubes are one
+Spotify app, N `BROKER_USERS` entries, and up to N Spotify accounts — never N
+apps. The failure this prevents is worth stating plainly, because it does not
+look like a configuration error: give a second cube an existing cube's
+`BROKER_TOKEN` and the two collapse into one user, so the new cube opens MUSIC
+playing the first cube's account and shows the first cube's countdown. Nothing
+errors; the bearer *is* the identity, and it was valid.
+
+**A Spotify app in Development mode admits five hand-added accounts**, and the
+account each cube authorises with must be one of them, on the app whose Client ID
+matches `SPOTIFY_CLIENT_ID`. Match that app by Client ID rather than by name. The
+failure is deferred and misleading: the QR flow completes, `/callback` stores a
+refresh token, `/spotify/token` returns 200 with a valid access token, and only
+Spotify refuses — `403 The user is not registered for this application`, on every
+endpoint including `/v1/me`. Sibling endpoints all failing is the tell that
+separates it from a scope problem, where some still answer 200; an authorised but
+idle account answers 204.
+
 **One task, one HTTP handle, one command queue.** `esp_http_client` handles carry
 no lock and mutate in place, so the handle is confined to the `spotify` task
 (stack in PSRAM) and touch callbacks only ever enqueue. Taps are optimistic: the
