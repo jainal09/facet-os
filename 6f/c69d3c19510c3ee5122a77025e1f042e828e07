@@ -1,0 +1,27 @@
+docs/HARDWARE.md
+  s_50feeff784e1f2::t_83d79ea0732540 923-935
+  s_50feeff784e1f2::t_e706551f01840d 1241-1254
+  s_50feeff784e1f2::t_0cda26027c1228 1265-1267
+  s_50feeff784e1f2::t_78441d0bad1207 136-138,1227-1236
+sdkconfig.defaults
+  s_50feeff784e1f2::t_74442d96a4f7a2 102-106
+  s_50feeff784e1f2::t_9f0f4270f4d06a 59-65,68
+dependencies.lock
+  s_50feeff784e1f2::t_f93f9fbef2e51b 183,195,216,220,224,240,244,252,254,258,262
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.24",
+  "base_commit_sha": "6fc69d3c19510c3ee5122a77025e1f042e828e07",
+  "prompts": {},
+  "sessions": {
+    "s_50feeff784e1f2": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "4fd2c98c-653c-447f-bb5d-45ae59b02a82",
+        "model": "unknown"
+      },
+      "human_author": "Jainal Gosaliya <jainal09gosalia@gmail.com>"
+    }
+  }
+}
