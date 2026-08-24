@@ -1,0 +1,47 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="940" height="220" viewBox="0 0 940 220" role="img" aria-labelledby="title desc">
+  <title id="title">Facet</title>
+  <desc id="desc">Four coloured interface faces beside the Facet wordmark and the line one object, many faces.</desc>
+  <defs>
+    <linearGradient id="plate" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#091923"/>
+      <stop offset="1" stop-color="#070b10"/>
+    </linearGradient>
+  </defs>
+  <style>
+    .word { fill: #f2f7fa; }
+    .tag { fill: #91a4b0; }
+    .face { fill: #081119; }
+  </style>
+
+  <rect x="1.5" y="1.5" width="937" height="217" rx="28" fill="url(#plate)" stroke="#22cbe4" stroke-opacity="0.16" stroke-width="3"/>
+
+  <g transform="translate(20 20)">
+    <rect class="face" x="0" y="0" width="76" height="76" rx="18" stroke="#22cbe4" stroke-width="4"/>
+    <rect class="face" x="88" y="0" width="76" height="76" rx="18" stroke="#2bc863" stroke-width="4"/>
+    <rect class="face" x="0" y="88" width="76" height="76" rx="18" stroke="#ff5148" stroke-width="4"/>
+    <rect class="face" x="88" y="88" width="76" height="76" rx="18" stroke="#8973ff" stroke-width="4"/>
+
+    <g fill="#22cbe4">
+      <rect x="23" y="23" width="13" height="13" rx="2"/>
+      <rect x="40" y="23" width="13" height="13" rx="2"/>
+      <rect x="23" y="40" width="13" height="13" rx="2"/>
+      <rect x="40" y="40" width="13" height="13" rx="2"/>
+    </g>
+    <path d="M113 50v-29h8v10h15v8h-15v11a12 12 0 1 1-8 0Z" fill="#2bc863"/>
+    <circle cx="38" cy="126" r="18" fill="none" stroke="#ff5148" stroke-width="7"/>
+    <circle cx="38" cy="126" r="6" fill="#ff5148"/>
+    <rect x="108" y="110" width="36" height="32" rx="5" fill="none" stroke="#8973ff" stroke-width="7"/>
+    <path d="M116 102v12m20-12v12" stroke="#8973ff" stroke-width="7" stroke-linecap="round"/>
+    <rect x="119" y="123" width="14" height="11" rx="2" fill="#8973ff"/>
+  </g>
+
+  <text class="word" x="228" y="126" font-family="Arial, Helvetica, sans-serif" font-size="96" font-weight="800" letter-spacing="15">FACET</text>
+  <text class="tag" x="236" y="172" font-family="Arial, Helvetica, sans-serif" font-size="19" font-weight="700" letter-spacing="7">ONE OBJECT · MANY FACES</text>
+
+  <g transform="translate(236 196)">
+    <rect width="96" height="6" rx="3" fill="#22cbe4"/>
+    <rect x="108" width="40" height="6" rx="3" fill="#2bc863"/>
+    <rect x="160" width="40" height="6" rx="3" fill="#ff5148"/>
+    <rect x="212" width="40" height="6" rx="3" fill="#8973ff"/>
+  </g>
+</svg>

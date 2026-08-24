@@ -1,4 +1,4 @@
-# Facet
+<h1 align="center"><img src="docs/images/facet-wordmark.svg" width="720" alt="Facet — one object, many faces" /></h1>
 
 A small operating system for a cube-shaped ESP32-S3 device with a round-cornered
 480×480 AMOLED touchscreen — the
@@ -7,10 +7,9 @@ A small operating system for a cube-shaped ESP32-S3 device with a round-cornered
 A cube has facets; so does this. Apps are faces of one system rather than
 separate firmwares, and only the one you are looking at costs any RAM.
 
-<table align="center"><tr>
-<td align="center"><img src="docs/images/lock.png" width="300" alt="Lock screen, now playing" /><br/><b>Lock screen</b><br/><sub>with the now-playing card while Spotify is active</sub></td>
-<td align="center"><img src="docs/images/lock_ring.png" width="300" alt="Lock screen" /><br/><b>Lock screen</b><br/><sub>clock, date, battery ring over the day's wallpaper</sub></td>
-</tr></table>
+<p align="center"><img src="docs/images/facet-hero-lock.jpg" width="48%" alt="Facet cube showing the lock screen" /> <img src="docs/images/facet-hero-drawer.jpg" width="48%" alt="Facet cube showing its app drawer" /></p>
+
+<p align="center"><sub>Studio renders built from the real enclosure photography and the cube's own framebuffer captures.</sub></p>
 
 ## What it is
 
@@ -62,13 +61,13 @@ the duration and restores it however the session ends. See
 ## Screens
 
 <table align="center"><tr>
-<td align="center"><img src="docs/images/music.png" width="180" alt="MUSIC" /><br/><b>MUSIC</b><br/><sub>now playing; volume slider being raised to 100</sub></td>
-<td align="center"><img src="docs/images/music_liked.png" width="180" alt="MUSIC, liked" /><br/><b>MUSIC</b><br/><sub>track liked — the heart fills red</sub></td>
-<td align="center"><img src="docs/images/devices.png" width="180" alt="Device picker" /><br/><b>MUSIC · devices</b><br/><sub>pick which speaker or computer plays</sub></td>
+<td align="center"><img src="docs/images/cube-music.jpg" width="240" alt="Facet cube running MUSIC" /><br/><b>MUSIC</b><br/><sub>now playing; volume slider being raised to 100</sub></td>
+<td align="center"><img src="docs/images/cube-music-liked.jpg" width="240" alt="Facet cube showing a liked track" /><br/><b>MUSIC · liked</b><br/><sub>the heart fills red without leaving now playing</sub></td>
+<td align="center"><img src="docs/images/cube-devices.jpg" width="240" alt="Facet cube showing the device picker" /><br/><b>MUSIC · devices</b><br/><sub>pick which speaker or computer plays</sub></td>
 </tr><tr>
-<td align="center"><img src="docs/images/control.png" width="180" alt="CONTROL" /><br/><b>CONTROL</b><br/><sub>battery care: the charge limit and the 100%-once override</sub></td>
-<td align="center"><img src="docs/images/focus-active.png" width="180" alt="FOCUS, running" /><br/><b>FOCUS · running</b><br/><sub>the first second of a 60-minute session</sub></td>
-<td align="center"><img src="docs/images/days.png" width="180" alt="DAYS" /><br/><b>DAYS</b><br/><sub>countdown with a colour-shifting progress bar</sub></td>
+<td align="center"><img src="docs/images/cube-control.jpg" width="240" alt="Facet cube running CONTROL" /><br/><b>CONTROL</b><br/><sub>battery care: charge limit and the 100%-once override</sub></td>
+<td align="center"><img src="docs/images/cube-focus.jpg" width="240" alt="Facet cube running FOCUS" /><br/><b>FOCUS · running</b><br/><sub>the first second of a 60-minute session</sub></td>
+<td align="center"><img src="docs/images/cube-days.jpg" width="240" alt="Facet cube running DAYS" /><br/><b>DAYS</b><br/><sub>countdown with a colour-shifting progress bar</sub></td>
 </tr></table>
 
 ### The moments that make it Facet
@@ -77,12 +76,20 @@ These are the two gestures where the cube stops behaving like a tiny phone and
 starts feeling like its own object: the whole OS revealed as four physical
 faces, then the display breaking its own frame when the bezel comes alive.
 
-<p align="center"><img src="docs/images/exhibit-drawer.png" width="48%" alt="The app drawer — every app is a face" /> <img src="docs/images/exhibit-bezel.png" width="48%" alt="Bezel pop-out — the hardware joins the interface" /></p>
+<p align="center"><img src="docs/images/exhibit-drawer.jpg" width="48%" alt="The app drawer — every app is a face" /> <img src="docs/images/exhibit-bezel.jpg" width="48%" alt="Bezel pop-out — the hardware joins the interface" /></p>
 
-Every image here was taken by the device itself — hold LEFT+RIGHT and it
-saves a screenshot of its own framebuffer to the card (see CLAUDE.md,
-*Autonomous hardware verification*). No camera, no emulator; these are the
-real pixels.
+### Every face, alive
+
+Eight cubes, eight live states, one system. The lock screen anchors the scene;
+MUSIC, CONTROL, FOCUS, DAYS, device transfer, liked state, and the drawer all
+run around it.
+
+<p align="center"><img src="docs/images/facet-ensemble.jpg" width="100%" alt="Eight Facet cubes running every major interface in a dramatic exhibition scene" /></p>
+
+Every interface shown here began as a capture taken by the device itself — hold
+LEFT+RIGHT and it saves its framebuffer to the card (see CLAUDE.md,
+*Autonomous hardware verification*). The studio scenes were generated from
+those captures and photographs of the physical enclosure; no emulator was used.
 
 ## The three keys
 
