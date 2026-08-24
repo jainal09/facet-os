@@ -637,6 +637,8 @@ static const char *pet_stage_word(void) {
     return w[s_pet.stage <= PET_AWAY ? s_pet.stage : PET_ADULT];
 }
 
+static void pet_save(void);
+
 static void pet_fresh_egg(void) {
     memset(&s_pet, 0, sizeof(s_pet));
     s_pet.ver = PET_BLOB_VER;
@@ -686,9 +688,12 @@ static void pet_load(void) {
             s_pet.tick_utc    = now;
             s_pet.seen_utc    = now;
         }
-        s_pet_dirty = true;
         ESP_LOGI(TAG, "pet migrated from v1: %lumin old -> %s",
                  (unsigned long)v1.age_min, pet_stage_word());
+        /* Persist v2 NOW: the card is mounted (load order guarantees it),
+         * and a migration that waits for the 60 s flush re-runs on any
+         * power cut in between. */
+        pet_save();
         return;
     }
     pet_fresh_egg();
@@ -730,6 +735,10 @@ static volatile bool s_pet_cfg_ready;
 static pet_report_t  s_pet_report;
 static volatile bool s_req_pet_push;
 static volatile bool s_req_pet_cfg = true;   /* first fetch rides the boot */
+/* Outcome of the most recent config fetch, for the QR panel's sync button:
+ * 0 none/pending, 1 landed, 2 failed. Written by the net task, consumed by
+ * the view; a single byte, so no lock. */
+static volatile uint8_t s_pet_cfg_result;
 static portMUX_TYPE  s_pet_net_lock = portMUX_INITIALIZER_UNLOCKED;
 
 static void pet_report_publish(void) {
@@ -1880,6 +1889,7 @@ static void pet_net_service(void) {
     __atomic_store_n(&s_pet_cfg_fetching, true, __ATOMIC_RELEASE);
     bool ok = pet_cfg_fetch();
     __atomic_store_n(&s_pet_cfg_fetching, false, __ATOMIC_RELEASE);
+    s_pet_cfg_result = ok ? 1 : 2;
     if (ok) s_pet_cfg_ok_ms = t;
 }
 
@@ -2947,6 +2957,72 @@ static void screen_toggle_power(void) {
 
 #define PET_FPS_MS   25
 
+/* ---- themes and worlds: the design the phone chose, drawn ----
+ *
+ * A world contributes the stage (sky, ground, props); a theme contributes the
+ * character and UI. The two mono themes (retro LCD, ink) override everything
+ * with a two-tone ramp — that IS the aesthetic — so every color in the scene
+ * routes through pet_col() and nothing hardcodes a hex. */
+enum {
+    PC_SKY = 0, PC_SKY2, PC_GROUND, PC_GROUND_HI, PC_SPOT, PC_STAR,
+    PC_BODY, PC_BODY_DARK, PC_EYE, PC_ACCENT, PC_TEXT, PC_DIM, PC_PROP,
+};
+
+typedef struct {
+    uint32_t sky, sky2, ground, ground_hi, spot, star, prop;
+    bool moon;                          /* some skies have one, some do not */
+} pet_world_pal_t;
+static const pet_world_pal_t s_pet_world_pal[4] = {
+    /* tiny planet  */ { 0x0A0F22, 0x241B3A, 0x2A9D8F, 0x6FD8C8, 0x21857A, 0xFFF3D6, 0xB8C4D9, true  },
+    /* ocean floor  */ { 0x041830, 0x0A2E4E, 0xC2B280, 0xE0D2A0, 0xA89868, 0x8DE0D2, 0xFF8C69, false },
+    /* forest glade */ { 0x0F1A2E, 0x16283A, 0x2E7D32, 0x66BB6A, 0x1B5E20, 0xE8F6B8, 0xC9A227, true  },
+    /* city rooftop */ { 0x0B1020, 0x1B1430, 0x37474F, 0x546E7A, 0x263238, 0xE9C46A, 0xB0BEC5, true  },
+};
+
+typedef struct {
+    uint32_t body, body_dark, eye, accent, text, dim;
+    bool mono;
+    uint32_t mono_bg, mono_fg, mono_mid;
+} pet_theme_pal_t;
+static const pet_theme_pal_t s_pet_theme_pal[4] = {
+    /* modern    */ { 0xF4F1DE, 0x264653, 0x8DE0D2, 0xE76F51, 0xF4F1DE, 0x9AA7B8, false, 0, 0, 0 },
+    /* retro lcd */ { 0, 0, 0, 0, 0, 0, true,  0x9BBC0F, 0x0F380F, 0x306230 },
+    /* ink       */ { 0, 0, 0, 0, 0, 0, true,  0xF2F2F2, 0x141414, 0x6E6E6E },
+    /* neon      */ { 0x00E5FF, 0x0077AA, 0x001018, 0xFF2D95, 0x00E5FF, 0x557788, false, 0x000000, 0, 0 },
+};
+
+static uint32_t pet_col(int role) {
+    const pet_world_pal_t *w = &s_pet_world_pal[s_pet.world & 3];
+    const pet_theme_pal_t *t = &s_pet_theme_pal[s_pet.theme & 3];
+    if (t->mono) {
+        switch (role) {
+        case PC_SKY: case PC_SKY2: case PC_EYE:      return t->mono_bg;
+        case PC_GROUND: case PC_BODY: case PC_TEXT:  return t->mono_fg;
+        default:                                     return t->mono_mid;
+        }
+    }
+    switch (role) {
+    case PC_SKY:       return (s_pet.theme == 3) ? 0x000000 : w->sky;
+    case PC_SKY2:      return (s_pet.theme == 3) ? 0x0A0018 : w->sky2;
+    case PC_GROUND:    return w->ground;
+    case PC_GROUND_HI: return w->ground_hi;
+    case PC_SPOT:      return w->spot;
+    case PC_STAR:      return w->star;
+    case PC_PROP:      return w->prop;
+    case PC_BODY:      return t->body;
+    case PC_BODY_DARK: return t->body_dark;
+    case PC_EYE:       return t->eye;
+    case PC_ACCENT:    return t->accent;
+    case PC_TEXT:      return t->text;
+    default:           return t->dim;
+    }
+}
+
+/* the ground and sky props the quake rattles; the planet stays put because
+ * translating a 540 px circle invalidates a full-width band per frame */
+static int s_pet_quake;             /* frames of world-shake left */
+static int s_pet_quake_amp;
+
 /* the planet is a big circle whose top cap forms the horizon */
 #define PLANET_CX    240
 #define PLANET_CY    510
@@ -3010,8 +3086,14 @@ static char s_pet_prev_mood[48], s_pet_prev_name[24];
  * the DAYS edit QR: the link is minted by the broker, single-use, and the
  * phone lands on /pet already holding a session code. */
 static lv_obj_t *s_pet_qr_panel, *s_pet_qr, *s_pet_qr_note;
+static lv_obj_t *s_pet_qr_btn, *s_pet_qr_btn_l, *s_pet_qr_tick;
 static char s_pet_link_drawn[256];
 static uint32_t s_pet_link_seen_ver = UINT32_MAX;
+/* The panel's little ceremony: show the code, sync on demand with a visible
+ * wait, then a green tick or a red cross — never a white screen that just
+ * disappears and leaves the user guessing whether anything happened. */
+enum { PET_QR_SHOWING = 0, PET_QR_SYNCING, PET_QR_DONE, PET_QR_FAIL };
+static uint8_t s_pet_qr_state;
 
 static int isin(int deg, int amp) {
     while (deg < 0) deg += 360;
@@ -3155,17 +3237,20 @@ static void pet_motion_poll(void) {
     }
 
     int64_t t = now_ms();
-    if (primed) {
-        int jerk = abs(s_acc_x - px) + abs(s_acc_y - py) + abs(s_acc_z - pz);
-        if (jerk > 6500 && t - last_shake_ms > 1200) {
-            last_shake_ms = t;
-            set_act(ACT_JUMP, 34);
-            say("wobble!");
-            s_pet.happy = clampi(s_pet.happy + 2, 0, 100);
-            s_pet_dirty = true;
-            pet_seen();
-            ESP_LOGI(TAG, "pet imu: shake jerk=%d", jerk);
-        }
+    int jerk = 0;
+    if (primed)
+        jerk = abs(s_acc_x - px) + abs(s_acc_y - py) + abs(s_acc_z - pz);
+    if (primed && jerk > 6500 && t - last_shake_ms > 1200) {
+        last_shake_ms = t;
+        set_act(ACT_JUMP, 34);
+        /* the world gets it too: harder shake, bigger rattle */
+        s_pet_quake = 24;
+        s_pet_quake_amp = clampi(jerk / 1400, 5, 16);
+        say(jerk > 14000 ? "earthquake!!" : "wobble!");
+        s_pet.happy = clampi(s_pet.happy + 2, 0, 100);
+        s_pet_dirty = true;
+        pet_seen();
+        ESP_LOGI(TAG, "pet imu: shake jerk=%d", jerk);
     }
     px = s_acc_x; py = s_acc_y; pz = s_acc_z;
     primed = true;
@@ -3174,7 +3259,24 @@ static void pet_motion_poll(void) {
      * The window also swallows the rebound of the hand arresting the shake. */
     if (t - last_shake_ms < 400) return;
 
-    int left = pet_lean_signal(1), right = pet_lean_signal(3);
+    /* A cube PARKED on its side is not a command. When the accelerometer has
+     * been rock-still for ~4 s, whatever pose it rests in becomes the new
+     * level, so a cube leaned against a book stops pinning the pet to a wall
+     * — while a hand-held tilt (never still) steers relative to level. */
+    static int base_l, base_r;
+    static int still_polls;
+    int raw_l = pet_lean_signal(1), raw_r = pet_lean_signal(3);
+    if (jerk < 900) {
+        if (still_polls < 200) still_polls++;
+        if (still_polls >= 200) {                /* adopt the resting pose */
+            base_l += (raw_l - base_l) / 8;
+            base_r += (raw_r - base_r) / 8;
+        }
+    } else {
+        still_polls = 0;
+    }
+
+    int left = raw_l - base_l, right = raw_r - base_r;
     int mag = left > right ? left : right;
     int tx = -1;
     if (left > PET_LEAN_TH && left >= right)  tx = WALK_MIN_X;
@@ -3352,10 +3454,38 @@ static void pet_hud_refresh(const char *mood) {
 }
 
 /* Mirrors days_timer_cb's QR section: redraw the code only when the link
- * actually changed, show honest text while it is being minted or failing. */
+ * actually changed, show honest text while it is being minted or failing —
+ * and run the sync button's little state machine on top. */
 static void pet_qr_refresh(void) {
     if (!s_pet_qr_panel || lv_obj_has_flag(s_pet_qr_panel, LV_OBJ_FLAG_HIDDEN))
         return;
+
+    if (s_pet_qr_state == PET_QR_SYNCING) {
+        static const char *dots[] = { "SYNCING", "SYNCING.", "SYNCING..", "SYNCING..." };
+        lv_label_set_text(s_pet_qr_btn_l, dots[(s_fcount / 12) & 3]);
+        uint8_t res = s_pet_cfg_result;
+        if (res == 1) {
+            s_pet_qr_state = PET_QR_DONE;
+            lv_obj_add_flag(s_pet_qr, LV_OBJ_FLAG_HIDDEN);
+            lv_obj_add_flag(s_pet_qr_btn, LV_OBJ_FLAG_HIDDEN);
+            lv_obj_remove_flag(s_pet_qr_tick, LV_OBJ_FLAG_HIDDEN);
+            lv_obj_set_style_bg_color(s_pet_qr_tick, lv_color_hex(0x2E9E5B), 0);
+            lv_label_set_text(lv_obj_get_child(s_pet_qr_tick, 0), LV_SYMBOL_OK);
+            lv_label_set_text(s_pet_qr_note,
+                              "SAVED TO YOUR CUBE\nTap anywhere to see it");
+        } else if (res == 2) {
+            s_pet_qr_state = PET_QR_FAIL;
+            lv_obj_remove_flag(s_pet_qr_tick, LV_OBJ_FLAG_HIDDEN);
+            lv_obj_set_style_bg_color(s_pet_qr_tick, lv_color_hex(0xC0392B), 0);
+            lv_label_set_text(lv_obj_get_child(s_pet_qr_tick, 0), LV_SYMBOL_CLOSE);
+            lv_label_set_text(s_pet_qr_btn_l, "TRY AGAIN");
+            lv_label_set_text(s_pet_qr_note,
+                              "SYNC FAILED\nCheck Wi-Fi, then try again");
+        }
+        return;
+    }
+    if (s_pet_qr_state != PET_QR_SHOWING) return;
+
     char url[PET_LINK_URL_MAX];
     uint32_t version;
     pet_link_snapshot(url, sizeof(url), &version);
@@ -3369,8 +3499,7 @@ static void pet_qr_refresh(void) {
             lv_obj_remove_flag(s_pet_qr, LV_OBJ_FLAG_HIDDEN);
             lv_label_set_text(s_pet_qr_note,
                               "SCAN, THEN DESIGN ON YOUR PHONE\n"
-                              "When you have saved there,\n"
-                              "TAP THIS SCREEN to sync the cube");
+                              "Saved there? Press the button below.");
         } else {
             lv_obj_add_flag(s_pet_qr, LV_OBJ_FLAG_HIDDEN);
             lv_label_set_text(s_pet_qr_note, "QR ENCODE FAILED\nTap to close and retry");
@@ -3391,21 +3520,39 @@ static void pet_qr_open_cb(lv_event_t *e) {
     pet_link_publish("");
     s_pet_link_drawn[0] = '\0';
     s_pet_link_seen_ver = UINT32_MAX;
+    s_pet_qr_state = PET_QR_SHOWING;
     lv_obj_add_flag(s_pet_qr, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_flag(s_pet_qr_tick, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_remove_flag(s_pet_qr_btn, LV_OBJ_FLAG_HIDDEN);
+    lv_label_set_text(s_pet_qr_btn_l, "I SAVED - SYNC NOW");
     lv_label_set_text(s_pet_qr_note, "CREATING SECURE LINK...");
     lv_obj_remove_flag(s_pet_qr_panel, LV_OBJ_FLAG_HIDDEN);
     __atomic_store_n(&s_req_pet_link, true, __ATOMIC_RELEASE);
 }
 
+static void pet_qr_sync_cb(lv_event_t *e) {
+    lv_event_stop_bubbling(e);
+    if (s_pet_qr_state == PET_QR_SYNCING) return;
+    s_pet_qr_state = PET_QR_SYNCING;
+    s_pet_cfg_result = 0;
+    lv_obj_add_flag(s_pet_qr_tick, LV_OBJ_FLAG_HIDDEN);
+    lv_label_set_text(s_pet_qr_note, "TALKING TO THE BROKER...");
+    __atomic_store_n(&s_req_pet_cfg, true, __ATOMIC_RELEASE);
+}
+
 static void pet_qr_close_cb(lv_event_t *e) {
     lv_event_stop_bubbling(e);
+    /* Mid-sync the panel holds still: dismissing a spinner is how results
+     * get lost. It resolves to a tick or a cross within seconds. */
+    if (s_pet_qr_state == PET_QR_SYNCING) return;
     if (s_pet_qr_panel) lv_obj_add_flag(s_pet_qr_panel, LV_OBJ_FLAG_HIDDEN);
-    /* Saving happens on the phone; closing the handoff is the signal to
-     * fetch the result now rather than on the 2 h cycle. The bubble is the
-     * acknowledgement that a sync is actually happening — without it the
-     * tap looked like a plain dismiss and the design seemed lost. */
-    __atomic_store_n(&s_req_pet_cfg, true, __ATOMIC_RELEASE);
-    say("syncing...");
+    /* Closing without pressing SYNC still fetches — a safety net for the
+     * user who saved on the phone and just taps the panel away. */
+    if (s_pet_qr_state == PET_QR_SHOWING) {
+        __atomic_store_n(&s_req_pet_cfg, true, __ATOMIC_RELEASE);
+        say("syncing...");
+    }
+    s_pet_qr_state = PET_QR_SHOWING;
 }
 
 static void pet_timer_cb(lv_timer_t *t) {
@@ -3590,10 +3737,30 @@ static void pet_timer_cb(lv_timer_t *t) {
     }
     if (s_act != ACT_IDLE) s_next_pick = s_fcount + 150 + rnd(220);
 
+    /* ---- the quake: a shake rattles the WORLD, not just the pet ----
+     * Sky props and the creature jitter on decaying sine offsets; the big
+     * ground circle stays put because translating it invalidates a
+     * full-width band per frame. Small objects, small dirty rects. */
+    int qx = 0, qy = 0;
+    if (s_pet_quake > 0) {
+        s_pet_quake--;
+        int a = (s_pet_quake_amp * s_pet_quake) / 24;
+        qx = isin(s_pet_quake * 67, a);
+        qy = isin(s_pet_quake * 53 + 90, a / 2);
+        lv_obj_set_style_translate_x(s_moon, qx, 0);
+        for (int i = 0; i < STAR_N; i += 2)
+            lv_obj_set_style_translate_y(s_star[i], qy, 0);
+        if (!s_pet_quake) {                     /* settle everything back */
+            lv_obj_set_style_translate_x(s_moon, 0, 0);
+            for (int i = 0; i < STAR_N; i += 2)
+                lv_obj_set_style_translate_y(s_star[i], 0, 0);
+        }
+    }
+
     /* ---- place the character on the surface ---- */
     int gy = ground_y(s_cx);
-    lv_obj_set_x(s_ch_wrap, s_cx - CH_W / 2 + lean);
-    lv_obj_set_y(s_ch_wrap, gy - CH_H + bob);
+    lv_obj_set_x(s_ch_wrap, s_cx - CH_W / 2 + lean + qx);
+    lv_obj_set_y(s_ch_wrap, gy - CH_H + bob + qy);
 
     static int p_eye = -1, p_ll = 999, p_arm = 999, p_sq = 999, p_face = 0;
     if (eye_h != p_eye) {
@@ -3612,18 +3779,24 @@ static void pet_timer_cb(lv_timer_t *t) {
         p_arm = arm;
     }
     if (squash != p_sq) {
-        lv_obj_set_size(s_ch_body, CH_W - 8 + squash, 40 - squash);
+        if (s_pet.species == 1)
+            lv_obj_set_size(s_ch_body, CH_W - 4 + squash, 44 - squash);
+        else
+            lv_obj_set_size(s_ch_body, CH_W - 8 + squash, 40 - squash);
         p_sq = squash;
     }
-    if (s_face != p_face) {                       /* shift the visor to "face" a way */
-        lv_obj_align(s_ch_visor, LV_ALIGN_TOP_MID, s_face * 3, 6);
+    if (s_face != p_face) {                       /* shift the face to "look" a way */
+        lv_obj_align(s_ch_visor, LV_ALIGN_TOP_MID, s_face * 3,
+                     s_pet.species == 1 ? 8 : 6);
         p_face = s_face;
     }
 
-    /* antenna light blinks slowly */
-    if (s_fcount % 20 == 0) {
+    /* antenna light blinks slowly — the astronaut's alone; on the cat the
+     * slot holds an ear, and a blinking ear is nobody's pet */
+    if (s_pet.species == 0 && s_fcount % 20 == 0) {
         lv_obj_set_style_bg_color(s_ch_antdot,
-            lv_color_hex((s_fcount / 20) % 2 ? 0xE76F51 : 0x5A2A20), 0);
+            lv_color_hex((s_fcount / 20) % 2 ? pet_col(PC_ACCENT)
+                                             : pet_col(PC_BODY_DARK)), 0);
     }
 
     /* speech bubble rides above the head */
@@ -3716,7 +3889,10 @@ static lv_obj_t *make_action_btn(lv_obj_t *parent, const char *txt,
     lv_obj_t *l = lv_label_create(b);
     lv_obj_set_style_text_font(l, &lv_font_montserrat_20, 0);
     lv_label_set_text(l, txt);
-    lv_obj_set_style_text_color(l, lv_color_hex(0x10162A), 0);
+    /* On a mono theme the button IS the ink color, so the label takes the
+     * paper color; everywhere else near-black reads on every accent. */
+    lv_obj_set_style_text_color(l, lv_color_hex(
+        s_pet_theme_pal[s_pet.theme & 3].mono ? pet_col(PC_SKY) : 0x10162A), 0);
     lv_obj_center(l);
     return b;
 }
@@ -3725,116 +3901,237 @@ static lv_obj_t *make_action_btn(lv_obj_t *parent, const char *txt,
  * so it cannot bit-rot; --gc-sections drops it from such an image, so the
  * attribute and this note stay even while the app ships. */
 __attribute__((unused))
+/* The astronaut rig — species 0. Every species fills the same part slots so
+ * the pose code in pet_timer_cb animates any of them. */
+static void pet_build_astro(void) {
+    s_ch_ant = rect(s_ch_wrap, 3, 10, 1, pet_col(PC_PROP));
+    lv_obj_align(s_ch_ant, LV_ALIGN_TOP_MID, 10, -4);
+    s_ch_antdot = rect(s_ch_wrap, 7, 7, 3, pet_col(PC_ACCENT));
+    lv_obj_align(s_ch_antdot, LV_ALIGN_TOP_MID, 10, -10);
+
+    s_ch_pack = rect(s_ch_wrap, 16, 26, 5, pet_col(PC_ACCENT));
+    lv_obj_align(s_ch_pack, LV_ALIGN_TOP_LEFT, 0, 12);
+
+    s_ch_leg_l = rect(s_ch_wrap, 11, 16, 4, pet_col(PC_BODY_DARK));
+    lv_obj_align(s_ch_leg_l, LV_ALIGN_BOTTOM_MID, -10, 0);
+    s_ch_leg_r = rect(s_ch_wrap, 11, 16, 4, pet_col(PC_BODY_DARK));
+    lv_obj_align(s_ch_leg_r, LV_ALIGN_BOTTOM_MID, 10, 0);
+
+    s_ch_arm_l = rect(s_ch_wrap, 9, 20, 4, pet_col(PC_BODY));
+    lv_obj_align(s_ch_arm_l, LV_ALIGN_TOP_LEFT, 3, 22);
+    s_ch_arm_r = rect(s_ch_wrap, 9, 20, 4, pet_col(PC_BODY));
+    lv_obj_align(s_ch_arm_r, LV_ALIGN_TOP_RIGHT, -3, 22);
+
+    /* body last so it sits over the pack and arm roots */
+    s_ch_body = rect(s_ch_wrap, CH_W - 8, 40, 14, pet_col(PC_BODY));
+    lv_obj_align(s_ch_body, LV_ALIGN_TOP_MID, 0, 6);
+
+    s_ch_visor = rect(s_ch_body, 32, 18, 9, pet_col(PC_BODY_DARK));
+    lv_obj_align(s_ch_visor, LV_ALIGN_TOP_MID, 0, 6);
+
+    s_ch_eye_l = rect(s_ch_visor, 6, 12, 3, pet_col(PC_EYE));
+    lv_obj_align(s_ch_eye_l, LV_ALIGN_CENTER, -7, 0);
+    s_ch_eye_r = rect(s_ch_visor, 6, 12, 3, pet_col(PC_EYE));
+    lv_obj_align(s_ch_eye_r, LV_ALIGN_CENTER, 7, 0);
+}
+
+/* BIT the cat — species 1, drawn vector-side until the sprite pipeline lands.
+ * Ears ride the antenna slots (their blink is guarded by species), the tail
+ * rides the pack slot, the face strip is a transparent container so the eye
+ * pose logic works unchanged. */
+static void pet_build_cat(void) {
+    s_ch_ant = rect(s_ch_wrap, 12, 14, 4, pet_col(PC_BODY_DARK));   /* ears */
+    lv_obj_align(s_ch_ant, LV_ALIGN_TOP_MID, -14, 2);
+    s_ch_antdot = rect(s_ch_wrap, 12, 14, 4, pet_col(PC_BODY_DARK));
+    lv_obj_align(s_ch_antdot, LV_ALIGN_TOP_MID, 14, 2);
+
+    s_ch_pack = rect(s_ch_wrap, 6, 22, 3, pet_col(PC_BODY_DARK));   /* tail */
+    lv_obj_align(s_ch_pack, LV_ALIGN_BOTTOM_LEFT, -2, -14);
+
+    s_ch_leg_l = rect(s_ch_wrap, 12, 12, 5, pet_col(PC_BODY));
+    lv_obj_align(s_ch_leg_l, LV_ALIGN_BOTTOM_MID, -12, 0);
+    s_ch_leg_r = rect(s_ch_wrap, 12, 12, 5, pet_col(PC_BODY));
+    lv_obj_align(s_ch_leg_r, LV_ALIGN_BOTTOM_MID, 12, 0);
+
+    /* front paws in the arm slots, small so the wave reads as a paw lift */
+    s_ch_arm_l = rect(s_ch_wrap, 9, 12, 4, pet_col(PC_BODY));
+    lv_obj_align(s_ch_arm_l, LV_ALIGN_BOTTOM_MID, -20, -4);
+    s_ch_arm_r = rect(s_ch_wrap, 9, 12, 4, pet_col(PC_BODY));
+    lv_obj_align(s_ch_arm_r, LV_ALIGN_BOTTOM_MID, 20, -4);
+
+    s_ch_body = rect(s_ch_wrap, CH_W - 4, 44, 18, pet_col(PC_BODY));
+    lv_obj_align(s_ch_body, LV_ALIGN_TOP_MID, 0, 8);
+
+    /* transparent face strip: the pose code moves and squints these */
+    s_ch_visor = rect(s_ch_body, 36, 18, 9, pet_col(PC_BODY));
+    lv_obj_set_style_bg_opa(s_ch_visor, LV_OPA_TRANSP, 0);
+    lv_obj_align(s_ch_visor, LV_ALIGN_TOP_MID, 0, 8);
+
+    s_ch_eye_l = rect(s_ch_visor, 6, 12, 3, pet_col(PC_BODY_DARK));
+    lv_obj_align(s_ch_eye_l, LV_ALIGN_CENTER, -9, 0);
+    s_ch_eye_r = rect(s_ch_visor, 6, 12, 3, pet_col(PC_BODY_DARK));
+    lv_obj_align(s_ch_eye_r, LV_ALIGN_CENTER, 9, 0);
+
+    /* blush, the cat's whole charm */
+    lv_obj_t *bl = rect(s_ch_body, 7, 5, 2, pet_col(PC_ACCENT));
+    lv_obj_align(bl, LV_ALIGN_TOP_MID, -17, 22);
+    lv_obj_t *br = rect(s_ch_body, 7, 5, 2, pet_col(PC_ACCENT));
+    lv_obj_align(br, LV_ALIGN_TOP_MID, 17, 22);
+}
+
+/* The hat rides the character wrap, so every pose and hop carries it. */
+static void pet_build_hat(void) {
+    int top = (s_pet.species == 1) ? 0 : -2;
+    switch (s_pet.hat) {
+    case 1: {                                            /* cap */
+        lv_obj_t *dome = rect(s_ch_wrap, 24, 10, 5, pet_col(PC_ACCENT));
+        lv_obj_align(dome, LV_ALIGN_TOP_MID, -2, top - 6);
+        lv_obj_t *brim = rect(s_ch_wrap, 34, 4, 2, pet_col(PC_ACCENT));
+        lv_obj_align(brim, LV_ALIGN_TOP_MID, 4, top + 2);
+        break;
+    }
+    case 2: {                                            /* crown */
+        lv_obj_t *band = rect(s_ch_wrap, 26, 8, 2, pet_col(PC_STAR));
+        lv_obj_align(band, LV_ALIGN_TOP_MID, 0, top - 4);
+        for (int i = 0; i < 3; i++) {
+            lv_obj_t *pt = rect(s_ch_wrap, 6, 7, 1, pet_col(PC_STAR));
+            lv_obj_align(pt, LV_ALIGN_TOP_MID, (i - 1) * 9, top - 10);
+        }
+        break;
+    }
+    case 3: {                                            /* bow */
+        lv_obj_t *l = rect(s_ch_wrap, 10, 9, 3, pet_col(PC_ACCENT));
+        lv_obj_align(l, LV_ALIGN_TOP_MID, -8, top - 6);
+        lv_obj_t *r = rect(s_ch_wrap, 10, 9, 3, pet_col(PC_ACCENT));
+        lv_obj_align(r, LV_ALIGN_TOP_MID, 8, top - 6);
+        lv_obj_t *knot = rect(s_ch_wrap, 6, 6, 2, pet_col(PC_BODY_DARK));
+        lv_obj_align(knot, LV_ALIGN_TOP_MID, 0, top - 5);
+        break;
+    }
+    default:
+        break;
+    }
+}
+
 static void build_pet_app(lv_obj_t *scr) {
     s_scr_pet = scr;
     lv_obj_remove_flag(s_scr_pet, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_set_style_bg_color(s_scr_pet, lv_color_hex(0x0A0F22), 0);
-    lv_obj_set_style_bg_grad_color(s_scr_pet, lv_color_hex(0x241B3A), 0);
+    lv_obj_set_style_bg_color(s_scr_pet, lv_color_hex(pet_col(PC_SKY)), 0);
+    lv_obj_set_style_bg_grad_color(s_scr_pet, lv_color_hex(pet_col(PC_SKY2)), 0);
     lv_obj_set_style_bg_grad_dir(s_scr_pet, LV_GRAD_DIR_VER, 0);
     lv_obj_set_style_pad_all(s_scr_pet, 0, 0);
 
-    /* --- sky --- */
+    const pet_world_pal_t *wp = &s_pet_world_pal[s_pet.world & 3];
+
+    /* --- sky (or water, or night air): the same twelve twinkles play
+     * stars, rising bubbles, fireflies and lit windows — only the color
+     * changes, the stagger animation already reads right for all four --- */
     /* uint16_t, not uint8_t: the five x positions past 255 used to wrap and
      * pile those stars up against the left edge */
     static const uint16_t sx[STAR_N] = { 34, 78, 132, 190, 250, 300, 352, 404, 60, 220, 330, 430 };
     static const uint16_t sy[STAR_N] = { 96, 52, 112, 40, 78, 34, 96, 130, 168, 150, 168, 74 };
     for (int i = 0; i < STAR_N; i++) {
         int sz = (i % 3 == 0) ? 4 : 3;
-        s_star[i] = rect(s_scr_pet, sz, sz, 2, 0xFFF3D6);
+        s_star[i] = rect(s_scr_pet, sz, sz, 2, pet_col(PC_STAR));
         lv_obj_set_pos(s_star[i], sx[i] * 480 / 460, sy[i]);
         s_star_ph[i] = (uint8_t)(i * 7);
     }
 
-    s_moon = rect(s_scr_pet, 46, 46, 23, 0xE9C46A);
+    s_moon = rect(s_scr_pet, 46, 46, 23, pet_col(PC_STAR));
     lv_obj_set_pos(s_moon, 76, 58);
-    lv_obj_t *moon_dip = rect(s_moon, 14, 14, 7, 0xD9B45A);
+    lv_obj_t *moon_dip = rect(s_moon, 14, 14, 7, pet_col(PC_SKY2));
+    lv_obj_set_style_bg_opa(moon_dip, 90, 0);
     lv_obj_set_pos(moon_dip, 8, 12);
+    if (!wp->moon) lv_obj_add_flag(s_moon, LV_OBJ_FLAG_HIDDEN);
 
-    s_shoot = rect(s_scr_pet, 26, 3, 2, 0xFFF3D6);
+    s_shoot = rect(s_scr_pet, 26, 3, 2, pet_col(PC_STAR));
     lv_obj_add_flag(s_shoot, LV_OBJ_FLAG_HIDDEN);
 
-    s_ufo = rect(s_scr_pet, 54, 14, 7, 0xB8C4D9);
+    /* the passer-by: UFO over the planet, a fish in the sea, a butterfly in
+     * the glade, a little plane over the skyline — same flight path */
+    s_ufo = rect(s_scr_pet, 54, 14, 7, pet_col(PC_PROP));
     lv_obj_add_flag(s_ufo, LV_OBJ_FLAG_HIDDEN);
-    lv_obj_t *ufo_dome = rect(s_ufo, 24, 12, 6, 0x8DE0D2);
+    lv_obj_t *ufo_dome = rect(s_ufo, 24, 12, 6, pet_col(PC_STAR));
     lv_obj_align(ufo_dome, LV_ALIGN_TOP_MID, 0, -6);
 
-    /* --- the planet: a big circle, only its cap is on screen --- */
-    lv_obj_t *planet = rect(s_scr_pet, PLANET_R * 2, PLANET_R * 2, PLANET_R, 0x2A9D8F);
+    /* --- the ground: a big circle, only its cap is on screen --- */
+    lv_obj_t *planet = rect(s_scr_pet, PLANET_R * 2, PLANET_R * 2, PLANET_R, pet_col(PC_GROUND));
     lv_obj_set_pos(planet, PLANET_CX - PLANET_R, PLANET_CY - PLANET_R);
     lv_obj_set_style_border_width(planet, 4, 0);
-    lv_obj_set_style_border_color(planet, lv_color_hex(0x6FD8C8), 0);
+    lv_obj_set_style_border_color(planet, lv_color_hex(pet_col(PC_GROUND_HI)), 0);
     lv_obj_set_style_border_opa(planet, 190, 0);
 
-    lv_obj_t *c1 = rect(planet, 54, 20, 10, 0x21857A);
+    lv_obj_t *c1 = rect(planet, 54, 20, 10, pet_col(PC_SPOT));
     lv_obj_set_pos(c1, PLANET_R - 130, PLANET_R - 232);
-    lv_obj_t *c2 = rect(planet, 34, 14, 7, 0x21857A);
+    lv_obj_t *c2 = rect(planet, 34, 14, 7, pet_col(PC_SPOT));
     lv_obj_set_pos(c2, PLANET_R + 74, PLANET_R - 224);
-    lv_obj_t *c3 = rect(planet, 22, 10, 5, 0x21857A);
+    lv_obj_t *c3 = rect(planet, 22, 10, 5, pet_col(PC_SPOT));
     lv_obj_set_pos(c3, PLANET_R - 16, PLANET_R - 200);
 
+    /* --- per-world set dressing: two or three still props, dirt cheap --- */
+    switch (s_pet.world & 3) {
+    case 1: {                                        /* kelp on the seabed */
+        lv_obj_t *k1 = rect(s_scr_pet, 6, 44, 3, pet_col(PC_SPOT));
+        lv_obj_set_pos(k1, 96, ground_y(99) - 40);
+        lv_obj_t *k2 = rect(s_scr_pet, 5, 30, 2, pet_col(PC_GROUND_HI));
+        lv_obj_set_pos(k2, 388, ground_y(390) - 26);
+        break;
+    }
+    case 2: {                                        /* one good tree */
+        lv_obj_t *trunk = rect(s_scr_pet, 10, 46, 3, 0x5D4037);
+        lv_obj_set_pos(trunk, 372, ground_y(377) - 42);
+        lv_obj_t *crown = rect(s_scr_pet, 62, 52, 26, pet_col(PC_GROUND_HI));
+        lv_obj_set_pos(crown, 346, ground_y(377) - 88);
+        break;
+    }
+    case 3: {                                        /* skyline behind the roof */
+        lv_obj_t *b1 = rect(s_scr_pet, 44, 90, 3, pet_col(PC_SKY2));
+        lv_obj_set_pos(b1, 60, ground_y(82) - 84);
+        lv_obj_t *b2 = rect(s_scr_pet, 34, 62, 3, pet_col(PC_SKY2));
+        lv_obj_set_pos(b2, 384, ground_y(400) - 58);
+        break;
+    }
+    default:
+        break;
+    }
+
     /* rocket on the pad, hidden until it flies */
-    s_rocket = rect(s_scr_pet, 18, 34, 8, 0xE76F51);
+    s_rocket = rect(s_scr_pet, 18, 34, 8, pet_col(PC_ACCENT));
     lv_obj_add_flag(s_rocket, LV_OBJ_FLAG_HIDDEN);
-    lv_obj_t *nose = rect(s_rocket, 10, 10, 5, 0xF4F1DE);
+    lv_obj_t *nose = rect(s_rocket, 10, 10, 5, pet_col(PC_BODY));
     lv_obj_align(nose, LV_ALIGN_TOP_MID, 0, 2);
-    s_flame = rect(s_scr_pet, 8, 16, 4, 0xE9C46A);
+    s_flame = rect(s_scr_pet, 8, 16, 4, pet_col(PC_STAR));
     lv_obj_add_flag(s_flame, LV_OBJ_FLAG_HIDDEN);
 
-    s_food_item = rect(s_scr_pet, 18, 18, 9, 0xF4A261);
+    s_food_item = rect(s_scr_pet, 18, 18, 9, pet_col(PC_ACCENT));
     lv_obj_add_flag(s_food_item, LV_OBJ_FLAG_HIDDEN);
 
-    /* --- the astronaut --- */
+    /* --- the creature the phone chose --- */
     s_ch_wrap = lv_obj_create(s_scr_pet);
     lv_obj_remove_style_all(s_ch_wrap);
     lv_obj_set_size(s_ch_wrap, CH_W, CH_H);
     lv_obj_remove_flag(s_ch_wrap, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_set_pos(s_ch_wrap, 240 - CH_W / 2, 200);
 
-    s_ch_ant = rect(s_ch_wrap, 3, 10, 1, 0xB8C4D9);
-    lv_obj_align(s_ch_ant, LV_ALIGN_TOP_MID, 10, -4);
-    s_ch_antdot = rect(s_ch_wrap, 7, 7, 3, 0xE76F51);
-    lv_obj_align(s_ch_antdot, LV_ALIGN_TOP_MID, 10, -10);
-
-    s_ch_pack = rect(s_ch_wrap, 16, 26, 5, 0xE76F51);
-    lv_obj_align(s_ch_pack, LV_ALIGN_TOP_LEFT, 0, 12);
-
-    s_ch_leg_l = rect(s_ch_wrap, 11, 16, 4, 0x264653);
-    lv_obj_align(s_ch_leg_l, LV_ALIGN_BOTTOM_MID, -10, 0);
-    s_ch_leg_r = rect(s_ch_wrap, 11, 16, 4, 0x264653);
-    lv_obj_align(s_ch_leg_r, LV_ALIGN_BOTTOM_MID, 10, 0);
-
-    s_ch_arm_l = rect(s_ch_wrap, 9, 20, 4, 0xE0DCC8);
-    lv_obj_align(s_ch_arm_l, LV_ALIGN_TOP_LEFT, 3, 22);
-    s_ch_arm_r = rect(s_ch_wrap, 9, 20, 4, 0xE0DCC8);
-    lv_obj_align(s_ch_arm_r, LV_ALIGN_TOP_RIGHT, -3, 22);
-
-    /* body last so it sits over the pack and arm roots */
-    s_ch_body = rect(s_ch_wrap, CH_W - 8, 40, 14, 0xF4F1DE);
-    lv_obj_align(s_ch_body, LV_ALIGN_TOP_MID, 0, 6);
-
-    s_ch_visor = rect(s_ch_body, 32, 18, 9, 0x264653);
-    lv_obj_align(s_ch_visor, LV_ALIGN_TOP_MID, 0, 6);
-
-    s_ch_eye_l = rect(s_ch_visor, 6, 12, 3, 0x8DE0D2);
-    lv_obj_align(s_ch_eye_l, LV_ALIGN_CENTER, -7, 0);
-    s_ch_eye_r = rect(s_ch_visor, 6, 12, 3, 0x8DE0D2);
-    lv_obj_align(s_ch_eye_r, LV_ALIGN_CENTER, 7, 0);
+    if (s_pet.species == 1) pet_build_cat();
+    else                    pet_build_astro();
+    pet_build_hat();
 
     s_bubble = lv_label_create(s_scr_pet);
-    lv_obj_set_style_text_color(s_bubble, lv_color_hex(0xE9C46A), 0);
+    lv_obj_set_style_text_color(s_bubble, lv_color_hex(pet_col(PC_STAR)), 0);
     lv_label_set_text(s_bubble, "");
     lv_obj_add_flag(s_bubble, LV_OBJ_FLAG_HIDDEN);
 
-    /* --- before hatching / after leaving, the astronaut is not here --- */
+    /* --- before hatching / after leaving, the creature is not here --- */
     s_pet_egg = NULL;
     if (s_pet.stage == PET_EGG) {
         lv_obj_add_flag(s_ch_wrap, LV_OBJ_FLAG_HIDDEN);
         int gy = ground_y(240);
-        s_pet_egg = rect(s_scr_pet, 44, 54, 22, 0xF4F1DE);
+        s_pet_egg = rect(s_scr_pet, 44, 54, 22, pet_col(PC_BODY));
         lv_obj_set_pos(s_pet_egg, 240 - 22, gy - 50);
-        lv_obj_t *spot = rect(s_pet_egg, 12, 10, 5, 0xE9C46A);
+        lv_obj_t *spot = rect(s_pet_egg, 12, 10, 5, pet_col(PC_ACCENT));
         lv_obj_set_pos(spot, 8, 14);
-        lv_obj_t *spot2 = rect(s_pet_egg, 8, 7, 3, 0xE9C46A);
+        lv_obj_t *spot2 = rect(s_pet_egg, 8, 7, 3, pet_col(PC_ACCENT));
         lv_obj_set_pos(spot2, 26, 30);
         /* the murmurs rise from the shell, not from a walking character */
         lv_obj_set_pos(s_bubble, 240 + 30, gy - 76);
@@ -3842,15 +4139,15 @@ static void build_pet_app(lv_obj_t *scr) {
         lv_obj_add_flag(s_ch_wrap, LV_OBJ_FLAG_HIDDEN);
         /* a tiny sign planted where it used to stand */
         int gy = ground_y(262);
-        lv_obj_t *post = rect(s_scr_pet, 4, 26, 2, 0xB8C4D9);
+        lv_obj_t *post = rect(s_scr_pet, 4, 26, 2, pet_col(PC_PROP));
         lv_obj_set_pos(post, 262, gy - 26);
-        lv_obj_t *board = rect(s_scr_pet, 34, 18, 4, 0xE9C46A);
+        lv_obj_t *board = rect(s_scr_pet, 34, 18, 4, pet_col(PC_STAR));
         lv_obj_set_pos(board, 247, gy - 42);
     }
 
     /* --- HUD: name + mood + three slim bars, kept out of the scene --- */
     s_pet_name = lv_label_create(s_scr_pet);
-    lv_obj_set_style_text_color(s_pet_name, lv_color_hex(0xF4F1DE), 0);
+    lv_obj_set_style_text_color(s_pet_name, lv_color_hex(pet_col(PC_TEXT)), 0);
     lv_label_set_text(s_pet_name, "PIP");
     lv_obj_align(s_pet_name, LV_ALIGN_TOP_MID, 0, TOP_MARGIN - 8);
 
@@ -3862,14 +4159,15 @@ static void build_pet_app(lv_obj_t *scr) {
     lv_obj_set_flex_align(bars, LV_FLEX_ALIGN_SPACE_BETWEEN,
                           LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
     lv_obj_remove_flag(bars, LV_OBJ_FLAG_SCROLLABLE);
-    s_bar_food = make_stat_bar(bars, 0xF4A261);
-    s_bar_fun  = make_stat_bar(bars, 0xE76F51);
-    s_bar_nrg  = make_stat_bar(bars, 0x8DE0D2);
+    bool mono = s_pet_theme_pal[s_pet.theme & 3].mono;
+    s_bar_food = make_stat_bar(bars, mono ? pet_col(PC_TEXT) : 0xF4A261);
+    s_bar_fun  = make_stat_bar(bars, mono ? pet_col(PC_TEXT) : 0xE76F51);
+    s_bar_nrg  = make_stat_bar(bars, mono ? pet_col(PC_TEXT) : 0x8DE0D2);
 
     s_pet_mood = lv_label_create(s_scr_pet);
     lv_obj_set_width(s_pet_mood, CONTENT_W);
     lv_obj_set_style_text_align(s_pet_mood, LV_TEXT_ALIGN_CENTER, 0);
-    lv_obj_set_style_text_color(s_pet_mood, lv_color_hex(0x9AA7B8), 0);
+    lv_obj_set_style_text_color(s_pet_mood, lv_color_hex(pet_col(PC_DIM)), 0);
     lv_label_set_text(s_pet_mood, "having a good day");
     lv_obj_align(s_pet_mood, LV_ALIGN_TOP_MID, 0, TOP_MARGIN + 34);
 
@@ -3883,9 +4181,10 @@ static void build_pet_app(lv_obj_t *scr) {
         lv_obj_set_flex_align(acts, LV_FLEX_ALIGN_SPACE_BETWEEN,
                               LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
         lv_obj_remove_flag(acts, LV_OBJ_FLAG_SCROLLABLE);
-        make_action_btn(acts, "FEED",  0xF4A261, act_feed_cb);
-        make_action_btn(acts, "DANCE", 0xE76F51, act_play_cb);
-        make_action_btn(acts, "NAP",   0x8DE0D2, act_rest_cb);
+        /* Mono themes keep their two-tone promise on the verbs too. */
+        make_action_btn(acts, "FEED",  mono ? pet_col(PC_TEXT) : 0xF4A261, act_feed_cb);
+        make_action_btn(acts, "DANCE", mono ? pet_col(PC_TEXT) : 0xE76F51, act_play_cb);
+        make_action_btn(acts, "NAP",   mono ? pet_col(PC_TEXT) : 0x8DE0D2, act_rest_cb);
     }
 
     /* Fresh labels must not be gated against a previous build's text. */
@@ -3919,7 +4218,38 @@ static void build_pet_app(lv_obj_t *scr) {
     lv_obj_set_style_text_align(s_pet_qr_note, LV_TEXT_ALIGN_CENTER, 0);
     lv_obj_set_style_text_color(s_pet_qr_note, lv_color_hex(0x10162A), 0);
     lv_label_set_text(s_pet_qr_note, "");
-    lv_obj_align(s_pet_qr_note, LV_ALIGN_CENTER, 0, 116);
+    lv_obj_align(s_pet_qr_note, LV_ALIGN_CENTER, 0, 108);
+
+    /* the sync button — 76 px per the touch rule, loud color on the white */
+    s_pet_qr_btn = lv_button_create(s_pet_qr_panel);
+    lv_obj_set_size(s_pet_qr_btn, 320, 76);
+    lv_obj_set_style_radius(s_pet_qr_btn, 26, 0);
+    lv_obj_set_style_bg_color(s_pet_qr_btn, lv_color_hex(0xE76F51), 0);
+    lv_obj_set_style_shadow_width(s_pet_qr_btn, 0, 0);
+    lv_obj_align(s_pet_qr_btn, LV_ALIGN_BOTTOM_MID, 0, -42);
+    lv_obj_add_event_cb(s_pet_qr_btn, pet_qr_sync_cb, LV_EVENT_CLICKED, NULL);
+    s_pet_qr_btn_l = lv_label_create(s_pet_qr_btn);
+    lv_obj_set_style_text_font(s_pet_qr_btn_l, &lv_font_montserrat_20, 0);
+    lv_obj_set_style_text_color(s_pet_qr_btn_l, lv_color_hex(0xFFFFFF), 0);
+    lv_label_set_text(s_pet_qr_btn_l, "I SAVED - SYNC NOW");
+    lv_obj_center(s_pet_qr_btn_l);
+
+    /* the verdict badge: a green tick or a red cross where the QR was */
+    s_pet_qr_tick = lv_obj_create(s_pet_qr_panel);
+    lv_obj_remove_style_all(s_pet_qr_tick);
+    lv_obj_set_size(s_pet_qr_tick, 120, 120);
+    lv_obj_set_style_radius(s_pet_qr_tick, 60, 0);
+    lv_obj_set_style_bg_color(s_pet_qr_tick, lv_color_hex(0x2E9E5B), 0);
+    lv_obj_set_style_bg_opa(s_pet_qr_tick, LV_OPA_COVER, 0);
+    lv_obj_remove_flag(s_pet_qr_tick, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_align(s_pet_qr_tick, LV_ALIGN_CENTER, 0, -28);
+    lv_obj_t *tick_l = lv_label_create(s_pet_qr_tick);
+    lv_obj_set_style_text_font(tick_l, &lv_font_montserrat_20, 0);
+    lv_obj_set_style_text_color(tick_l, lv_color_hex(0xFFFFFF), 0);
+    lv_label_set_text(tick_l, LV_SYMBOL_OK);
+    lv_obj_center(tick_l);
+    lv_obj_add_flag(s_pet_qr_tick, LV_OBJ_FLAG_HIDDEN);
+
     lv_obj_add_flag(s_pet_qr_panel, LV_OBJ_FLAG_HIDDEN);
 
     /* tap the world to send it walking, tap the astronaut to pet it */
@@ -8922,7 +9252,9 @@ static void build_drawer(lv_obj_t *scr) {
         lv_obj_set_style_text_font(l, &hud_text_18, 0);
         lv_obj_set_style_text_color(l, lv_color_hex(0xC7D2E0), 0);
         lv_obj_set_style_text_letter_space(l, 2, 0);
-        lv_label_set_text(l, s_apps[i].name);
+        /* the pet's tile answers to its given name, not its factory one */
+        lv_label_set_text(l, (i == APP_PET && s_pet.name[0]) ? s_pet.name
+                                                             : s_apps[i].name);
         lv_obj_align(l, LV_ALIGN_CENTER, 0, 46);
         shown++;
     }
@@ -10602,6 +10934,8 @@ static void app_open(int idx) {
     s_bolt_label = NULL; s_fps_label = NULL; s_events_label = NULL;
     s_ch_wrap = NULL; s_pet_egg = NULL;
     s_pet_qr_panel = NULL; s_pet_qr = NULL; s_pet_qr_note = NULL;
+    s_pet_qr_btn = NULL; s_pet_qr_btn_l = NULL; s_pet_qr_tick = NULL;
+    s_pet_qr_state = PET_QR_SHOWING;
     s_cfg_wall_pool = NULL; s_cfg_wall_state = NULL;
     s_cfg_wall_bar = NULL; s_cfg_wall_sub = NULL;
     s_cfg_days_val = NULL;
@@ -11142,8 +11476,12 @@ void app_main(void) {
      * same network since before the table existed reports nothing as saved, and
      * the phone asks for a password the cube is holding. Self-dedupes. */
     if (s_ssid[0] && s_pass[0]) known_remember(s_ssid, s_pass);
-    pet_load();
-    pomo_load();
+    /* pet_load and pomo_load used to run HERE — before sd_init() — which
+     * silently pinned them to the NVS fallback forever: every v2 pet save
+     * went to the card, every boot re-read a fossil v1 blob from NVS and
+     * re-migrated it, and the pet lived the same 45 minutes on repeat.
+     * State loads belong AFTER the card mounts, where days_load already
+     * was. */
     /* Ahead of the display, not with the other settings further down, and handed
      * to the BSP rather than applied here: the panel is already lit and holding a
      * 600 ms delay partway through bsp_display_start_with_config(), so anything
@@ -11221,6 +11559,11 @@ void app_main(void) {
 
     sd_init();
     days_load();
+    pet_load();
+    pomo_load();
+    /* The drawer built above knew only the factory pet name; now that the
+     * real one is loaded, rebuild it before anyone looks too closely. */
+    if (s_app == APP_DRAWER) app_request(APP_DRAWER);
     rtc_init();
     chg_load();          /* before pmu_init: the first CV write is the user's */
     pmu_init();
