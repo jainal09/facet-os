@@ -1,12 +1,13 @@
 # Build and runtime are split so the shipped image contains a single static
 # binary and nothing else — no shell, no package manager, no Go toolchain.
 
-FROM golang:1.25-alpine AS build
+FROM golang:1.25.13-alpine AS build
 WORKDIR /src
 
 # Dependencies first: this layer only rebuilds when go.mod/go.sum change.
 COPY go.mod go.sum ./
 RUN go mod download
+RUN go install golang.org/x/vuln/cmd/govulncheck@v1.7.0
 
 COPY *.go ./
 # The provisioning and DAYS pages are //go:embed-ed into the binary, so they
@@ -17,7 +18,7 @@ COPY static/ ./static/
 # The tests assert the album-art format as well as the authenticated countdown
 # contract. Running them here means a regression fails the image build rather
 # than silently shipping data the cube cannot consume.
-RUN go vet ./... && go test ./...
+RUN go vet ./... && go test ./... && govulncheck ./...
 
 RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /facet-broker .
 

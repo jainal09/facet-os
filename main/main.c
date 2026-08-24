@@ -319,6 +319,7 @@ static char s_sp_art_id[26];      /* the TRACK the loaded cover belongs to */
 static uint8_t *s_sp_art_buf;            /* PSRAM, SP_ART_MAX */
 static size_t   s_sp_art_len;            /* bytes of JPEG actually held */
 static lv_image_dsc_t s_sp_art_dsc;      /* points into s_sp_art_buf + header */
+static volatile int s_brk_status;        /* last broker_fetch HTTP status */
 static bool broker_fetch(const char *path, const char *xname, const char *xval,
                          uint8_t *buf, size_t cap, size_t *out_len);
 
@@ -1083,13 +1084,15 @@ static void net_bench_run(void) {
  * The web page writes one target to the broker. The cube keeps the last good
  * answer locally so opening the app never waits on DNS or TLS, then asks again
  * in the background on every open and once a day. The network task is the only
- * writer. A tiny cross-core critical section publishes the fixed-size snapshot
- * to the LVGL task; it covers only a 72-byte copy, never a render callback. */
+ * countdown writer. A small cross-core critical section publishes fixed-size
+ * countdown and one-time edit-link snapshots to the LVGL task; it never covers
+ * a render callback or network operation. */
 
 #define DAYS_BLOB_VER        1
 #define DAYS_FETCH_MS        (24 * 60 * 60 * 1000LL)
 #define DAYS_RETRY_MS        (15 * 60 * 1000LL)
-#define DAYS_RESPONSE_MAX    256
+#define DAYS_RESPONSE_MAX    512
+#define DAYS_LINK_URL_MAX    256
 
 typedef struct {
     uint8_t ver;
@@ -1101,10 +1104,14 @@ typedef struct {
 static days_blob_t s_days;
 static uint32_t s_days_version;
 static bool s_req_days_fetch = true;
+static bool s_req_days_link;
 static bool s_days_fetching;
+static bool s_days_link_fetching;
 static portMUX_TYPE s_days_lock = portMUX_INITIALIZER_UNLOCKED;
 static int64_t s_days_last_ok_ms;
 static int64_t s_days_last_attempt_ms;
+static char s_days_link_url[DAYS_LINK_URL_MAX];
+static uint32_t s_days_link_version;
 
 static void days_publish(const days_blob_t *next) {
     portENTER_CRITICAL(&s_days_lock);
@@ -1117,6 +1124,20 @@ static void days_snapshot(days_blob_t *out, uint32_t *version) {
     portENTER_CRITICAL(&s_days_lock);
     *out = s_days;
     if (version) *version = s_days_version;
+    portEXIT_CRITICAL(&s_days_lock);
+}
+
+static void days_link_publish(const char *url) {
+    portENTER_CRITICAL(&s_days_lock);
+    snprintf(s_days_link_url, sizeof(s_days_link_url), "%s", url ? url : "");
+    s_days_link_version++;
+    portEXIT_CRITICAL(&s_days_lock);
+}
+
+static void days_link_snapshot(char *out, size_t cap, uint32_t *version) {
+    portENTER_CRITICAL(&s_days_lock);
+    snprintf(out, cap, "%s", s_days_link_url);
+    if (version) *version = s_days_link_version;
     portEXIT_CRITICAL(&s_days_lock);
 }
 
@@ -1154,7 +1175,7 @@ static esp_err_t days_http_evt(esp_http_client_event_t *e) {
     return ESP_OK;
 }
 
-static bool days_fetch(void) {
+static bool days_http_get(const char *path) {
     s_days_rx.len = 0;
     s_days_rx.overflow = false;
     s_days_rx.data[0] = '\0';
@@ -1162,8 +1183,9 @@ static bool days_fetch(void) {
     if (!s_days_http) {
         char url[224];
         size_t base_len = strlen(BROKER_URL);
-        snprintf(url, sizeof(url), "%s%scountdown", BROKER_URL,
-                 (base_len && BROKER_URL[base_len - 1] == '/') ? "" : "/");
+        snprintf(url, sizeof(url), "%s%s%s", BROKER_URL,
+                 (base_len && BROKER_URL[base_len - 1] == '/') ? "" : "/",
+                 path[0] == '/' ? path + 1 : path);
         esp_http_client_config_t cfg = {
             .url = url,
             .crt_bundle_attach = esp_crt_bundle_attach,
@@ -1176,7 +1198,7 @@ static bool days_fetch(void) {
         s_days_http = esp_http_client_init(&cfg);
         if (!s_days_http) return false;
     } else {
-        esp_http_client_set_url(s_days_http, "/countdown");
+        esp_http_client_set_url(s_days_http, path);
     }
 
     char auth[96];
@@ -1187,16 +1209,21 @@ static bool days_fetch(void) {
     esp_err_t err = esp_http_client_perform(s_days_http);
     int status = esp_http_client_get_status_code(s_days_http);
     if (err != ESP_OK) {
-        ESP_LOGW(TAG, "days: %s (HTTP %d) - redial next time",
-                 esp_err_to_name(err), status);
+        ESP_LOGW(TAG, "days %.24s: %s (HTTP %d) - redial next time",
+                 path, esp_err_to_name(err), status);
         esp_http_client_close(s_days_http);
         return false;
     }
     if (status != 200 || s_days_rx.overflow) {
-        ESP_LOGW(TAG, "days: HTTP %d, response %s", status,
+        ESP_LOGW(TAG, "days %.24s: HTTP %d, response %s", path, status,
                  s_days_rx.overflow ? "too large" : "rejected");
         return false;
     }
+    return true;
+}
+
+static bool days_fetch(void) {
+    if (!days_http_get("/countdown")) return false;
 
     cJSON *root = cJSON_Parse(s_days_rx.data);
     cJSON *date = root ? cJSON_GetObjectItem(root, "d") : NULL;
@@ -1227,9 +1254,46 @@ static bool days_fetch(void) {
     return true;
 }
 
+static bool days_link_fetch(void) {
+    if (!days_http_get("/days/link")) return false;
+
+    cJSON *root = cJSON_Parse(s_days_rx.data);
+    cJSON *url = root ? cJSON_GetObjectItem(root, "authorization_url") : NULL;
+    cJSON *expires = root ? cJSON_GetObjectItem(root, "expires_in") : NULL;
+    const char *value = cJSON_IsString(url) ? url->valuestring : NULL;
+    size_t n = value ? strlen(value) : 0;
+    bool valid = value && strncmp(value, "https://", 8) == 0 &&
+                 n > 8 && n < DAYS_LINK_URL_MAX &&
+                 cJSON_IsNumber(expires) && expires->valueint > 0 &&
+                 expires->valueint <= 300;
+    if (valid) {
+        for (size_t i = 0; i < n; i++) {
+            unsigned char c = (unsigned char)value[i];
+            if (c < 0x21 || c > 0x7E) { valid = false; break; }
+        }
+    }
+    if (!valid) {
+        ESP_LOGW(TAG, "days: malformed secure-link response");
+        if (root) cJSON_Delete(root);
+        return false;
+    }
+
+    days_link_publish(value);
+    cJSON_Delete(root);
+    ESP_LOGI(TAG, "days: secure edit QR ready (%u B)", (unsigned)n);
+    return true;
+}
+
 static void days_service(void) {
     if (!s_wifi_up || ble_prov_active() || BROKER_URL[0] == '\0' ||
         BROKER_TOKEN[0] == '\0') return;
+
+    bool link = __atomic_exchange_n(&s_req_days_link, false, __ATOMIC_ACQ_REL);
+    if (link) {
+        __atomic_store_n(&s_days_link_fetching, true, __ATOMIC_RELEASE);
+        if (!days_link_fetch()) days_link_publish("");
+        __atomic_store_n(&s_days_link_fetching, false, __ATOMIC_RELEASE);
+    }
 
     int64_t t = now_ms();
     bool forced = __atomic_exchange_n(&s_req_days_fetch, false, __ATOMIC_ACQ_REL);
@@ -1270,7 +1334,8 @@ static void net_task(void *arg) {
          * instead of sitting until the next cycle. */
         int period = s_doze ? (10 * 60 * 1000) : HTTPS_PERIOD_MS;
         for (int w = 0; w < period / 100 && !s_req_wallpaper &&
-                        !__atomic_load_n(&s_req_days_fetch, __ATOMIC_ACQUIRE); w++) {
+                        !__atomic_load_n(&s_req_days_fetch, __ATOMIC_ACQUIRE) &&
+                        !__atomic_load_n(&s_req_days_link, __ATOMIC_ACQUIRE); w++) {
             vTaskDelay(pdMS_TO_TICKS(100));
         }
     }
@@ -5266,6 +5331,9 @@ static void pomo_poll(int64_t t) {
 static lv_obj_t *s_days_today, *s_days_time, *s_days_num, *s_days_unit;
 static lv_obj_t *s_days_bar, *s_days_start, *s_days_target;
 static lv_obj_t *s_days_card, *s_days_text, *s_days_sync;
+static lv_obj_t *s_days_qr_panel, *s_days_qr, *s_days_qr_note;
+static char s_days_link_drawn[DAYS_LINK_URL_MAX];
+static uint32_t s_days_link_seen_ver = UINT32_MAX;
 static uint32_t s_days_painted_ver = UINT32_MAX;
 static int s_days_painted_day = INT32_MIN;
 static int s_days_painted_minute = -1;
@@ -5424,16 +5492,58 @@ static void days_refresh(void) {
     }
     days_label_text(s_days_sync,
                     __atomic_load_n(&s_days_fetching, __ATOMIC_ACQUIRE) ? "SYNCING..." :
-                    (have_target ? "TAP TO REFRESH" : "SET IT AT /DAYS"));
+                    (have_target ? "TAP TO EDIT" : "TAP TO SET A DATE"));
 }
 
 static void days_timer_cb(lv_timer_t *timer) {
     (void)timer;
+    if (s_days_qr_panel && !lv_obj_has_flag(s_days_qr_panel, LV_OBJ_FLAG_HIDDEN)) {
+        char url[DAYS_LINK_URL_MAX];
+        uint32_t version;
+        days_link_snapshot(url, sizeof(url), &version);
+        bool fetching = __atomic_load_n(&s_days_link_fetching, __ATOMIC_ACQUIRE) ||
+                        __atomic_load_n(&s_req_days_link, __ATOMIC_ACQUIRE);
+        if (url[0] && s_days_qr &&
+            (version != s_days_link_seen_ver || strcmp(url, s_days_link_drawn) != 0)) {
+            size_t n = strlen(url);
+            if (lv_qrcode_update(s_days_qr, url, (uint32_t)n) == LV_RESULT_OK) {
+                snprintf(s_days_link_drawn, sizeof(s_days_link_drawn), "%s", url);
+                lv_obj_remove_flag(s_days_qr, LV_OBJ_FLAG_HIDDEN);
+                days_label_text(s_days_qr_note,
+                                "SCAN WITH YOUR PHONE\nLink expires in 5 minutes");
+            } else {
+                lv_obj_add_flag(s_days_qr, LV_OBJ_FLAG_HIDDEN);
+                days_label_text(s_days_qr_note, "QR ENCODE FAILED\nTap to close and retry");
+                ESP_LOGW(TAG, "days: edit QR encode failed (%u bytes)", (unsigned)n);
+            }
+            s_days_link_seen_ver = version;
+        } else if (!url[0]) {
+            lv_obj_add_flag(s_days_qr, LV_OBJ_FLAG_HIDDEN);
+            days_label_text(s_days_qr_note, fetching ? "CREATING SECURE LINK..." :
+                            "BROKER UNAVAILABLE\nTap to close and retry");
+            s_days_link_seen_ver = version;
+        }
+    }
     days_refresh();
 }
 
 static void days_tap_cb(lv_event_t *e) {
     (void)e;
+    if (!s_days_qr_panel) return;
+    days_link_publish("");
+    s_days_link_drawn[0] = '\0';
+    s_days_link_seen_ver = UINT32_MAX;
+    lv_obj_add_flag(s_days_qr, LV_OBJ_FLAG_HIDDEN);
+    days_label_text(s_days_qr_note, "CREATING SECURE LINK...");
+    lv_obj_remove_flag(s_days_qr_panel, LV_OBJ_FLAG_HIDDEN);
+    __atomic_store_n(&s_req_days_link, true, __ATOMIC_RELEASE);
+}
+
+static void days_qr_close_cb(lv_event_t *e) {
+    lv_event_stop_bubbling(e);
+    if (s_days_qr_panel) lv_obj_add_flag(s_days_qr_panel, LV_OBJ_FLAG_HIDDEN);
+    /* Saving happens on the phone. Closing the handoff is the user's explicit
+     * signal to fetch now, while the normal daily refresh remains unchanged. */
     __atomic_store_n(&s_req_days_fetch, true, __ATOMIC_RELEASE);
     days_label_text(s_days_sync, "SYNCING...");
 }
@@ -5544,11 +5654,58 @@ static void build_days_app(lv_obj_t *scr) {
     lv_label_set_text(s_days_sync, "SYNCING...");
     lv_obj_align(s_days_sync, LV_ALIGN_BOTTOM_MID, 0, -44);
 
+    /* Editing is a full-screen, user-bound handoff. The QR contains a five-
+     * minute one-time code, never BROKER_TOKEN; the phone exchanges it for a
+     * 30-minute bearer that the broker accepts only on this user's countdown. */
+    s_days_qr_panel = lv_obj_create(scr);
+    lv_obj_remove_style_all(s_days_qr_panel);
+    lv_obj_set_size(s_days_qr_panel, 480, 480);
+    lv_obj_center(s_days_qr_panel);
+    lv_obj_set_style_bg_color(s_days_qr_panel, lv_color_hex(0x05070B), 0);
+    lv_obj_set_style_bg_opa(s_days_qr_panel, LV_OPA_COVER, 0);
+    lv_obj_remove_flag(s_days_qr_panel, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(s_days_qr_panel, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_flag(s_days_qr_panel, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_event_cb(s_days_qr_panel, days_qr_close_cb, LV_EVENT_CLICKED, NULL);
+
+    lv_obj_t *title = lv_label_create(s_days_qr_panel);
+    lv_obj_set_style_text_font(title, &lv_font_montserrat_20, 0);
+    lv_obj_set_style_text_color(title, lv_color_hex(0x8B7CF6), 0);
+    lv_obj_set_style_text_letter_space(title, 2, 0);
+    lv_label_set_text(title, "EDIT DAYS");
+    lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 42);
+
+    s_days_qr = lv_qrcode_create(s_days_qr_panel);
+    lv_qrcode_set_size(s_days_qr, 228);
+    lv_qrcode_set_dark_color(s_days_qr, lv_color_hex(0x000000));
+    lv_qrcode_set_light_color(s_days_qr, lv_color_hex(0xFFFFFF));
+    lv_qrcode_set_quiet_zone(s_days_qr, true);
+    lv_obj_align(s_days_qr, LV_ALIGN_TOP_MID, 0, 92);
+    lv_obj_add_flag(s_days_qr, LV_OBJ_FLAG_HIDDEN);
+
+    s_days_qr_note = lv_label_create(s_days_qr_panel);
+    lv_obj_set_width(s_days_qr_note, 370);
+    lv_obj_set_style_text_font(s_days_qr_note, &hud_text_18, 0);
+    lv_obj_set_style_text_color(s_days_qr_note, lv_color_hex(0xC7D2E0), 0);
+    lv_obj_set_style_text_align(s_days_qr_note, LV_TEXT_ALIGN_CENTER, 0);
+    lv_label_set_long_mode(s_days_qr_note, LV_LABEL_LONG_WRAP);
+    lv_label_set_text(s_days_qr_note, "CREATING SECURE LINK...");
+    lv_obj_align(s_days_qr_note, LV_ALIGN_TOP_MID, 0, 348);
+
+    lv_obj_t *close = lv_label_create(s_days_qr_panel);
+    lv_obj_set_style_text_font(close, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(close, lv_color_hex(0x536176), 0);
+    lv_obj_set_style_text_letter_space(close, 2, 0);
+    lv_label_set_text(close, "TAP TO RETURN AND SYNC");
+    lv_obj_align(close, LV_ALIGN_BOTTOM_MID, 0, -38);
+
     s_days_painted_ver = UINT32_MAX;
     s_days_painted_day = INT32_MIN;
     s_days_painted_minute = -1;
     s_days_painted_progress = -1;
     s_days_painted_accent = 0;
+    s_days_link_drawn[0] = '\0';
+    s_days_link_seen_ver = UINT32_MAX;
     __atomic_store_n(&s_req_days_fetch, true, __ATOMIC_RELEASE);
     days_refresh();                         /* cached value, before the GET */
     s_app_timer = lv_timer_create(days_timer_cb, 1000, NULL);
@@ -5715,6 +5872,12 @@ static volatile int s_sp_transfer_idx = -1;
 
 static char s_sp_access[320];
 static int64_t s_sp_expires_ms;         /* when the access token dies */
+/* The broker owns refresh tokens now. When it has none (fresh install, erased
+ * volume, or Spotify revoked the grant), /spotify/token returns the one-time
+ * URL the MUSIC screen encodes. Fixed buffers follow the same task/UI contract
+ * as track and artist above: a torn read can repaint stale text, never a pointer. */
+static char s_sp_pair_url[256];
+static int64_t s_sp_token_retry_ms;
 
 static QueueHandle_t s_sp_q;
 static esp_http_client_handle_t s_sp_http;
@@ -5805,10 +5968,9 @@ static esp_err_t sp_evt(esp_http_client_event_t *e) {
     return ESP_OK;
 }
 
-/* Refresh the access token. No client secret: this is a PKCE public client, and
- * Spotify returns no new refresh token for this grant, so the stored one keeps
- * working and never has to be re-persisted. */
-static bool sp_refresh_token(void) {
+/* Legacy single-user token refresh. Kept only for a brokerless deployment; when
+ * a broker is configured the firmware never reads the compiled refresh token. */
+static bool sp_refresh_legacy(void) {
     if (SPOTIFY_REFRESH_TOKEN[0] == '\0' || SPOTIFY_CLIENT_ID[0] == '\0') return false;
 
     char *body = heap_caps_malloc(1024, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
@@ -5853,14 +6015,78 @@ static bool sp_refresh_token(void) {
         esp_http_client_cleanup(c);
     }
     free(body);
-    s_sp_authfail = !ok;
     return ok;
 }
+
+/* Ask the broker for this cube's short-lived access token. Its bearer is also
+ * the user identity: the broker maps unique bearers to isolated refresh-token
+ * records, so neither a username nor a Spotify credential travels in the URL. */
+static bool sp_refresh_broker(bool force) {
+    char path[40];
+    snprintf(path, sizeof(path), "/spotify/token%s", force ? "?force=1" : "");
+    size_t got = 0;
+    bool fetched = broker_fetch(path, NULL, NULL, (uint8_t *)s_sp_body,
+                                SP_BODY_MAX, &got);
+    s_sp_len = (int)got;
+    if (s_sp_body) s_sp_body[got < SP_BODY_MAX ? got : SP_BODY_MAX - 1] = '\0';
+
+    if (fetched && s_brk_status == 200 && got > 0) {
+        cJSON *j = cJSON_Parse(s_sp_body);
+        if (j) {
+            cJSON *at = cJSON_GetObjectItem(j, "access_token");
+            cJSON *ex = cJSON_GetObjectItem(j, "expires_in");
+            if (cJSON_IsString(at)) {
+                snprintf(s_sp_access, sizeof(s_sp_access), "%s", at->valuestring);
+                int secs = cJSON_IsNumber(ex) ? ex->valueint : 3600;
+                s_sp_expires_ms = now_ms() + (int64_t)secs * 1000;
+                s_sp_pair_url[0] = '\0';
+                cJSON_Delete(j);
+                ESP_LOGI(TAG, "spotify: broker token valid %d s", secs);
+                return true;
+            }
+            cJSON_Delete(j);
+        }
+        ESP_LOGW(TAG, "spotify: broker token response malformed");
+        return false;
+    }
+
+    if (s_brk_status == 428 && got > 0) {
+        cJSON *j = cJSON_Parse(s_sp_body);
+        if (j) {
+            cJSON *u = cJSON_GetObjectItem(j, "authorization_url");
+            if (cJSON_IsString(u)) {
+                snprintf(s_sp_pair_url, sizeof(s_sp_pair_url), "%s", u->valuestring);
+                ESP_LOGI(TAG, "spotify: authorisation required");
+            }
+            cJSON_Delete(j);
+        }
+    } else if (s_brk_status == 401) {
+        /* A QR cannot fix a broker bearer mismatch. Do not leave an older,
+         * expired pairing URL on-screen and imply that it can. */
+        s_sp_pair_url[0] = '\0';
+        ESP_LOGE(TAG, "spotify: broker rejected BROKER_TOKEN");
+    } else {
+        ESP_LOGW(TAG, "spotify: broker token failed, HTTP %d", s_brk_status);
+    }
+    return false;
+}
+
+static bool sp_refresh_token_force(bool force) {
+    bool ok;
+    if (BROKER_URL[0] && BROKER_TOKEN[0]) ok = sp_refresh_broker(force);
+    else                                 ok = sp_refresh_legacy();
+    s_sp_authfail = !ok;
+    s_sp_token_retry_ms = ok ? 0 : now_ms() + 5000;
+    return ok;
+}
+
+static bool sp_refresh_token(void) { return sp_refresh_token_force(false); }
 
 static bool sp_token_ok(void) {
     /* Refresh early rather than discovering expiry via a 401: that path leaves
      * the socket undrained (HARDWARE.md 7f) and costs a reconnect. */
     if (s_sp_access[0] && now_ms() < s_sp_expires_ms - 120000) return true;
+    if (s_sp_token_retry_ms && now_ms() < s_sp_token_retry_ms) return false;
     return sp_refresh_token();
 }
 
@@ -5911,7 +6137,7 @@ static int sp_call(esp_http_client_method_t method, const char *path, const char
          * the socket has unread bytes. Flush before reusing, then retry once. */
         esp_http_client_flush_response(s_sp_http, NULL);
         s_sp_access[0] = '\0';
-        if (sp_refresh_token()) {
+        if (sp_refresh_token_force(true)) {
             snprintf(auth, sizeof(auth), "Bearer %s", s_sp_access);
             esp_http_client_set_header(s_sp_http, "Authorization", auth);
             s_sp_len = 0;
@@ -6659,6 +6885,8 @@ static bool s_sp_chrome;          /* secondary controls shown? hidden by default
 static int32_t s_sp_chrome_p;     /* 0 = immersive, SP_CHROME_FULL = chrome */
 static int64_t s_sp_chrome_at;    /* when last shown, for the auto-hide */
 static lv_obj_t *s_sp_devpanel, *s_sp_devlist;
+static lv_obj_t *s_sp_pair_panel, *s_sp_pair_qr;
+static char s_sp_pair_drawn[256];
 static lv_obj_t *s_sp_scr;      /* the MUSIC screen, for the accent backdrop */
 static uint32_t s_sp_bg_drawn;  /* last backdrop colour, 0 = unset */
 
@@ -7083,7 +7311,8 @@ static void sp_vol_mute_toggle(void) {
 static bool sp_keys(btn_ev_t kleft, btn_ev_t kright, bool pwr) {
     /* The device picker keeps the global bindings. Volume there would leave the
      * sub-scene with no way to pop, and the only exit would be leaving the app. */
-    if (!s_sp_devpanel || !lv_obj_has_flag(s_sp_devpanel, LV_OBJ_FLAG_HIDDEN)) return false;
+    if (!s_sp_devpanel || !lv_obj_has_flag(s_sp_devpanel, LV_OBJ_FLAG_HIDDEN) ||
+        (s_sp_pair_panel && !lv_obj_has_flag(s_sp_pair_panel, LV_OBJ_FLAG_HIDDEN))) return false;
 
     /* Left raises, right lowers. This deliberately contradicts the silkscreen —
      * the board labels the leftmost key "minus" and the rightmost "plus" — because
@@ -7103,9 +7332,25 @@ static bool sp_keys(btn_ev_t kleft, btn_ev_t kright, bool pwr) {
 static void sp_timer_cb(lv_timer_t *t) {
     if (!s_sp_lbl_track) return;
 
+    bool show_pair = s_sp_authfail && s_sp_pair_url[0] != '\0';
+    if (s_sp_pair_panel) {
+        bool hidden = lv_obj_has_flag(s_sp_pair_panel, LV_OBJ_FLAG_HIDDEN);
+        if (show_pair && hidden) lv_obj_remove_flag(s_sp_pair_panel, LV_OBJ_FLAG_HIDDEN);
+        if (!show_pair && !hidden) lv_obj_add_flag(s_sp_pair_panel, LV_OBJ_FLAG_HIDDEN);
+    }
+    if (show_pair && s_sp_pair_qr && strcmp(s_sp_pair_drawn, s_sp_pair_url) != 0) {
+        size_t n = strlen(s_sp_pair_url);
+        if (lv_qrcode_update(s_sp_pair_qr, s_sp_pair_url, (uint32_t)n) == LV_RESULT_OK) {
+            snprintf(s_sp_pair_drawn, sizeof(s_sp_pair_drawn), "%s", s_sp_pair_url);
+        } else {
+            ESP_LOGW(TAG, "spotify: pairing QR encode failed (%u bytes)", (unsigned)n);
+        }
+    }
+
     if (s_sp_authfail) {
         label_set_changed(s_sp_lbl_track, "not authorised");
-        label_set_changed(s_sp_lbl_artist, "check SPOTIFY_REFRESH_TOKEN");
+        label_set_changed(s_sp_lbl_artist,
+                          s_sp_pair_url[0] ? "scan to connect" : "broker unavailable");
     } else if (!s_sp_have_state) {
         label_set_changed(s_sp_lbl_track, "nothing playing");
         label_set_changed(s_sp_lbl_artist, "pick a device to start");
@@ -7469,6 +7714,42 @@ static void build_music_app(lv_obj_t *scr) {
      * letting it bubble would close the picker out from under the finger. */
     lv_obj_remove_flag(s_sp_devlist, LV_OBJ_FLAG_GESTURE_BUBBLE);
 
+    /* Reauthorisation is a full scene, not a tiny QR squeezed into the player.
+     * It appears only when the authenticated broker says this user's stored
+     * refresh token is absent or revoked. The phone then owns login, consent and
+     * any Spotify 2FA; the cube only has to show an unambiguous handoff. */
+    s_sp_pair_panel = lv_obj_create(scr);
+    lv_obj_remove_style_all(s_sp_pair_panel);
+    lv_obj_set_size(s_sp_pair_panel, 480, 480);
+    lv_obj_center(s_sp_pair_panel);
+    lv_obj_set_style_bg_color(s_sp_pair_panel, lv_color_hex(0x05070B), 0);
+    lv_obj_set_style_bg_opa(s_sp_pair_panel, LV_OPA_COVER, 0);
+    lv_obj_remove_flag(s_sp_pair_panel, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(s_sp_pair_panel, LV_OBJ_FLAG_HIDDEN);
+
+    lv_obj_t *pt = lv_label_create(s_sp_pair_panel);
+    lv_obj_set_style_text_font(pt, &lv_font_montserrat_20, 0);
+    lv_obj_set_style_text_color(pt, lv_color_hex(0x1DB954), 0);
+    lv_obj_set_style_text_letter_space(pt, 2, 0);
+    lv_label_set_text(pt, "CONNECT SPOTIFY");
+    lv_obj_align(pt, LV_ALIGN_TOP_MID, 0, 42);
+
+    s_sp_pair_qr = lv_qrcode_create(s_sp_pair_panel);
+    lv_qrcode_set_size(s_sp_pair_qr, 228);
+    lv_qrcode_set_dark_color(s_sp_pair_qr, lv_color_hex(0x000000));
+    lv_qrcode_set_light_color(s_sp_pair_qr, lv_color_hex(0xFFFFFF));
+    lv_qrcode_set_quiet_zone(s_sp_pair_qr, true);
+    lv_obj_align(s_sp_pair_qr, LV_ALIGN_TOP_MID, 0, 92);
+
+    lv_obj_t *ps = lv_label_create(s_sp_pair_panel);
+    lv_obj_set_width(ps, 360);
+    lv_obj_set_style_text_font(ps, &hud_text_18, 0);
+    lv_obj_set_style_text_color(ps, lv_color_hex(0xC7D2E0), 0);
+    lv_obj_set_style_text_align(ps, LV_TEXT_ALIGN_CENTER, 0);
+    lv_label_set_long_mode(ps, LV_LABEL_LONG_WRAP);
+    lv_label_set_text(ps, "SCAN WITH YOUR PHONE\nSpotify handles login and 2FA");
+    lv_obj_align(ps, LV_ALIGN_TOP_MID, 0, 348);
+
     lv_obj_add_event_cb(scr, sp_gesture_cb, LV_EVENT_GESTURE, NULL);
     /* Buttons consume their own clicks, so this only ever sees the background or
      * the cover — exactly the "tap to toggle" surface we want. */
@@ -7492,6 +7773,7 @@ static void build_music_app(lv_obj_t *scr) {
     s_sp_devlit = -1;
     s_sp_vol_painted = -1;   /* draw the gauge once on open, not only on change */
     s_sp_art_shown[0] = '\0';
+    s_sp_pair_drawn[0] = '\0';
     sp_send(SP_CMD_POLL);
     sp_send(SP_CMD_DEVICES);
     s_app_timer = lv_timer_create(sp_timer_cb, 400, NULL);
@@ -7909,6 +8191,7 @@ static esp_http_client_handle_t s_brk_http;
 static bool broker_fetch(const char *path, const char *xname, const char *xval,
                          uint8_t *buf, size_t cap, size_t *out_len) {
     s_dl_total = 0; s_dl_got = 0; s_dl_pct = 0; s_dl_kb = 0; s_dl_accent = 0;
+    s_brk_status = 0;
     s_dl_mem = buf; s_dl_mem_cap = cap; s_dl_mem_len = 0;
 
     if (!s_brk_http) {
@@ -7938,9 +8221,11 @@ static bool broker_fetch(const char *path, const char *xname, const char *xval,
     esp_http_client_set_header(s_brk_http, "Authorization", auth);
     esp_http_client_set_method(s_brk_http, HTTP_METHOD_GET);
     if (xname && xval && xval[0]) esp_http_client_set_header(s_brk_http, xname, xval);
+    else esp_http_client_delete_header(s_brk_http, "X-Spotify-Token");
 
     esp_err_t err = esp_http_client_perform(s_brk_http);
     int status = esp_http_client_get_status_code(s_brk_http);
+    s_brk_status = status;
     bool ok = (err == ESP_OK && status == 200);
 
     /* A dead socket is never retried into — perform() will not redial on its own,
@@ -9166,6 +9451,16 @@ static bool app_back(void) {
         }
         return false;
     }
+    if (s_app == APP_DAYS && s_days_qr_panel &&
+        !lv_obj_has_flag(s_days_qr_panel, LV_OBJ_FLAG_HIDDEN)) {
+        if (ui_lock()) {
+            lv_obj_add_flag(s_days_qr_panel, LV_OBJ_FLAG_HIDDEN);
+            __atomic_store_n(&s_req_days_fetch, true, __ATOMIC_RELEASE);
+            days_label_text(s_days_sync, "SYNCING...");
+            bsp_display_unlock();
+        }
+        return true;
+    }
     return false;
 }
 
@@ -9275,6 +9570,7 @@ static void app_open(int idx) {
     s_sp_art = NULL; s_sp_art_ph = NULL; s_sp_lbl_track = NULL;
     s_sp_lbl_artist = NULL; s_sp_btn_play_lbl = NULL; s_sp_btn_shuf = NULL;
     s_sp_btn_dev = NULL; s_sp_devpanel = NULL; s_sp_devlist = NULL;
+    s_sp_pair_panel = NULL; s_sp_pair_qr = NULL; s_sp_pair_drawn[0] = '\0';
     s_sp_btn_prev = NULL; s_sp_btn_next = NULL; s_sp_btn_like = NULL;
     s_sp_vol_bar = NULL; s_sp_vol_icon = NULL;
     /* s_sp_spin was added without a row here and dangled after MUSIC closed —
@@ -9293,7 +9589,8 @@ static void app_open(int idx) {
     s_days_today = NULL; s_days_time = NULL; s_days_num = NULL;
     s_days_unit = NULL; s_days_bar = NULL; s_days_start = NULL;
     s_days_target = NULL; s_days_card = NULL; s_days_text = NULL;
-    s_days_sync = NULL;
+    s_days_sync = NULL; s_days_qr_panel = NULL; s_days_qr = NULL;
+    s_days_qr_note = NULL; s_days_link_drawn[0] = '\0';
     lock_snapshot_clear();
     s_lock_time = NULL; s_lock_date = NULL; s_lock_meridiem = NULL;
     s_lock_batt = NULL;

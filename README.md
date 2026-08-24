@@ -36,7 +36,7 @@ and not PSRAM, is what decides whether a feature fits. Facet is built around it:
 | **CONTROL** | Settings and diagnostics in one scrolling column of cards: wallpaper pool, manual DAYS refresh, rotation calibration, battery and drain rate, network, system counters | Fetch a new wallpaper |
 | **MUSIC** | A direct Spotify remote with cover art, queue lookahead, device transfer and volume controls | Play / pause |
 | **FOCUS** | A Pomodoro timer you drive by turning the cube. Rotate to pick 60/30/10/5 and start; lay it flat to pause | Cancel the session |
-| **DAYS** | A minimal countdown: today, time, days remaining, message and a colour-changing progress bar. Edit it from the broker's `/days` page. | Refresh now |
+| **DAYS** | A local-first countdown with a colour-changing progress bar. Tap it for a secure, one-time QR that opens your own phone editor. | Refresh now |
 
 Sound is authored, not sampled — see
 [assets/sounds/CREDITS.md](assets/sounds/CREDITS.md).
@@ -109,6 +109,9 @@ All of it lives in `.env`:
 | `NTP_SERVER` | Defaults to `pool.ntp.org` |
 | `UNSPLASH_KEY` | Unsplash **Access Key** only. Leave empty to disable wallpapers. |
 | `UNSPLASH_QUERY` | Wallpaper themes separated by `;`, one picked at random per download |
+| `BROKER_URL` | Public Facet broker origin; required for multi-user Spotify login |
+| `BROKER_TOKEN` | Unique bearer for this cube; must match exactly one server `BROKER_USERS` entry |
+| `SPOTIFY_CLIENT_ID` / `SPOTIFY_REFRESH_TOKEN` | Legacy brokerless mode only; leave empty with a broker |
 
 Only the Unsplash Access Key belongs on the device — public read endpoints use
 Client-ID auth. The Secret Key is for OAuth flows Facet does not use, so it

@@ -50,10 +50,7 @@ func (b *broker) handleProvision(w http.ResponseWriter, r *http.Request) {
 	// pairing bug rather than a caching one.
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-store")
-	w.Header().Set("X-Content-Type-Options", "nosniff")
-	// It is served over Funnel, i.e. the public internet. Nothing here should
-	// ever be framed by another origin.
-	w.Header().Set("X-Frame-Options", "DENY")
+	setHTMLCSP(w, data, false)
 
 	http.ServeContent(w, r, "provision.html", time.Time{}, bytes.NewReader(data))
 }

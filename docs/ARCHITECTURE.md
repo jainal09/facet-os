@@ -332,11 +332,20 @@ an AMOLED.
 ## DAYS: remote editing, local-first display
 
 The editor lives at the broker's `/days` page because a native date picker and
-real keyboard are better tools than a 480 px touch panel. The page sends an
-authenticated date and 48-character message to `/countdown`; the server stores
-one small JSON document with temp-file-plus-rename replacement. The public page
-contains no saved state and every state read or write still requires the device
-bearer.
+real keyboard are better tools than a 480 px touch panel. Tapping the DAYS
+screen requests `/days/link` with the cube's permanent bearer and draws the
+returned HTTPS URL as a full-screen QR. The URL carries only a 144-bit,
+user-bound, single-use code with a hard five-minute TTL. The browser removes the
+code from its visible URL/history, exchanges it at `/days/session`, and keeps
+the resulting 256-bit, 30-minute bearer only in tab memory. That bearer is
+accepted only by `/countdown`; it cannot access Spotify, art, queues, or mint
+another QR. The permanent cube bearer never enters the URL or browser.
+
+The page sends the authenticated date and 48-character message to `/countdown`;
+the server stores one small per-user JSON document with temp-file-plus-rename
+replacement. Closing the QR scene queues an immediate cube refresh. The public
+page contains no saved state, and opening `/days` directly instructs the user to
+start from their cube.
 
 The cube loads its own fixed-size DAYS blob from the app store at boot, so
 opening the tile never waits for the network. A dedicated HTTP client in the
@@ -359,17 +368,34 @@ The cube never plays the audio. It drives whichever Spotify endpoint is active �
 phone, laptop, speaker — which is why it can be useful without a decent speaker
 of its own.
 
-**Direct to Spotify for everything interactive; the broker only where it earns
-its place.** Control, state and the device list go straight to `api.spotify.com`
-at 6 ms warm (see [HARDWARE.md §7f](HARDWARE.md)). The broker in [`broker/`](../broker)
-is touched for exactly two things — one-time pairing, and album art — so it is
-not a dependency of daily use:
+**Direct to Spotify for everything interactive; user-scoped tokens from the
+broker.** Control, state and the device list go straight to `api.spotify.com` at
+6 ms warm (see [HARDWARE.md §7f](HARDWARE.md)). Each cube has a unique broker
+bearer that selects one isolated user record. The broker persists that user's
+Spotify refresh token and returns only a short-lived access token; it is also
+used for pairing, album art, queue compaction, and renewing that token roughly
+once an hour.
 
 | Broker down | Result |
 |---|---|
-| Controls, state, device list | Unaffected |
+| Controls, state, device list | Work until the current access token expires |
 | Album art | Last cached art, or the placeholder |
-| First-time pairing | Blocked, but that is a one-off |
+| Pairing or token renewal | Blocked until the broker returns |
+
+**Reauthorisation is a recoverable UI state.** If the broker volume is fresh,
+its credential was erased, or Spotify rejects the refresh grant, authenticated
+`GET /spotify/token` returns `428` with a random, five-minute authorization URL.
+MUSIC covers the player with a high-contrast QR. The phone opens the ordinary
+Spotify authorization flow, so Spotify owns password entry, consent, and any
+2FA; the callback atomically stores the new refresh token under that bearer.
+The cube polls again, receives an access token, and removes the QR. A transient
+Spotify or broker error does not erase a valid stored credential or force login.
+
+The broker's `BROKER_USERS` map is the tenancy boundary: labels exist only in
+server configuration and unique bearer tokens identify cubes on the wire. No
+request accepts a user ID that could be changed to read another account. DAYS
+uses the same identity to keep its persisted countdown per user. The legacy
+single `BROKER_TOKEN` remains as a one-user migration mode named `default`.
 
 **One task, one HTTP handle, one command queue.** `esp_http_client` handles carry
 no lock and mutate in place, so the handle is confined to the `spotify` task

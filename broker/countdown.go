@@ -2,8 +2,9 @@
 // laptop at /days and read by the cube at /countdown.
 //
 // The web page is inert markup, unauthenticated for the same reason /provision
-// is — it holds no secret. Every read or write of the actual state goes through
-// the device bearer, which the page asks for once and keeps in localStorage.
+// is — it holds no secret. A cube-minted, single-use QR link gives the page a
+// short-lived bearer scoped only to this user's countdown. The permanent cube
+// bearer never enters the URL or browser.
 // The state itself is one tiny JSON file in the cache directory, written with
 // the same temp-and-rename discipline as the art cache, so a killed process
 // cannot leave a half-written file that later parses as garbage.
@@ -30,8 +31,15 @@ type countdown struct {
 	Set  string `json:"set"` // when it was last saved, YYYY-MM-DD
 }
 
-func (b *broker) countdownPath() string {
-	return filepath.Join(b.cfg.cacheDir, "countdown.json")
+func (b *broker) countdownPath(user string) string {
+	// Preserve the original filename for a legacy single-user deployment. Named
+	// users get separate files so adding Spotify tenants cannot quietly expose or
+	// overwrite another cube's DAYS state through the same bearer boundary.
+	name := "countdown.json"
+	if user != "default" {
+		name = "countdown-" + user + ".json"
+	}
+	return filepath.Join(b.cfg.cacheDir, name)
 }
 
 // asciiFold reduces the text to the printable ASCII the cube's fonts can draw.
@@ -63,7 +71,9 @@ func asciiFold(s string, max int) string {
 // the page (POST). One-letter keys on the wire out, for the same reason
 // queue.go uses them: every byte of key name is internal SRAM during the parse.
 func (b *broker) handleCountdown(w http.ResponseWriter, r *http.Request) {
-	if !b.authed(r) {
+	w.Header().Set("Cache-Control", "no-store")
+	user, ok := b.authenticateCountdown(r)
+	if !ok {
 		http.Error(w, "unauthorised", http.StatusUnauthorized)
 		return
 	}
@@ -71,10 +81,9 @@ func (b *broker) handleCountdown(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case http.MethodGet:
 		var c countdown
-		if data, err := os.ReadFile(b.countdownPath()); err == nil {
+		if data, err := os.ReadFile(b.countdownPath(user)); err == nil {
 			_ = json.Unmarshal(data, &c) // a corrupt file reads as unset, not an error
 		}
-		w.Header().Set("Cache-Control", "no-store")
 		writeJSON(w, http.StatusOK, map[string]string{"d": c.Date, "t": c.Text, "s": c.Set})
 
 	case http.MethodPost, http.MethodPut:
@@ -96,7 +105,7 @@ func (b *broker) handleCountdown(w http.ResponseWriter, r *http.Request) {
 			Set:  time.Now().UTC().Format("2006-01-02"),
 		}
 		data, _ := json.Marshal(c)
-		path := b.countdownPath()
+		path := b.countdownPath(user)
 		tmp, err := os.CreateTemp(filepath.Dir(path), ".countdown-*.part")
 		if err != nil {
 			http.Error(w, "store", http.StatusInternalServerError)
@@ -117,7 +126,6 @@ func (b *broker) handleCountdown(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "store", http.StatusInternalServerError)
 			return
 		}
-		w.Header().Set("Cache-Control", "no-store")
 		writeJSON(w, http.StatusOK, map[string]string{"d": c.Date, "t": c.Text, "s": c.Set})
 
 	default:
@@ -132,6 +140,7 @@ func (b *broker) handleDaysPage(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-store")
+	setHTMLCSP(w, daysPage, true)
 	if r.Method == http.MethodHead {
 		return
 	}

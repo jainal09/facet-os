@@ -3,6 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; base-uri 'none'; form-action 'none'; style-src 'sha256-7Xz3DdFl+UUuH4FYfbCIj0TiWbxoDPYggvJ/msnp4Yw='; script-src 'sha256-3McNxP8Y28yZQdSrEmi7hyB+f05ydgHf7wz5uTsXldc='; connect-src 'self'; require-trusted-types-for 'script'; trusted-types 'none'">
 <title>Facet · Days Until</title>
 <style>
   :root {
@@ -43,6 +44,8 @@
     letter-spacing: 3px; cursor: pointer;
   }
   button:active { transform: translateY(1px); }
+  button:disabled, input:disabled { opacity: .45; cursor: not-allowed; }
+  #intro { text-align: center; font-size: 12px; letter-spacing: 2px; color: var(--dim); margin: 20px 0 4px; }
   #msg { text-align: center; font-size: 12px; letter-spacing: 2px; color: var(--dim); margin-top: 14px; min-height: 18px; }
   #msg.ok { color: #35c759; }
   #msg.err { color: #ff453a; }
@@ -61,17 +64,14 @@
          autocomplete="off" spellcheck="false">
   <div class="count"><span id="c">0</span>/48</div>
 
-  <label for="k">DEVICE KEY</label>
-  <input id="k" type="password" placeholder="the broker bearer" autocomplete="off">
-
-  <button id="save">SAVE TO CUBE</button>
+  <div id="intro">SCAN THE QR ON YOUR CUBE TO CONNECT</div>
+  <button id="save" type="button" disabled>SAVE TO CUBE</button>
   <div id="msg"></div>
 </div>
 
 <script>
   const $ = id => document.getElementById(id);
-  const KEY = 'facet_days_key';
-  $('k').value = localStorage.getItem(KEY) || '';
+  let accessToken = '';
 
   function days() {
     if (!$('d').value) return null;
@@ -90,36 +90,57 @@
   ['d', 't'].forEach(id => $(id).addEventListener('input', preview));
 
   function msg(text, cls) { const m = $('msg'); m.textContent = text; m.className = cls || ''; }
+  function enabled(on) {
+    $('d').disabled = !on; $('t').disabled = !on; $('save').disabled = !on;
+    $('intro').textContent = on ? 'SECURE SESSION CONNECTED' : 'SCAN THE QR ON YOUR CUBE TO CONNECT';
+  }
 
   async function load() {
-    const key = $('k').value.trim();
-    if (!key) { msg('ENTER THE KEY TO LOAD / SAVE'); return; }
     try {
-      const r = await fetch('/countdown', { headers: { Authorization: 'Bearer ' + key } });
-      if (r.status === 401) { msg('WRONG KEY', 'err'); return; }
+      const r = await fetch('/countdown', { headers: { Authorization: 'Bearer ' + accessToken } });
+      if (r.status === 401) { accessToken = ''; enabled(false); msg('SESSION EXPIRED - SCAN A NEW QR', 'err'); return; }
+      if (!r.ok) { msg('LOAD FAILED (' + r.status + ')', 'err'); return; }
       const j = await r.json();
-      if (j.d) { $('d').value = j.d; $('t').value = j.t || ''; preview(); msg('LOADED', 'ok'); }
+      if (j.d) { $('d').value = j.d; $('t').value = j.t || ''; }
+      preview(); msg(j.d ? 'LOADED FROM YOUR CUBE' : 'CONNECTED - PICK A DATE', 'ok');
+    } catch { msg('BROKER UNREACHABLE', 'err'); }
+  }
+
+  async function connect() {
+    const code = new URLSearchParams(location.search).get('c') || '';
+    history.replaceState(null, '', '/days');
+    enabled(false);
+    if (!code) { msg('OPEN DAYS ON THE CUBE AND SCAN ITS QR'); return; }
+    try {
+      const r = await fetch('/days/session', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ code })
+      });
+      if (!r.ok) { msg('LINK EXPIRED OR ALREADY USED - SCAN A NEW QR', 'err'); return; }
+      const j = await r.json();
+      if (!j.access_token) { msg('BROKER RETURNED AN INVALID SESSION', 'err'); return; }
+      accessToken = j.access_token;
+      enabled(true);
+      await load();
     } catch { msg('BROKER UNREACHABLE', 'err'); }
   }
 
   $('save').addEventListener('click', async () => {
-    const key = $('k').value.trim();
-    if (!key) { msg('ENTER THE DEVICE KEY', 'err'); return; }
+    if (!accessToken) { msg('SESSION EXPIRED - SCAN A NEW QR', 'err'); return; }
     if (!$('d').value) { msg('PICK A DATE', 'err'); return; }
-    localStorage.setItem(KEY, key);
     try {
       const r = await fetch('/countdown', {
         method: 'POST',
-        headers: { Authorization: 'Bearer ' + key, 'Content-Type': 'application/json' },
+        headers: { Authorization: 'Bearer ' + accessToken, 'Content-Type': 'application/json' },
         body: JSON.stringify({ d: $('d').value, t: $('t').value })
       });
-      if (r.ok) msg('SAVED - THE CUBE PICKS IT UP ON ITS NEXT FETCH', 'ok');
-      else if (r.status === 401) msg('WRONG KEY', 'err');
+      if (r.ok) msg('SAVED - TAP THE QR SCREEN TO RETURN AND SYNC', 'ok');
+      else if (r.status === 401) { accessToken = ''; enabled(false); msg('SESSION EXPIRED - SCAN A NEW QR', 'err'); }
       else msg('SAVE FAILED (' + r.status + ')', 'err');
     } catch { msg('BROKER UNREACHABLE', 'err'); }
   });
 
-  if ($('k').value) load();
+  connect();
 </script>
 </body>
 </html>

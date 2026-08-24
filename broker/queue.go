@@ -16,7 +16,7 @@ package main
 
 import (
 	"encoding/json"
-	"fmt"
+	"io"
 	"net/http"
 	"strconv"
 )
@@ -53,11 +53,15 @@ type queueItem struct {
 	Art    string `json:"u"`
 }
 
-// handleQueue proxies the caller's own Spotify token; the broker holds no token
-// of its own. Pairing deliberately hands the refresh token to the device and
-// forgets it, and that stays true — this borrows an access token for the length
-// of one request, over TLS, behind the same bearer that guards /art.
+// handleQueue proxies the caller's short-lived Spotify access token. The broker
+// does hold the matching refresh token now, but this endpoint still borrows the
+// access token for one request so queue work stays on the same token generation
+// as the cube's direct interactive calls.
 func (b *broker) handleQueue(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
 	if !b.authed(r) {
 		http.Error(w, "unauthorised", http.StatusUnauthorized)
 		return
@@ -108,7 +112,7 @@ func (b *broker) handleQueue(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var sq spotifyQueue
-	if err := json.NewDecoder(resp.Body).Decode(&sq); err != nil {
+	if err := json.NewDecoder(io.LimitReader(resp.Body, 2<<20)).Decode(&sq); err != nil {
 		http.Error(w, "decode", http.StatusBadGateway)
 		return
 	}
@@ -148,5 +152,3 @@ func pickImage(imgs []struct {
 	}
 	return best
 }
-
-var _ = fmt.Sprintf // keep fmt available for future error detail

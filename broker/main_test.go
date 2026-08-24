@@ -87,8 +87,8 @@ func TestArtHostAllowlistRejectsEverythingElse(t *testing.T) {
 }
 
 func TestValidPairCode(t *testing.T) {
-	good := []string{"A7F3", "ABCD1234", "0000"}
-	bad := []string{"", "abc", "A7", "A7F3!", "../../etc/passwd", "a7f3"}
+	good := []string{"0123456789ABCDEF0123456789ABCDEF"}
+	bad := []string{"", "A7F3", "ABCD1234", "../../etc/passwd", "a7f30123456789abcdef0123456789ab", "0123456789ABCDEF0123456789ABCDE!", "0123456789ABCDEF0123456789ABCDEF0"}
 	for _, s := range good {
 		if !validPairCode(s) {
 			t.Errorf("%q should be valid", s)

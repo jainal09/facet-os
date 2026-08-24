@@ -3,12 +3,10 @@
 // It exists only where a server genuinely buys something, and deliberately
 // stays out of the interactive path for everything else:
 //
-//  1. Pairing. Spotify's OAuth needs an HTTPS redirect target, and it does not
-//     offer the device-code flow that would let a screen with no keyboard pair
-//     on its own. So something reachable over HTTPS has to catch the callback.
-//     Once paired, the cube holds a refresh token and talks straight to
-//     api.spotify.com — this service can be down and playback control still
-//     works.
+//  1. Pairing and token custody. Spotify's OAuth needs an HTTPS redirect target.
+//     Each cube authenticates as one broker user; the broker persists that user's
+//     refresh token and leases short-lived access tokens back to firmware. The
+//     cube still talks straight to api.spotify.com for interactive control.
 //
 //  2. Album art. The firmware can only decode *baseline* JPEG, and its baseline
 //     decoder never populates LVGL's image cache, so a stock Spotify image is
@@ -22,11 +20,13 @@
 //
 // Deployed behind Tailscale Funnel, which means it is on the public internet.
 // Everything below is written with that in mind: no open image proxy, no
-// unauthenticated token store, single-use pair codes with a short TTL.
+// unauthenticated token store, user isolation, single-use pair codes with a
+// short TTL.
 package main
 
 import (
 	"bytes"
+	"context"
 	"crypto/rand"
 	"crypto/sha256"
 	"crypto/subtle"
@@ -37,6 +37,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"html/template"
 	"image"
 	"image/jpeg"
 	"io"
@@ -65,10 +66,12 @@ const (
 	spotifyScopes = "user-read-playback-state user-modify-playback-state " +
 		"user-library-read user-library-modify"
 
-	pairTTL     = 5 * time.Minute
-	artMaxSize  = 640
-	artMinSize  = 64
-	artMaxBytes = 8 << 20 // refuse absurd upstream images
+	pairTTL         = 5 * time.Minute
+	artMaxSize      = 640
+	artMinSize      = 64
+	artMaxBytes     = 8 << 20 // refuse absurd upstream images
+	artMaxPixels    = 16 << 20
+	artMaxDimension = 4096
 )
 
 // artHostAllow is an allowlist, not a filter. Funnel makes this endpoint public,
@@ -87,54 +90,92 @@ type config struct {
 	clientID     string
 	clientSecret string // optional; PKCE works without it
 	redirectURI  string
-	deviceToken  string // shared secret the cube presents
+	publicURL    string
+	deviceToken  string            // legacy single-user bearer
+	users        map[string]string // user name -> unique cube bearer
 	cacheDir     string
 }
 
 // pending is one in-flight pairing. Held in memory on purpose: it lives for at
 // most pairTTL, and losing them all on restart is the correct behaviour.
 type pending struct {
-	verifier  string
-	created   time.Time
-	refresh   string // filled in once the callback completes
-	completed bool
+	user     string
+	verifier string
+	created  time.Time
+}
+
+type cachedAccess struct {
+	token   string
+	expires time.Time
 }
 
 type broker struct {
 	cfg config
 
-	mu      sync.Mutex
-	pairs   map[string]*pending
-	artHits int
-	artMiss int
+	mu           sync.Mutex
+	pairs        map[string]*pending
+	daysLinks    map[string]daysLink
+	daysSessions map[[sha256.Size]byte]daysSession
+	credentials  map[string]string
+	access       map[string]cachedAccess
+	refreshMu    map[string]*sync.Mutex
+	artSem       chan struct{}
+	artHits      int
+	artMiss      int
 
 	http *http.Client
 }
 
 func main() {
 	var cfg config
+	var rawUsers string
 	flag.StringVar(&cfg.addr, "addr", envOr("BROKER_ADDR", ":8080"), "listen address")
 	flag.StringVar(&cfg.clientID, "client-id", os.Getenv("SPOTIFY_CLIENT_ID"), "Spotify client ID")
 	flag.StringVar(&cfg.clientSecret, "client-secret", os.Getenv("SPOTIFY_CLIENT_SECRET"), "Spotify client secret (optional, PKCE works without)")
 	flag.StringVar(&cfg.redirectURI, "redirect-uri", os.Getenv("SPOTIFY_REDIRECT_URI"), "must match the app registration exactly")
-	flag.StringVar(&cfg.deviceToken, "device-token", os.Getenv("BROKER_TOKEN"), "shared secret the cube presents")
+	flag.StringVar(&cfg.publicURL, "public-url", os.Getenv("BROKER_PUBLIC_URL"), "public broker origin encoded in pairing QR codes")
+	flag.StringVar(&cfg.deviceToken, "device-token", os.Getenv("BROKER_TOKEN"), "legacy single-user cube bearer")
+	flag.StringVar(&rawUsers, "users", os.Getenv("BROKER_USERS"), "comma-separated user=bearer entries")
 	flag.StringVar(&cfg.cacheDir, "cache-dir", envOr("BROKER_CACHE", "./cache"), "transcoded art cache")
 	flag.Parse()
 
-	if cfg.deviceToken == "" {
-		log.Fatal("BROKER_TOKEN is required: /token and /art are public once Funnel is on")
+	var err error
+	cfg.users, err = parseBrokerUsers(rawUsers, cfg.deviceToken)
+	if err != nil {
+		log.Fatalf("BROKER_USERS: %v", err)
+	}
+	if len(cfg.users) == 0 {
+		log.Fatal("BROKER_USERS or legacy BROKER_TOKEN is required: authenticated endpoints are public once Funnel is on")
 	}
 	if cfg.clientID == "" || cfg.redirectURI == "" {
 		log.Println("warning: SPOTIFY_CLIENT_ID or SPOTIFY_REDIRECT_URI unset — /pair will refuse, /art still works")
+	}
+	if cfg.publicURL == "" {
+		cfg.publicURL = originOf(cfg.redirectURI)
+	}
+	if cfg.publicURL != "" {
+		cfg.publicURL, err = canonicalPublicURL(cfg.publicURL)
+		if err != nil {
+			log.Fatalf("BROKER_PUBLIC_URL: %v", err)
+		}
 	}
 	if err := os.MkdirAll(cfg.cacheDir, 0o755); err != nil {
 		log.Fatalf("cache dir: %v", err)
 	}
 
 	b := &broker{
-		cfg:   cfg,
-		pairs: map[string]*pending{},
-		http:  &http.Client{Timeout: 20 * time.Second},
+		cfg:          cfg,
+		pairs:        map[string]*pending{},
+		daysLinks:    map[string]daysLink{},
+		daysSessions: map[[sha256.Size]byte]daysSession{},
+		credentials:  map[string]string{},
+		access:       map[string]cachedAccess{},
+		refreshMu:    map[string]*sync.Mutex{},
+		artSem:       make(chan struct{}, 2),
+		http:         &http.Client{Timeout: 20 * time.Second},
+	}
+	if err := b.loadSpotifyCredentials(); err != nil {
+		log.Fatalf("Spotify credential store: %v", err)
 	}
 	go b.reapPairs()
 
@@ -142,7 +183,7 @@ func main() {
 	mux.HandleFunc("/healthz", b.handleHealth)
 	mux.HandleFunc("/pair", b.handlePair)
 	mux.HandleFunc("/callback", b.handleCallback)
-	mux.HandleFunc("/token", b.handleToken)
+	mux.HandleFunc("/spotify/token", b.handleSpotifyToken)
 	mux.HandleFunc("/art", b.handleArt)
 	mux.HandleFunc("/art.bin", b.handleArt)
 	// Queue lookahead for prefetching — see queue.go for why it is server-side.
@@ -151,11 +192,17 @@ func main() {
 	mux.HandleFunc("/provision", b.handleProvision)
 	mux.HandleFunc("/countdown", b.handleCountdown)
 	mux.HandleFunc("/days", b.handleDaysPage)
+	mux.HandleFunc("/days/link", b.handleDaysLink)
+	mux.HandleFunc("/days/session", b.handleDaysSession)
 
 	srv := &http.Server{
 		Addr:              cfg.addr,
-		Handler:           logging(mux),
+		Handler:           logging(securityHeaders(b.rateLimit(mux))),
 		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       15 * time.Second,
+		WriteTimeout:      45 * time.Second,
+		IdleTimeout:       75 * time.Second,
+		MaxHeaderBytes:    16 << 10,
 	}
 	log.Printf("facet broker listening on %s (cache %s)", cfg.addr, cfg.cacheDir)
 	if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
@@ -180,29 +227,64 @@ func logging(next http.Handler) http.Handler {
 	})
 }
 
-// authed guards the endpoints the cube calls. Constant-time compare because this
-// is reachable from the internet and a timing oracle on a shared secret is free
-// to exploit.
+// authenticate both guards a cube endpoint and identifies whose persisted state
+// it may touch. Each cube gets a unique bearer, so no user-controlled ID is
+// accepted from a header or query string. Constant-time comparison matters here
+// because Funnel makes this reachable from the public internet.
+func (b *broker) authenticate(r *http.Request) (string, bool) {
+	header := r.Header.Get("Authorization")
+	if !strings.HasPrefix(header, "Bearer ") {
+		return "", false
+	}
+	got := strings.TrimPrefix(header, "Bearer ")
+	matched := ""
+	for user, want := range b.cfg.users {
+		if subtle.ConstantTimeCompare([]byte(got), []byte(want)) == 1 {
+			matched = user
+		}
+	}
+	if matched != "" {
+		return matched, true
+	}
+	// Tests and older in-process callers construct config directly. Keep the
+	// legacy field functional without making it a second identity when main has
+	// already folded it into cfg.users.
+	if len(b.cfg.users) == 0 && b.cfg.deviceToken != "" &&
+		subtle.ConstantTimeCompare([]byte(got), []byte(b.cfg.deviceToken)) == 1 {
+		return "default", true
+	}
+	return "", false
+}
+
 func (b *broker) authed(r *http.Request) bool {
-	got := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
-	return subtle.ConstantTimeCompare([]byte(got), []byte(b.cfg.deviceToken)) == 1
+	_, ok := b.authenticate(r)
+	return ok
 }
 
 func (b *broker) handleHealth(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet && r.Method != http.MethodHead {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
 	b.mu.Lock()
 	pairs, hits, miss := len(b.pairs), b.artHits, b.artMiss
 	b.mu.Unlock()
 	writeJSON(w, http.StatusOK, map[string]any{
-		"ok": true, "pending_pairs": pairs, "art_cache_hits": hits, "art_cache_misses": miss,
+		"ok": true, "pending_pairs": pairs,
+		"art_cache_hits": hits, "art_cache_misses": miss,
 	})
 }
 
 // ---------------------------------------------------------------- pairing
 
-// handlePair is what the QR code on the cube points at. The cube generates the
-// code itself and encodes it in the QR, so it already knows what to poll for;
-// this only has to mint a PKCE verifier and bounce the phone to Spotify.
+// handlePair is what the QR code on the cube points at. /spotify/token creates
+// the random, user-bound code first; accepting caller-chosen codes here would
+// let one cube overwrite another cube's in-flight session.
 func (b *broker) handlePair(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
 	if b.cfg.clientID == "" || b.cfg.redirectURI == "" {
 		http.Error(w, "broker not configured for pairing", http.StatusServiceUnavailable)
 		return
@@ -212,18 +294,50 @@ func (b *broker) handlePair(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "bad pair code", http.StatusBadRequest)
 		return
 	}
+	b.mu.Lock()
+	p := b.pairs[code]
+	if p != nil && time.Since(p.created) > pairTTL {
+		delete(b.pairs, code)
+		p = nil
+	}
+	verifier := ""
+	if p != nil {
+		verifier = p.verifier
+	}
+	b.mu.Unlock()
+	if p == nil {
+		page(w, http.StatusBadRequest, "Expired", "That pairing link has expired. Start again from the cube.")
+		return
+	}
 
-	verifier, err := randomURLSafe(64)
-	if err != nil {
-		http.Error(w, "entropy", http.StatusInternalServerError)
+	if verifier == "" {
+		var err error
+		verifier, err = randomURLSafe(64)
+		if err != nil {
+			http.Error(w, "entropy", http.StatusInternalServerError)
+			return
+		}
+		b.mu.Lock()
+		// A reaper or simultaneous second scan may have won while entropy was
+		// being read. Reuse the winner's verifier so two browser tabs cannot
+		// invalidate each other's callback.
+		if current := b.pairs[code]; current == p {
+			if p.verifier == "" {
+				p.verifier = verifier
+			} else {
+				verifier = p.verifier
+			}
+		} else {
+			p = nil
+		}
+		b.mu.Unlock()
+	}
+	if p == nil {
+		page(w, http.StatusBadRequest, "Expired", "That pairing link has expired. Start again from the cube.")
 		return
 	}
 	sum := sha256.Sum256([]byte(verifier))
 	challenge := base64.RawURLEncoding.EncodeToString(sum[:])
-
-	b.mu.Lock()
-	b.pairs[code] = &pending{verifier: verifier, created: time.Now()}
-	b.mu.Unlock()
 
 	q := url.Values{
 		"client_id":             {b.cfg.clientID},
@@ -240,17 +354,35 @@ func (b *broker) handlePair(w http.ResponseWriter, r *http.Request) {
 // handleCallback is the registered Spotify redirect URI. A human's phone lands
 // here, so it answers in HTML rather than JSON.
 func (b *broker) handleCallback(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
 	q := r.URL.Query()
 	if e := q.Get("error"); e != "" {
+		b.mu.Lock()
+		delete(b.pairs, q.Get("state"))
+		b.mu.Unlock()
 		page(w, http.StatusOK, "Denied", "Spotify returned: "+e)
 		return
 	}
 	code, state := q.Get("code"), q.Get("state")
+	if code == "" {
+		page(w, http.StatusBadRequest, "Failed", "Spotify did not return an authorization code.")
+		return
+	}
 
 	b.mu.Lock()
 	p := b.pairs[state]
+	user, verifier := "", ""
+	if p != nil {
+		user, verifier = p.user, p.verifier
+		// Consume the state before any network call. A callback is a single-use
+		// capability even when Spotify later rejects the supplied code.
+		delete(b.pairs, state)
+	}
 	b.mu.Unlock()
-	if p == nil {
+	if p == nil || verifier == "" {
 		page(w, http.StatusBadRequest, "Expired", "That pairing link has expired. Start again from the cube.")
 		return
 	}
@@ -260,7 +392,7 @@ func (b *broker) handleCallback(w http.ResponseWriter, r *http.Request) {
 		"code":          {code},
 		"redirect_uri":  {b.cfg.redirectURI},
 		"client_id":     {b.cfg.clientID},
-		"code_verifier": {p.verifier},
+		"code_verifier": {verifier},
 	}
 	tok, err := b.tokenRequest(form)
 	if err != nil {
@@ -273,46 +405,19 @@ func (b *broker) handleCallback(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if err := b.storeSpotifyCredential(user, tok.RefreshToken); err != nil {
+		log.Printf("store Spotify credential for %q: %v", user, err)
+		page(w, http.StatusInternalServerError, "Failed", "Could not save this account. Try again.")
+		return
+	}
 	b.mu.Lock()
-	p.refresh = tok.RefreshToken
-	p.completed = true
+	if tok.AccessToken != "" {
+		b.access[user] = cachedAccess{token: tok.AccessToken,
+			expires: time.Now().Add(time.Duration(tok.ExpiresIn) * time.Second)}
+	}
 	b.mu.Unlock()
 
 	page(w, http.StatusOK, "Paired", "You can put your phone down — the cube is picking this up now.")
-}
-
-// handleToken is polled by the cube. The token is handed over exactly once and
-// then erased, so a leaked pair code is worthless the moment pairing completes.
-func (b *broker) handleToken(w http.ResponseWriter, r *http.Request) {
-	if !b.authed(r) {
-		http.Error(w, "unauthorized", http.StatusUnauthorized)
-		return
-	}
-	code := r.URL.Query().Get("c")
-	if !validPairCode(code) {
-		http.Error(w, "bad pair code", http.StatusBadRequest)
-		return
-	}
-
-	b.mu.Lock()
-	p := b.pairs[code]
-	var refresh string
-	if p != nil && p.completed {
-		refresh = p.refresh
-		delete(b.pairs, code)
-	}
-	b.mu.Unlock()
-
-	if p == nil {
-		http.Error(w, "unknown or expired", http.StatusNotFound)
-		return
-	}
-	if refresh == "" {
-		// Not an error — the human simply has not finished logging in.
-		writeJSON(w, http.StatusAccepted, map[string]any{"status": "waiting"})
-		return
-	}
-	writeJSON(w, http.StatusOK, map[string]any{"refresh_token": refresh})
 }
 
 type tokenResp struct {
@@ -340,7 +445,16 @@ func (b *broker) tokenRequest(form url.Values) (*tokenResp, error) {
 	defer res.Body.Close()
 	body, _ := io.ReadAll(io.LimitReader(res.Body, 1<<20))
 	if res.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("spotify %d: %s", res.StatusCode, strings.TrimSpace(string(body)))
+		var detail struct {
+			Error       string `json:"error"`
+			Description string `json:"error_description"`
+		}
+		_ = json.Unmarshal(body, &detail)
+		return nil, &spotifyTokenError{
+			Status: res.StatusCode,
+			Code:   detail.Error,
+			Body:   strings.TrimSpace(string(body)),
+		}
 	}
 	var t tokenResp
 	if err := json.Unmarshal(body, &t); err != nil {
@@ -350,14 +464,17 @@ func (b *broker) tokenRequest(form url.Values) (*tokenResp, error) {
 }
 
 func (b *broker) reapPairs() {
-	for range time.Tick(time.Minute) {
-		cutoff := time.Now().Add(-pairTTL)
+	ticker := time.NewTicker(time.Minute)
+	defer ticker.Stop()
+	for now := range ticker.C {
+		pairCutoff := now.Add(-pairTTL)
 		b.mu.Lock()
 		for k, p := range b.pairs {
-			if p.created.Before(cutoff) {
+			if p.created.Before(pairCutoff) {
 				delete(b.pairs, k)
 			}
 		}
+		b.reapDaysLocked(now)
 		b.mu.Unlock()
 	}
 }
@@ -372,6 +489,10 @@ func (b *broker) reapPairs() {
 // a ~40 KB 640x640 into a few KB, so the download is quick and the decode is
 // small; and a stable, predictable output means the firmware never has to guess.
 func (b *broker) handleArt(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet && r.Method != http.MethodHead {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
 	if !b.authed(r) {
 		http.Error(w, "unauthorized", http.StatusUnauthorized)
 		return
@@ -383,7 +504,7 @@ func (b *broker) handleArt(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	u, err := url.Parse(raw)
-	if err != nil || u.Scheme != "https" || !artHostAllow[u.Host] {
+	if err != nil || !validArtURL(u) {
 		http.Error(w, "u must be an https Spotify image URL", http.StatusForbidden)
 		return
 	}
@@ -408,7 +529,26 @@ func (b *broker) handleArt(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	data, err := b.transcode(raw, size, rawOut)
+	// Decoding attacker-triggered compressed images is the most CPU- and
+	// memory-intensive operation in the broker. Bound it independently of HTTP
+	// request concurrency so a valid but leaked cube bearer cannot exhaust the
+	// small container with parallel cache misses.
+	b.mu.Lock()
+	if b.artSem == nil {
+		b.artSem = make(chan struct{}, 2)
+	}
+	artSem := b.artSem
+	b.mu.Unlock()
+	select {
+	case artSem <- struct{}{}:
+		defer func() { <-artSem }()
+	default:
+		w.Header().Set("Retry-After", "1")
+		http.Error(w, "art workers busy", http.StatusTooManyRequests)
+		return
+	}
+
+	data, err := b.transcode(r.Context(), raw, size, rawOut)
 	if err != nil {
 		log.Printf("art: %v", err)
 		http.Error(w, "upstream", http.StatusBadGateway)
@@ -421,15 +561,51 @@ func (b *broker) handleArt(w http.ResponseWriter, r *http.Request) {
 	// Write via a temp file and rename, the same discipline the firmware uses for
 	// downloads: a killed process must not leave a half-written cache entry that
 	// later reads as a valid image.
-	tmp := path + ".part"
-	if err := os.WriteFile(tmp, data, 0o644); err == nil {
-		_ = os.Rename(tmp, path)
+	if tmp, err := os.CreateTemp(b.cfg.cacheDir, ".art-*.part"); err == nil {
+		name := tmp.Name()
+		if _, err = tmp.Write(data); err == nil {
+			err = tmp.Chmod(0o644)
+		}
+		if closeErr := tmp.Close(); err == nil {
+			err = closeErr
+		}
+		if err == nil {
+			err = os.Rename(name, path)
+		}
+		if err != nil {
+			_ = os.Remove(name)
+		}
 	}
 	serveArt(w, data, rawOut)
 }
 
-func (b *broker) transcode(src string, size int, rawOut bool) ([]byte, error) {
-	res, err := b.http.Get(src)
+func validArtURL(u *url.URL) bool {
+	if u == nil || u.Scheme != "https" || u.User != nil || !artHostAllow[u.Hostname()] {
+		return false
+	}
+	return u.Port() == "" || u.Port() == "443"
+}
+
+func (b *broker) transcode(ctx context.Context, src string, size int, rawOut bool) ([]byte, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, src, nil)
+	if err != nil {
+		return nil, err
+	}
+	client := *b.http
+	previousRedirect := client.CheckRedirect
+	client.CheckRedirect = func(req *http.Request, via []*http.Request) error {
+		if len(via) >= 5 {
+			return errors.New("too many art redirects")
+		}
+		if !validArtURL(req.URL) {
+			return errors.New("art redirect left the Spotify image allowlist")
+		}
+		if previousRedirect != nil {
+			return previousRedirect(req, via)
+		}
+		return nil
+	}
+	res, err := client.Do(req)
 	if err != nil {
 		return nil, err
 	}
@@ -438,7 +614,22 @@ func (b *broker) transcode(src string, size int, rawOut bool) ([]byte, error) {
 		return nil, fmt.Errorf("upstream %d", res.StatusCode)
 	}
 
-	img, _, err := image.Decode(io.LimitReader(res.Body, artMaxBytes))
+	encoded, err := io.ReadAll(io.LimitReader(res.Body, artMaxBytes+1))
+	if err != nil {
+		return nil, err
+	}
+	if len(encoded) > artMaxBytes {
+		return nil, errors.New("upstream art exceeds encoded size limit")
+	}
+	cfg, _, err := image.DecodeConfig(bytes.NewReader(encoded))
+	if err != nil {
+		return nil, fmt.Errorf("decode config: %w", err)
+	}
+	if cfg.Width <= 0 || cfg.Height <= 0 || cfg.Width > artMaxDimension ||
+		cfg.Height > artMaxDimension || int64(cfg.Width)*int64(cfg.Height) > artMaxPixels {
+		return nil, fmt.Errorf("upstream art dimensions %dx%d exceed limit", cfg.Width, cfg.Height)
+	}
+	img, _, err := image.Decode(bytes.NewReader(encoded))
 	if err != nil {
 		return nil, fmt.Errorf("decode: %w", err)
 	}
@@ -693,7 +884,7 @@ func serveArt(w http.ResponseWriter, data []byte, rawOut bool) {
 // ---------------------------------------------------------------- helpers
 
 func validPairCode(s string) bool {
-	if len(s) < 4 || len(s) > 16 {
+	if len(s) != 32 {
 		return false
 	}
 	for _, c := range s {
@@ -718,13 +909,24 @@ func writeJSON(w http.ResponseWriter, code int, v any) {
 	_ = json.NewEncoder(w).Encode(v)
 }
 
+const pageStyle = `body{background:#05070b;color:#e8fbff;font:16px/1.6 system-ui,sans-serif;
+display:grid;place-items:center;min-height:100vh;margin:0;text-align:center;padding:2rem}
+h1{font-weight:600;letter-spacing:.02em;margin:0 0 .5rem}p{color:#94a3b8;margin:0}`
+
+const messagePageMarkup = `<!doctype html><meta name=viewport content="width=device-width,initial-scale=1">
+<title>Facet — {{.Title}}</title>
+<style>` + pageStyle + `</style>
+<div><h1>{{.Title}}</h1><p>{{.Body}}</p></div>`
+
+var messagePage = template.Must(template.New("message").Parse(messagePageMarkup))
+
 func page(w http.ResponseWriter, code int, title, body string) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-store")
+	setHTMLCSP(w, []byte(messagePageMarkup), false)
 	w.WriteHeader(code)
-	fmt.Fprintf(w, `<!doctype html><meta name=viewport content="width=device-width,initial-scale=1">
-<title>Facet — %s</title>
-<style>body{background:#05070b;color:#e8fbff;font:16px/1.6 system-ui,sans-serif;
-display:grid;place-items:center;min-height:100vh;margin:0;text-align:center;padding:2rem}
-h1{font-weight:600;letter-spacing:.02em;margin:0 0 .5rem}p{color:#94a3b8;margin:0}</style>
-<div><h1>%s</h1><p>%s</p></div>`, title, title, body)
+	_ = messagePage.Execute(w, struct {
+		Title string
+		Body  string
+	}{Title: title, Body: body})
 }

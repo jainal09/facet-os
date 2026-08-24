@@ -273,3 +273,9 @@ CONFIG_BT_CTRL_BLE_MAX_ACT=2
 CONFIG_BT_CTRL_ADV_DUP_FILT_MAX=1
 CONFIG_BT_CTRL_BLE_SCAN_DUPL=n
 CONFIG_BT_CTRL_BLE_ADV_REPORT_FLOW_CTRL_SUPP=n
+
+# ESP32-S3 PIE blenders for LVGL's plain fill / opaque copy paths, from
+# components/lv_blend_esp32s3 (vendored esp_lvgl_port 2.9.0 SIMD). Only the
+# mask==NULL, opa==COVER paths are accelerated; AA text and masks stay in C.
+CONFIG_LV_DRAW_SW_ASM_CUSTOM=y
+CONFIG_LV_DRAW_SW_ASM_CUSTOM_INCLUDE="esp_lvgl_port_lv_blend.h"

@@ -80,3 +80,35 @@ func TestDaysPageIsPublicButStateIsNot(t *testing.T) {
 		t.Fatalf("GET /days: status=%d body=%q", w.Code, w.Body.String())
 	}
 }
+
+func TestCountdownStateIsScopedToAuthenticatedUser(t *testing.T) {
+	b := &broker{cfg: config{
+		users: map[string]string{
+			"alice": "alice-secret",
+			"bob":   "bob-secret",
+		},
+		cacheDir: t.TempDir(),
+	}}
+	if w := countdownRequest(t, b, http.MethodPost,
+		`{"d":"2027-03-20","t":"Alice"}`, "alice-secret"); w.Code != http.StatusOK {
+		t.Fatalf("alice POST: %d %s", w.Code, w.Body.String())
+	}
+	if w := countdownRequest(t, b, http.MethodPost,
+		`{"d":"2028-04-21","t":"Bob"}`, "bob-secret"); w.Code != http.StatusOK {
+		t.Fatalf("bob POST: %d %s", w.Code, w.Body.String())
+	}
+
+	for token, wantText := range map[string]string{
+		"alice-secret": "Alice",
+		"bob-secret":   "Bob",
+	} {
+		w := countdownRequest(t, b, http.MethodGet, "", token)
+		var got map[string]string
+		if err := json.Unmarshal(w.Body.Bytes(), &got); err != nil {
+			t.Fatal(err)
+		}
+		if got["t"] != wantText {
+			t.Errorf("bearer %q read %q, want %q", token, got["t"], wantText)
+		}
+	}
+}

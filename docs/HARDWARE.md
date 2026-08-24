@@ -1199,6 +1199,11 @@ variable that repro cannot carry. To reinstate: put the directory back under
     line. Worse than the failed flash is the *successful* one: flashing resets
     the board and destroys whatever repro the other session was capturing.
     Ask before taking the port, and commit before handing the tree over (#21).
+    Note that a *reconnecting* monitor closes and reopens the tty on every
+    read error, so `lsof` can show nothing while a capture is live — and
+    macOS lets two readers open one tty, so both then see garbage. Neither
+    tool failing loudly is the trap; only the other session's word frees the
+    board.
 30. **Fast scrolling looks torn, like a game with vsync off.** The analogy is
     literally correct and there is no vsync to turn on (§5: no TE pin). A
     full-height list invalidates its whole viewport per step, and CONTROL's

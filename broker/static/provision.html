@@ -3,6 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; base-uri 'none'; form-action 'none'; style-src 'sha256-FG+r86+YVrBxEk69ykdhKVJ6q21Gs2FSIYoBUqLJBaQ='; script-src 'sha256-SFgL4LH0IyesBiQ+b9gkeuyuMyj5gNdTfgz19Y5k45w='; require-trusted-types-for 'script'; trusted-types 'none'">
 <title>Facet — Wi-Fi setup</title>
 <style>
   :root {
@@ -317,7 +318,7 @@ function resetSession() {
   unlocking = false;
   $("btnCode").disabled = false;
   pwShown(false);
-  $("netList").innerHTML = "";
+  $("netList").replaceChildren();
   $("rescanHint").textContent = "Captured when pairing started.";
   $("btnRescan").disabled = false;
 }
@@ -425,19 +426,27 @@ async function readAplist() {
 
 function bars(rssi) {
   const n = rssi >= -55 ? 4 : rssi >= -67 ? 3 : rssi >= -78 ? 2 : 1;
-  let h = '<span class="bars">';
-  for (let i = 1; i <= 4; i++) h += `<i class="${i <= n ? "on" : ""}"></i>`;
-  return h + "</span>";
+  const span = document.createElement("span");
+  span.className = "bars";
+  for (let i = 1; i <= 4; i++) {
+    const bar = document.createElement("i");
+    if (i <= n) bar.className = "on";
+    span.appendChild(bar);
+  }
+  return span;
 }
 
 function renderNets(nets) {
   const list = $("netList");
-  list.innerHTML = "";
+  list.replaceChildren();
 
   nets.sort((a, b) => (b.ssid === currentSsid) - (a.ssid === currentSsid) || b.rssi - a.rssi);
 
   if (!nets.length) {
-    list.innerHTML = '<div class="sub">No networks found.</div>';
+    const empty = document.createElement("div");
+    empty.className = "sub";
+    empty.textContent = "No networks found.";
+    list.appendChild(empty);
     return;
   }
 
@@ -445,16 +454,25 @@ function renderNets(nets) {
     const isCur = net.ssid === currentSsid && currentSsid !== "";
     const b = document.createElement("button");
     b.className = "net" + (isCur ? " current" : "");
-    b.innerHTML =
-      `<span class="main">` +
-        (net.saved ? `<span class="pill">saved</span>` : ``) +
-        `<span class="name"></span>` +
-      `</span>` +
-      `<span class="lock">${net.secure ? "\u{1F512}" : ""}</span>` +
-      bars(net.rssi) +
-      `<span class="meta">${net.rssi}</span>`;
-    b.querySelector(".name").textContent = net.ssid;   /* never innerHTML — an
-                                                          SSID is attacker-chosen */
+    const main = document.createElement("span");
+    main.className = "main";
+    if (net.saved) {
+      const pill = document.createElement("span");
+      pill.className = "pill";
+      pill.textContent = "saved";
+      main.appendChild(pill);
+    }
+    const name = document.createElement("span");
+    name.className = "name";
+    name.textContent = net.ssid;             /* SSIDs are attacker-controlled. */
+    main.appendChild(name);
+    const lock = document.createElement("span");
+    lock.className = "lock";
+    lock.textContent = net.secure ? "\u{1F512}" : "";
+    const meta = document.createElement("span");
+    meta.className = "meta";
+    meta.textContent = String(net.rssi);
+    b.append(main, lock, bars(net.rssi), meta);
     /* Always pick(). "Currently connected" is captured before the cube takes
        Wi-Fi down for the session, so by the time you are looking at this list
        the cube is offline and "disconnect" would be a nonsense action — while
@@ -670,8 +688,11 @@ $("btnRescan").onclick = async () => {
   if (btn.disabled) return;
   btn.disabled = true;
   const seqBefore = lastSeq;
-  $("rescanHint").innerHTML = '<span class="spin"></span>Scanning — the cube is '
-    + 'switching Wi-Fi back on, this takes a few seconds.';
+  const hint = $("rescanHint");
+  const spin = document.createElement("span");
+  spin.className = "spin";
+  hint.replaceChildren(spin, document.createTextNode(
+    "Scanning — the cube is switching Wi-Fi back on, this takes a few seconds."));
   try {
     await send(new Uint8Array([CMD_RESCAN]));
     /* The cube answers by bumping data_seq, which onState() turns into a fresh

@@ -15,12 +15,16 @@ services:
     volumes:
       - art-cache:/cache
 
-    # It needs to fetch images and write one directory. Nothing else.
+    # It needs to fetch images and atomically persist per-user OAuth/countdown
+    # state in one directory. Protect and back up this credential-bearing volume.
     read_only: true
     cap_drop:
       - ALL
     security_opt:
       - no-new-privileges:true
+    mem_limit: 256m
+    cpus: "1.0"
+    pids_limit: 128
     logging:
       driver: json-file
       options:
