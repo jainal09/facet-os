@@ -2202,6 +2202,9 @@ static volatile int s_lock_key_app = LOCK_KEY_OFF;
 
 static volatile bool s_always_on;
 static volatile bool s_lock_rings = true;
+/* Cosmetic only: whether desk-clock mode announces itself with the amber
+ * ring. The mode itself belongs to the lock screen's right-key hold. */
+static volatile bool s_ao_ring_pref = true;
 static volatile bool s_req_lock_pref_save;
 /* The orientation to hold when autorotate is off. Without persisting this, a
  * reboot lands back at native 0 with the switch still reading OFF and — since
@@ -2581,6 +2584,7 @@ static void lock_pref_save(void) {
     if (nvs_open("cfg", NVS_READWRITE, &h) == ESP_OK) {
         nvs_set_i32(h, "alwayson", s_always_on ? 1 : 0);
         nvs_set_i32(h, "lockrings", s_lock_rings ? 1 : 0);
+        nvs_set_i32(h, "aoring", s_ao_ring_pref ? 1 : 0);
         nvs_set_i32(h, "lockmid", s_lock_key_app);
         nvs_commit(h);
         nvs_close(h);
@@ -2624,6 +2628,7 @@ static void rot_off_load(void) {
     if (nvs_get_i32(h, "clock24", &v) == ESP_OK) s_clock_24 = (v != 0);
     if (nvs_get_i32(h, "alwayson", &v) == ESP_OK) s_always_on = (v != 0);
     if (nvs_get_i32(h, "lockrings", &v) == ESP_OK) s_lock_rings = (v != 0);
+    if (nvs_get_i32(h, "aoring", &v) == ESP_OK) s_ao_ring_pref = (v != 0);
     /* Range-checked, not trusted: a stored index can outlive the app it named
      * if one is compiled out, and app_request() on a hole calls a NULL build(). */
     if (nvs_get_i32(h, "lockmid", &v) == ESP_OK) {
@@ -5454,10 +5459,6 @@ static void cfg_button_live(lv_obj_t *b, bool live) {
  * row next to its label, so fading only the switch leaves bright text over a
  * greyed control — worse than not fading at all. Dim the row; take CLICKABLE
  * off the switch, which is the object the indev actually hit-tests. */
-/* Unreferenced since the desk-clock switch stopped following the rings
- * switch; kept compiled for the next faded-control need — --gc-sections
- * drops it from the image, so it costs no flash. */
-__attribute__((unused))
 static void cfg_switch_live(lv_obj_t *sw, bool live) {
     if (!sw) return;
     lv_obj_t *row = lv_obj_get_parent(sw);
@@ -5967,9 +5968,13 @@ static void cfg_pick_build(lv_obj_t *scr) {
 }
 
 static void cfg_always_cb(lv_event_t *e) {
-    s_always_on = lv_obj_has_state(lv_event_get_target(e), LV_STATE_CHECKED);
+    /* The cosmetic half only. Flipping the MODE from a settings column while
+     * the mode's real switch is a key-hold on the lock screen made two
+     * owners for one state; this one now just decides whether the mode
+     * wears its amber ring. */
+    s_ao_ring_pref = lv_obj_has_state(lv_event_get_target(e), LV_STATE_CHECKED);
     s_req_lock_pref_save = true;
-    ESP_LOGI(TAG, "always-on %s", s_always_on ? "ON" : "OFF");
+    ESP_LOGI(TAG, "desk-clock ring %s", s_ao_ring_pref ? "ON" : "OFF");
 }
 
 static void cfg_rings_cb(lv_event_t *e) {
@@ -6197,6 +6202,15 @@ static void cfg_timer_cb(lv_timer_t *t) {
     if (s_cfg_rot_btn &&
         s_autorot != lv_obj_has_flag(s_cfg_rot_btn, LV_OBJ_FLAG_CLICKABLE)) {
         cfg_button_live(s_cfg_rot_btn, s_autorot);
+    }
+
+    /* The amber-ring preference is meaningless without rings to host it —
+     * an amber ring cannot appear in a ring set that does not exist — so it
+     * fades with them. Only the cosmetic switch fades: the desk-clock MODE
+     * lives on the lock screen's right-key hold and never asks this card. */
+    if (s_cfg_always_sw &&
+        s_lock_rings != lv_obj_has_flag(s_cfg_always_sw, LV_OBJ_FLAG_CLICKABLE)) {
+        cfg_switch_live(s_cfg_always_sw, s_lock_rings);
     }
 
     /* ---- battery ---- */
@@ -6526,14 +6540,16 @@ static void build_control_app(lv_obj_t *scr) {
 
     /* ---- lock screen ---- */
     c = cfg_card(col, "LOCK SCREEN", CFG_ACCENT_LOCK);
-    /* "Desk clock", because that is what the mode IS — the cube sits lit on
-     * the desk telling the time. "Always-on screen" described the mechanism
-     * and answered no one's actual question. The amber ring on the lock
-     * screen is this switch's readout, when the rings are on to host it. */
-    s_cfg_always_sw = cfg_switch(c, "Desk clock (stay lit)", CFG_ACCENT_LOCK,
-                                 s_always_on, cfg_always_cb);
+    /* Rings first, then the switch that depends on them. The second switch
+     * is COSMETIC: whether desk-clock mode (toggled by holding the right key
+     * on the lock screen — its only real switch) announces itself with an
+     * amber ring. With the rings off it fades, because an amber ring cannot
+     * appear in a ring set that does not exist — while the MODE stays none
+     * of this card's business. */
     s_cfg_rings_sw = cfg_switch(c, "Lock-screen rings", CFG_ACCENT_LOCK,
                                 s_lock_rings, cfg_rings_cb);
+    s_cfg_always_sw = cfg_switch(c, "Amber ring in desk clock", CFG_ACCENT_LOCK,
+                                 s_ao_ring_pref, cfg_always_cb);
     s_cfg_time_sw = cfg_switch(c, "24-hour time", CFG_ACCENT_LOCK,
                                s_clock_24, cfg_clock_cb);
 
@@ -10901,7 +10917,8 @@ static void lock_refresh(void) {
      * AND the rings are drawn — with rings off the mode still runs, it just
      * has no jewellery. */
     obj_set_hidden_changed(s_lock_ring, !s_lock_rings);
-    obj_set_hidden_changed(s_lock_ao_ring, !(s_lock_rings && s_always_on));
+    obj_set_hidden_changed(s_lock_ao_ring,
+                           !(s_lock_rings && s_ao_ring_pref && s_always_on));
     obj_set_hidden_changed(s_lock_inner_ring, !s_lock_rings);
     obj_set_hidden_changed(s_lock_batt_arc, !s_lock_rings);
 }
@@ -11356,13 +11373,9 @@ static void lock_engage(void) {
  * indefinitely. A banner confirms which way it just went, then fades itself
  * out and deletes itself — no timer to own or tear down. */
 static void always_on_toggle(void) {
-    /* Rings off means always-on has no standing indicator, so CONTROL greys
-     * the switch. The right-key hold has to agree, or the key quietly
-     * enables a mode the UI says is unavailable. */
-    if (!s_lock_rings && !s_always_on) {
-        ESP_LOGI(TAG, "always-on refused: lock-screen rings are off");
-        return;
-    }
+    /* The right-key hold on the lock screen is the mode's ONLY switch —
+     * CONTROL carries just the cosmetic preference for its amber ring. The
+     * hold works with the rings off; the mode then simply runs unadorned. */
     s_always_on = !s_always_on;
     s_req_lock_pref_save = true;
     ESP_LOGI(TAG, "always-on %s", s_always_on ? "ON" : "OFF");
