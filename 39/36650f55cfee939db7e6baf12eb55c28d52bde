@@ -1,0 +1,19 @@
+README.md
+  s_19efbd24d01d75::t_1f3afb28a16abc 12,69,77
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.24",
+  "base_commit_sha": "3936650f55cfee939db7e6baf12eb55c28d52bde",
+  "prompts": {},
+  "sessions": {
+    "s_19efbd24d01d75": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a03498-4b19-73e0-8825-ea6aa9305805",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "Jainal Gosaliya <jainal09gosalia@gmail.com>"
+    }
+  }
+}
