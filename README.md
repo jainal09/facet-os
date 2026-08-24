@@ -9,9 +9,11 @@ A small operating system for a cube-shaped ESP32-S3 device with a round-cornered
 A cube has facets; so does this. Apps are faces of one system rather than
 separate firmwares, and only the one you are looking at costs any RAM.
 
-<p align="center"><picture><source media="(prefers-color-scheme: dark) and (max-width: 430px)" srcset="docs/images/facet-portraits-dark-mobile.jpg"><source media="(prefers-color-scheme: dark)" srcset="docs/images/facet-portraits-dark-desktop.jpg"><source media="(max-width: 430px)" srcset="docs/images/facet-portraits-light-mobile.jpg"><img src="docs/images/facet-portraits-light-desktop.jpg" width="100%" alt="Facet cube showing its lock screen and four-face app drawer"></picture></p>
+<p align="center"><picture><source media="(prefers-color-scheme: dark)" srcset="docs/images/facet-portraits-dark-desktop.jpg"><img src="docs/images/facet-portraits-light-desktop.jpg" width="100%" alt="Facet cube showing its lock screen and four-face app drawer"></picture></p>
 
 <p align="center"><sub>Studio renders built from the real enclosure photography and the cube's own framebuffer captures.</sub></p>
+
+<p align="center"><sub><a href="docs/MOBILE-GALLERY.md">Open the phone-sized exhibition →</a></sub></p>
 
 ## What it is
 
@@ -66,7 +68,7 @@ the duration and restores it however the session ends. See
 
 ## Screens
 
-<p align="center"><picture><source media="(prefers-color-scheme: dark) and (max-width: 430px)" srcset="docs/images/screens-dark-mobile.jpg"><source media="(prefers-color-scheme: dark)" srcset="docs/images/screens-dark-desktop.jpg"><source media="(max-width: 430px)" srcset="docs/images/screens-light-mobile.jpg"><img src="docs/images/screens-light-desktop.jpg" width="100%" alt="Six Facet cubes showing MUSIC volume, liked track, device selection, CONTROL battery care, a running FOCUS session, and DAYS countdown"></picture></p>
+<p align="center"><picture><source media="(prefers-color-scheme: dark)" srcset="docs/images/screens-dark-desktop.jpg"><img src="docs/images/screens-light-desktop.jpg" width="100%" alt="Six Facet cubes showing MUSIC volume, liked track, device selection, CONTROL battery care, a running FOCUS session, and DAYS countdown"></picture></p>
 
 ### The moments that make it Facet
 
@@ -74,7 +76,7 @@ These are the two gestures where the cube stops behaving like a tiny phone and
 starts feeling like its own object: the whole OS revealed as four physical
 faces, then the display breaking its own frame when the bezel comes alive.
 
-<p align="center"><picture><source media="(prefers-color-scheme: dark) and (max-width: 430px)" srcset="docs/images/moments-dark-mobile.jpg"><source media="(prefers-color-scheme: dark)" srcset="docs/images/moments-dark-desktop.jpg"><source media="(max-width: 430px)" srcset="docs/images/moments-light-mobile.jpg"><img src="docs/images/moments-light-desktop.jpg" width="100%" alt="The four-face app drawer and the localized bezel pop-out responding to a button press"></picture></p>
+<p align="center"><picture><source media="(prefers-color-scheme: dark)" srcset="docs/images/moments-dark-desktop.jpg"><img src="docs/images/moments-light-desktop.jpg" width="100%" alt="The four-face app drawer and the localized bezel pop-out responding to a button press"></picture></p>
 
 ### Every face, alive
 
