@@ -5886,6 +5886,12 @@ static int64_t s_sp_expires_ms;         /* when the access token dies */
 static char s_sp_pair_url[256];
 static int64_t s_sp_token_retry_ms;
 
+/* Spotify answers 403 on every endpoint while this account is missing from the
+ * app's Development-mode allowlist, and keeps doing so until someone edits the
+ * dashboard. Both live on the spotify task, so neither needs an atomic. */
+static int64_t s_sp_poll_hold_ms;
+static int     s_sp_poll_denies;
+
 static QueueHandle_t s_sp_q;
 static esp_http_client_handle_t s_sp_http;
 static char *s_sp_body;                 /* PSRAM response buffer */
@@ -6175,16 +6181,34 @@ static int sp_call(esp_http_client_method_t method, const char *path, const char
 /* ---- state ---- */
 
 static void sp_poll_state(void) {
+    if (s_sp_poll_hold_ms && now_ms() < s_sp_poll_hold_ms) return;
+
     int code = sp_call(HTTP_METHOD_GET, "/me/player", NULL);
 
     if (code == 204 || (code == 200 && s_sp_len < 4)) {
+        s_sp_poll_hold_ms = 0;
+        s_sp_poll_denies  = 0;
         s_sp_have_state = false;        /* nothing playing anywhere */
         return;
     }
     if (code != 200 || s_sp_len == 0) {
+        /* A refused account is not a transient error, and a 3 s poll against it
+         * is the load generator ARCHITECTURE.md warns about. Back off to a
+         * minute; any answer that is not a refusal clears it on the next pass. */
+        if (code == 403) {
+            if (s_sp_poll_denies < 4) s_sp_poll_denies++;
+            s_sp_poll_hold_ms = now_ms() + 15000LL * s_sp_poll_denies;
+            ESP_LOGW(TAG, "spotify: poll HTTP 403 - account not registered for "
+                          "this app? holding %llds",
+                     (long long)(15 * s_sp_poll_denies));
+            return;
+        }
         ESP_LOGW(TAG, "spotify: poll HTTP %d, %d bytes", code, s_sp_len);
         return;
     }
+
+    s_sp_poll_hold_ms = 0;
+    s_sp_poll_denies  = 0;
 
     cJSON *j = cJSON_Parse(s_sp_body);
     if (!j) {
