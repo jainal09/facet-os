@@ -66,12 +66,13 @@ the duration and restores it however the session ends. See
 <td align="center"><img src="docs/images/music_liked.png" width="180" alt="MUSIC, liked" /><br/><b>MUSIC</b><br/><sub>track liked — the heart fills red</sub></td>
 <td align="center"><img src="docs/images/devices.png" width="180" alt="Device picker" /><br/><b>MUSIC · devices</b><br/><sub>pick which speaker or computer plays</sub></td>
 </tr><tr>
-<td align="center"><img src="docs/images/control.png" width="180" alt="CONTROL" /><br/><b>CONTROL</b><br/><sub>settings cards: audio, battery, charge limit</sub></td>
+<td align="center"><img src="docs/images/control.png" width="180" alt="CONTROL" /><br/><b>CONTROL</b><br/><sub>battery care: the charge limit and the 100%-once override</sub></td>
 <td align="center"><img src="docs/images/focus.png" width="180" alt="FOCUS" /><br/><b>FOCUS</b><br/><sub>rotate the cube to pick 60/30/10/5, tap to start</sub></td>
 <td align="center"><img src="docs/images/days.png" width="180" alt="DAYS" /><br/><b>DAYS</b><br/><sub>countdown with a colour-shifting progress bar</sub></td>
 </tr></table>
 
 <table align="center"><tr>
+<td align="center"><img src="docs/images/drawer.png" width="300" alt="App drawer" /><br/><b>The drawer</b><br/><sub>every app is a face of the cube; only the open one costs RAM</sub></td>
 <td align="center"><img src="docs/images/bezel.png" width="300" alt="Bezel pop-out" /><br/><b>Bezel pop-out</b><br/><sub>press a side key and the black bezel swells into the screen</sub></td>
 </tr></table>
 
@@ -79,9 +80,6 @@ Every image here was taken by the device itself — hold LEFT+RIGHT and it
 saves a screenshot of its own framebuffer to the card (see CLAUDE.md,
 *Autonomous hardware verification*). No camera, no emulator; these are the
 real pixels.
-
-<!-- drawer screenshot: regenerate via the harness after the scrollable-drawer
-     rework lands - the current drawer is about to change shape. -->
 
 ## The three keys
 
