@@ -1,5 +1,7 @@
 <h1 align="center"><img src="docs/images/facet-wordmark.svg" width="720" alt="Facet — one object, many faces" /></h1>
 
+<p align="center"><img src="docs/images/facet-hero.jpg" width="100%" alt="Facet cube showing its mountain lock screen in a cinematic product portrait" /></p>
+
 A small operating system for a cube-shaped ESP32-S3 device with a round-cornered
 480×480 AMOLED touchscreen — the
 [Waveshare ESP32-S3-Touch-AMOLED-2.16](https://www.waveshare.com/wiki/ESP32-S3-Touch-AMOLED-2.16).
