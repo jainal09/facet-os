@@ -3068,6 +3068,31 @@ static bool s_food_ready;
 /* the egg (stage PET_EGG) sits where the astronaut will stand */
 static lv_obj_t *s_pet_egg;
 
+/* ---- infinite travel ----
+ *
+ * Hold a tilt and the WORLD moves, not the walker: ground details and props
+ * ride a 640 px virtual track around the planet (the stretch beyond the
+ * panel maps below the horizon via ground_y, so things genuinely disappear
+ * around the back), stars parallax at quarter speed, the moon at an eighth.
+ * The walker eases to centre stage and just walks. Velocity ramps toward
+ * the tilt instead of snapping — momentum is most of the fidget. */
+#define WOBJ_N     8
+#define WOBJ_WRAP  640
+static lv_obj_t *s_wobj[WOBJ_N];
+static int16_t   s_wobj_x[WOBJ_N];     /* virtual track x of the centre */
+static int16_t   s_wobj_dy[WOBJ_N];    /* y offset from the surface line */
+static uint8_t   s_wobj_n;
+static int s_tilt_vel, s_tilt_vel_tgt; /* world-scroll velocity, -6..6 */
+static int s_sky_par;                  /* sky parallax accumulator */
+
+static void wobj_add(lv_obj_t *o, int track_x, int dy) {
+    if (s_wobj_n >= WOBJ_N) return;
+    s_wobj[s_wobj_n] = o;
+    s_wobj_x[s_wobj_n] = (int16_t)track_x;
+    s_wobj_dy[s_wobj_n] = (int16_t)dy;
+    s_wobj_n++;
+}
+
 /* character parts */
 static lv_obj_t *s_ch_wrap, *s_ch_body, *s_ch_pack, *s_ch_visor;
 static lv_obj_t *s_ch_eye_l, *s_ch_eye_r, *s_ch_leg_l, *s_ch_leg_r;
@@ -3225,14 +3250,14 @@ static int pet_lean_signal(int rot_delta) {
 
 static void pet_motion_poll(void) {
     static int16_t px, py, pz;
-    static bool primed, tilt_walking;
+    static bool primed;
     static int64_t last_shake_ms;
     static int8_t logged_dir;
 
     if (pet_absent() || !s_screen_on || s_doze || !s_ch_wrap) {
         primed = false;
-        tilt_walking = false;
         logged_dir = 0;
+        s_tilt_vel_tgt = 0;
         return;
     }
 
@@ -3240,20 +3265,45 @@ static void pet_motion_poll(void) {
     int jerk = 0;
     if (primed)
         jerk = abs(s_acc_x - px) + abs(s_acc_y - py) + abs(s_acc_z - pz);
-    if (primed && jerk > 6500 && t - last_shake_ms > 1200) {
+    px = s_acc_x; py = s_acc_y; pz = s_acc_z;
+    primed = true;
+
+    /* A hop needs a genuine shake, not a brisk tilt. A tilt gesture crosses
+     * any single-sample threshold for a poll or two on its way over, and on
+     * the glass that read as "tilting makes it jump". A real shake is
+     * violence SUSTAINED: the hot counter charges +2 per high-jerk poll and
+     * drains -1 per calm one, so it only reaches the trigger after ~80 ms of
+     * continuous thrash, and the peak requirement demands the thrash was
+     * actually hard. Both gates were tuned from the user's own play capture:
+     * deliberate shakes peaked 7-36k, tilt transients under 10k briefly. */
+    static int shake_hot, shake_peak;
+    if (jerk > 5500) {
+        if (shake_hot < 20) shake_hot += 2;
+        if (jerk > shake_peak) shake_peak = jerk;
+    } else if (shake_hot > 0) {
+        if (--shake_hot == 0) shake_peak = 0;
+    }
+    if (shake_hot >= 8 && shake_peak > 12000 && t - last_shake_ms > 1200) {
         last_shake_ms = t;
+        lv_display_trigger_activity(NULL);
         set_act(ACT_JUMP, 34);
         /* the world gets it too: harder shake, bigger rattle */
         s_pet_quake = 24;
-        s_pet_quake_amp = clampi(jerk / 1400, 5, 16);
-        say(jerk > 14000 ? "earthquake!!" : "wobble!");
+        s_pet_quake_amp = clampi(shake_peak / 2200, 5, 16);
+        say(shake_peak > 22000 ? "earthquake!!" : "wobble!");
         s_pet.happy = clampi(s_pet.happy + 2, 0, 100);
         s_pet_dirty = true;
         pet_seen();
-        ESP_LOGI(TAG, "pet imu: shake jerk=%d", jerk);
+        ESP_LOGI(TAG, "pet imu: shake peak=%d", shake_peak);
+        shake_hot = 0;
+        shake_peak = 0;
     }
-    px = s_acc_x; py = s_acc_y; pz = s_acc_z;
-    primed = true;
+
+    /* While the hand is accelerating the cube, the accelerometer measures
+     * the hand, not gravity — a forward tilt with a bit of right in it read
+     * as whatever the motion happened to look like. Steer only from quiet
+     * samples; a held tilt is quiet the moment the wrist stops. */
+    if (jerk > 4500) return;
 
     /* A shake IS a violent transient lean; let it be a hop, not a sprint.
      * The window also swallows the rebound of the hand arresting the shake. */
@@ -3278,44 +3328,29 @@ static void pet_motion_poll(void) {
 
     int left = raw_l - base_l, right = raw_r - base_r;
     int mag = left > right ? left : right;
-    int tx = -1;
-    if (left > PET_LEAN_TH && left >= right)  tx = WALK_MIN_X;
-    else if (right > PET_LEAN_TH)             tx = WALK_MAX_X;
+    int dir = 0;
+    if (left > PET_LEAN_TH && left >= right)  dir = -1;
+    else if (right > PET_LEAN_TH)             dir = 1;
 
-    /* A hop in flight is never preempted by a tilt: walk_to() would cut the
-     * jump on its first frames, which on hardware read as "shaking does
-     * nothing" — the reaction fired and was instantly overwritten. */
-    if (s_act == ACT_JUMP) return;
-
-    if (tx >= 0) {
-        /* Analog, like a marble: steeper is faster. */
-        int speed = clampi(2 + (mag - PET_LEAN_TH) / 2500, 2, 6);
-        /* Steer only when it changes something. Both clauses matter:
-         * walk_to() resets the activity clock, so re-issuing it every poll
-         * pins the animation on its first frame — and a pet already standing
-         * AT the tilted-toward wall re-completes its walk instantly, which
-         * without the s_cx check re-triggered (and logged) at 50 Hz. */
-        if (abs(s_cx - tx) > speed && (s_act != ACT_WALK || s_tx != tx)) {
-            walk_to(tx);
-            pet_seen();
-        }
-        s_walk_speed = speed;
-        tilt_walking = true;
-        int8_t dir = (tx == WALK_MIN_X) ? -1 : 1;
+    if (dir != 0) {
+        /* Motion play IS attention: without this, sixty seconds of pure
+         * tilt-steering — no touch, no keys — auto-locked the app out from
+         * under the player, and every control then looked dead at once.
+         * FOCUS holds itself awake the same way. */
+        lv_display_trigger_activity(NULL);
+        /* The tilt sets a target VELOCITY for the world, not a destination
+         * for the walker: the timer eases toward it and streams the planet
+         * underneath — the infinite walk. Steeper is faster. */
+        s_tilt_vel_tgt = dir * clampi(2 + (mag - PET_LEAN_TH) / 2500, 2, 6);
         if (dir != logged_dir) {         /* diagnostics on change, not cadence */
-            logged_dir = dir;
+            logged_dir = (int8_t)dir;
             ESP_LOGI(TAG, "pet imu: lean %s (L=%d R=%d)",
                      dir < 0 ? "left" : "right", left, right);
         }
+        pet_seen();
     } else if (mag < PET_LEAN_RELEASE) {
         logged_dir = 0;
-        if (tilt_walking) {
-            /* The cube levelled out: the marble stops rolling. Only a walk
-             * WE started is stopped — a tap-commanded walk keeps its
-             * target. */
-            tilt_walking = false;
-            if (s_act == ACT_WALK) set_act(ACT_IDLE, 40);
-        }
+        s_tilt_vel_tgt = 0;              /* momentum decays in the timer */
     }
 }
 
@@ -3635,6 +3670,62 @@ static void pet_timer_cb(lv_timer_t *t) {
         return;
     }
 
+    /* ---- infinite travel: the world streams under the walker ----
+     * Velocity eases toward the tilt (momentum in, momentum out — the
+     * marble feel), the walker recentres, and everything on the surface
+     * track wraps around the planet. Sky gets parallax: stars at quarter
+     * speed, the moon at an eighth, which is what sells the distance. */
+    if ((s_fcount & 1) && s_tilt_vel != s_tilt_vel_tgt)
+        s_tilt_vel += (s_tilt_vel_tgt > s_tilt_vel) ? 1 : -1;
+    bool traveling = s_tilt_vel != 0;
+    if (traveling) {
+        s_face = s_tilt_vel > 0 ? 1 : -1;
+        if (s_cx < 238)      s_cx += 2;
+        else if (s_cx > 242) s_cx -= 2;
+        if (s_act == ACT_WALK) set_act(ACT_IDLE, 40);  /* travel owns the legs */
+        s_next_pick = s_fcount + 150;                  /* no daydreams mid-hike */
+
+        int dx = -s_tilt_vel;
+        for (int i = 0; i < s_wobj_n; i++) {
+            int x = s_wobj_x[i] + dx;
+            if (x >= 560)      x -= WOBJ_WRAP;
+            else if (x < -80)  x += WOBJ_WRAP;
+            s_wobj_x[i] = (int16_t)x;
+            /* off-track x lands ground_y at the planet's centre — below the
+             * panel — so things genuinely set behind the horizon */
+            lv_obj_set_pos(s_wobj[i], x - lv_obj_get_width(s_wobj[i]) / 2,
+                           ground_y(x) + s_wobj_dy[i]);
+        }
+
+        s_sky_par += dx;
+        if (s_sky_par >= 4 * 480 || s_sky_par <= -4 * 480) s_sky_par = 0;
+        if ((s_fcount & 3) == 0) {
+            static const uint16_t par_sx[STAR_N] = { 34, 78, 132, 190, 250, 300,
+                                                     352, 404, 60, 220, 330, 430 };
+            for (int i = 0; i < STAR_N; i++) {
+                int x = (par_sx[i] * 480 / 460 + s_sky_par / 4) % 480;
+                if (x < 0) x += 480;
+                lv_obj_set_x(s_star[i], x);
+            }
+            int mx = (76 + s_sky_par / 8) % 526;
+            if (mx < 0) mx += 526;
+            lv_obj_set_x(s_moon, mx - 46);
+        }
+
+        /* a landed snack rides the ground; the walker eats it in passing */
+        if (s_food_ready) {
+            s_food_x += dx;
+            if (s_food_x < -20 || s_food_x > 500) {
+                lv_obj_add_flag(s_food_item, LV_OBJ_FLAG_HIDDEN);
+                s_food_ready = false;
+                s_walking_to_food = false;
+            } else if (abs(s_food_x - s_cx) < 24 && s_act != ACT_EAT) {
+                s_walking_to_food = false;
+                set_act(ACT_EAT, 90);
+            }
+        }
+    }
+
     /* falling snack */
     if (!lv_obj_has_flag(s_food_item, LV_OBJ_FLAG_HIDDEN)) {
         int gy = ground_y(s_food_x) - 14;
@@ -3649,7 +3740,16 @@ static void pet_timer_cb(lv_timer_t *t) {
     int bob = 0, lean = 0, leg_l = 0, leg_r = 0, arm = 0;
     int eye_h = 12, squash = 0;
 
-    switch (s_act) {
+    if (traveling && s_act == ACT_IDLE) {
+        /* the travelling gait: same limbs as ACT_WALK, cadence scaled to
+         * how hard the world is being tilted */
+        int step = (s_fcount * (14 + abs(s_tilt_vel) * 4)) % 360;
+        leg_l = isin(step, 7);
+        leg_r = -leg_l;
+        arm   = -leg_l;
+        bob   = -abs(isin(step * 2, 3));
+        if (worst <= 30) eye_h = 6;
+    } else switch (s_act) {
     case ACT_WALK: {
         int d = s_tx - s_cx;
         if (abs(d) <= s_walk_speed) {
@@ -4061,38 +4161,50 @@ static void build_pet_app(lv_obj_t *scr) {
     lv_obj_set_style_border_color(planet, lv_color_hex(pet_col(PC_GROUND_HI)), 0);
     lv_obj_set_style_border_opa(planet, 190, 0);
 
-    lv_obj_t *c1 = rect(planet, 54, 20, 10, pet_col(PC_SPOT));
-    lv_obj_set_pos(c1, PLANET_R - 130, PLANET_R - 232);
-    lv_obj_t *c2 = rect(planet, 34, 14, 7, pet_col(PC_SPOT));
-    lv_obj_set_pos(c2, PLANET_R + 74, PLANET_R - 224);
-    lv_obj_t *c3 = rect(planet, 22, 10, 5, pet_col(PC_SPOT));
-    lv_obj_set_pos(c3, PLANET_R - 16, PLANET_R - 200);
+    /* Everything on the surface rides the travel track — ground details and
+     * props scroll around the planet while the walker holds centre stage.
+     * Positions are (track x of centre, y offset from the surface line). */
+    s_wobj_n = 0;
+    s_tilt_vel = s_tilt_vel_tgt = 0;
+    s_sky_par = 0;
 
-    /* --- per-world set dressing: two or three still props, dirt cheap --- */
+    lv_obj_t *c1 = rect(s_scr_pet, 54, 20, 10, pet_col(PC_SPOT));
+    wobj_add(c1, 137, 18);
+    lv_obj_t *c2 = rect(s_scr_pet, 34, 14, 7, pet_col(PC_SPOT));
+    wobj_add(c2, 331, 30);
+    lv_obj_t *c3 = rect(s_scr_pet, 22, 10, 5, pet_col(PC_SPOT));
+    wobj_add(c3, 235, 66);
+
+    /* --- per-world set dressing, also on the track --- */
     switch (s_pet.world & 3) {
     case 1: {                                        /* kelp on the seabed */
         lv_obj_t *k1 = rect(s_scr_pet, 6, 44, 3, pet_col(PC_SPOT));
-        lv_obj_set_pos(k1, 96, ground_y(99) - 40);
+        wobj_add(k1, 99, -40);
         lv_obj_t *k2 = rect(s_scr_pet, 5, 30, 2, pet_col(PC_GROUND_HI));
-        lv_obj_set_pos(k2, 388, ground_y(390) - 26);
+        wobj_add(k2, 390, -26);
         break;
     }
     case 2: {                                        /* one good tree */
         lv_obj_t *trunk = rect(s_scr_pet, 10, 46, 3, 0x5D4037);
-        lv_obj_set_pos(trunk, 372, ground_y(377) - 42);
+        wobj_add(trunk, 377, -42);
         lv_obj_t *crown = rect(s_scr_pet, 62, 52, 26, pet_col(PC_GROUND_HI));
-        lv_obj_set_pos(crown, 346, ground_y(377) - 88);
+        wobj_add(crown, 377, -88);
         break;
     }
-    case 3: {                                        /* skyline behind the roof */
+    case 3: {                                        /* rooftop water towers */
         lv_obj_t *b1 = rect(s_scr_pet, 44, 90, 3, pet_col(PC_SKY2));
-        lv_obj_set_pos(b1, 60, ground_y(82) - 84);
+        wobj_add(b1, 82, -84);
         lv_obj_t *b2 = rect(s_scr_pet, 34, 62, 3, pet_col(PC_SKY2));
-        lv_obj_set_pos(b2, 384, ground_y(400) - 58);
+        wobj_add(b2, 400, -58);
         break;
     }
     default:
         break;
+    }
+    /* park every track object where it belongs before the first scroll */
+    for (int i = 0; i < s_wobj_n; i++) {
+        lv_obj_set_pos(s_wobj[i], s_wobj_x[i] - lv_obj_get_width(s_wobj[i]) / 2,
+                       ground_y(s_wobj_x[i]) + s_wobj_dy[i]);
     }
 
     /* rocket on the pad, hidden until it flies */
@@ -4207,26 +4319,28 @@ static void build_pet_app(lv_obj_t *scr) {
     lv_obj_remove_flag(s_pet_qr_panel, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_add_event_cb(s_pet_qr_panel, pet_qr_close_cb, LV_EVENT_CLICKED, NULL);
     s_pet_qr = lv_qrcode_create(s_pet_qr_panel);
-    lv_qrcode_set_size(s_pet_qr, 220);
+    lv_qrcode_set_size(s_pet_qr, 200);
     lv_qrcode_set_dark_color(s_pet_qr, lv_color_hex(0x000000));
     lv_qrcode_set_light_color(s_pet_qr, lv_color_hex(0xFFFFFF));
     lv_qrcode_set_quiet_zone(s_pet_qr, true);
-    lv_obj_align(s_pet_qr, LV_ALIGN_CENTER, 0, -28);
+    lv_obj_align(s_pet_qr, LV_ALIGN_CENTER, 0, -58);
     lv_obj_remove_flag(s_pet_qr, LV_OBJ_FLAG_CLICKABLE);
     s_pet_qr_note = lv_label_create(s_pet_qr_panel);
-    lv_obj_set_width(s_pet_qr_note, CONTENT_W);
+    lv_obj_set_width(s_pet_qr_note, 300);
     lv_obj_set_style_text_align(s_pet_qr_note, LV_TEXT_ALIGN_CENTER, 0);
     lv_obj_set_style_text_color(s_pet_qr_note, lv_color_hex(0x10162A), 0);
     lv_label_set_text(s_pet_qr_note, "");
-    lv_obj_align(s_pet_qr_note, LV_ALIGN_CENTER, 0, 108);
+    lv_obj_align(s_pet_qr_note, LV_ALIGN_CENTER, 0, 74);
 
-    /* the sync button — 76 px per the touch rule, loud color on the white */
+    /* The sync button — 72 px per the touch rule. Sized and placed so its
+     * corners sit well inside the panel's corner arcs: on the glass the
+     * first 320x76 at -42 crowded the curve and read as a layout mistake. */
     s_pet_qr_btn = lv_button_create(s_pet_qr_panel);
-    lv_obj_set_size(s_pet_qr_btn, 320, 76);
-    lv_obj_set_style_radius(s_pet_qr_btn, 26, 0);
+    lv_obj_set_size(s_pet_qr_btn, 292, 72);
+    lv_obj_set_style_radius(s_pet_qr_btn, 24, 0);
     lv_obj_set_style_bg_color(s_pet_qr_btn, lv_color_hex(0xE76F51), 0);
     lv_obj_set_style_shadow_width(s_pet_qr_btn, 0, 0);
-    lv_obj_align(s_pet_qr_btn, LV_ALIGN_BOTTOM_MID, 0, -42);
+    lv_obj_align(s_pet_qr_btn, LV_ALIGN_BOTTOM_MID, 0, -58);
     lv_obj_add_event_cb(s_pet_qr_btn, pet_qr_sync_cb, LV_EVENT_CLICKED, NULL);
     s_pet_qr_btn_l = lv_label_create(s_pet_qr_btn);
     lv_obj_set_style_text_font(s_pet_qr_btn_l, &lv_font_montserrat_20, 0);
@@ -4258,6 +4372,10 @@ static void build_pet_app(lv_obj_t *scr) {
     lv_obj_add_event_cb(s_scr_pet, pet_gesture_cb, LV_EVENT_GESTURE, NULL);
 
     pet_seen();                     /* opening the app counts as a visit */
+    /* Opening the app is also the natural "did anything change?" moment: a
+     * design saved on the phone should appear on the next visit without the
+     * QR ceremony. The cfg_ver gate makes the fetch free when nothing did. */
+    __atomic_store_n(&s_req_pet_cfg, true, __ATOMIC_RELEASE);
     s_app_timer = lv_timer_create(pet_timer_cb, PET_FPS_MS, NULL);
 }
 
