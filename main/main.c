@@ -386,6 +386,7 @@ static bool broker_fetch(const char *path, const char *xname, const char *xval,
 static lv_obj_t *s_lock_time, *s_lock_date, *s_lock_meridiem;
 static lv_obj_t *s_lock_batt, *s_lock_charge;
 static lv_obj_t *s_lock_ring, *s_lock_inner_ring, *s_lock_batt_arc;
+static lv_obj_t *s_lock_ao_ring;      /* the desk-clock cue, amber */
 static uint8_t s_lock_charge_phase, s_lock_charge_div;
 
 /* Now-playing panel on the lock screen. Hidden unless Spotify actually has an
@@ -5453,6 +5454,10 @@ static void cfg_button_live(lv_obj_t *b, bool live) {
  * row next to its label, so fading only the switch leaves bright text over a
  * greyed control — worse than not fading at all. Dim the row; take CLICKABLE
  * off the switch, which is the object the indev actually hit-tests. */
+/* Unreferenced since the desk-clock switch stopped following the rings
+ * switch; kept compiled for the next faded-control need — --gc-sections
+ * drops it from the image, so it costs no flash. */
+__attribute__((unused))
 static void cfg_switch_live(lv_obj_t *sw, bool live) {
     if (!sw) return;
     lv_obj_t *row = lv_obj_get_parent(sw);
@@ -5969,14 +5974,11 @@ static void cfg_always_cb(lv_event_t *e) {
 
 static void cfg_rings_cb(lv_event_t *e) {
     s_lock_rings = lv_obj_has_state(lv_event_get_target(e), LV_STATE_CHECKED);
-    /* Drop always-on with them. Leaving it set would strand a faded switch in
-     * the ON position with no way to clear it, and keep the panel awake with
-     * nothing on screen explaining why. */
-    if (!s_lock_rings && s_always_on) {
-        s_always_on = false;
-        if (s_cfg_always_sw) lv_obj_remove_state(s_cfg_always_sw, LV_STATE_CHECKED);
-        ESP_LOGI(TAG, "always-on OFF (rings off, it has no indicator)");
-    }
+    /* Deliberately does NOT touch desk clock. An earlier version force-
+     * disabled it here so its indicator ring could not vanish while the mode
+     * ran — and that coupling was worse than the problem: it silently threw
+     * away a setting the user chose. The amber cue ring simply hides with
+     * the rings; the mode itself is the user's business. */
     s_req_lock_pref_save = true;
     ESP_LOGI(TAG, "lock-screen rings %s", s_lock_rings ? "ON" : "OFF");
 }
@@ -6195,16 +6197,6 @@ static void cfg_timer_cb(lv_timer_t *t) {
     if (s_cfg_rot_btn &&
         s_autorot != lv_obj_has_flag(s_cfg_rot_btn, LV_OBJ_FLAG_CLICKABLE)) {
         cfg_button_live(s_cfg_rot_btn, s_autorot);
-    }
-
-    /* Always-on has no standing indicator once the rings are off: the amber
-     * base ring IS the readout, and lock_refresh() hides it with the rest.
-     * The mode would still run, which is worse than it not running — a lit
-     * panel with nothing saying why. Same fade-not-hide treatment the
-     * calibration button gets, and change-gated for the same reason. */
-    if (s_cfg_always_sw &&
-        s_lock_rings != lv_obj_has_flag(s_cfg_always_sw, LV_OBJ_FLAG_CLICKABLE)) {
-        cfg_switch_live(s_cfg_always_sw, s_lock_rings);
     }
 
     /* ---- battery ---- */
@@ -6534,7 +6526,11 @@ static void build_control_app(lv_obj_t *scr) {
 
     /* ---- lock screen ---- */
     c = cfg_card(col, "LOCK SCREEN", CFG_ACCENT_LOCK);
-    s_cfg_always_sw = cfg_switch(c, "Always-on screen", CFG_ACCENT_LOCK,
+    /* "Desk clock", because that is what the mode IS — the cube sits lit on
+     * the desk telling the time. "Always-on screen" described the mechanism
+     * and answered no one's actual question. The amber ring on the lock
+     * screen is this switch's readout, when the rings are on to host it. */
+    s_cfg_always_sw = cfg_switch(c, "Desk clock (stay lit)", CFG_ACCENT_LOCK,
                                  s_always_on, cfg_always_cb);
     s_cfg_rings_sw = cfg_switch(c, "Lock-screen rings", CFG_ACCENT_LOCK,
                                 s_lock_rings, cfg_rings_cb);
@@ -10899,17 +10895,13 @@ static void lock_refresh(void) {
         lv_obj_set_style_arc_color(s_lock_batt_arc, arc_color, LV_PART_MAIN);
     }
 
-    /* The Always On cue has its own 412 px path inside the 430 px battery
-     * gauge. Sharing one path hid it at 100%; placing it outside at 444 px let
-     * the rounded panel mask clip its corners. */
-    if (s_lock_ring) {
-        lv_color_t ring_color = lv_color_hex(s_always_on ? 0xF59E0B : 0x123A52);
-        if (!lv_color_eq(lv_obj_get_style_arc_color(s_lock_ring, LV_PART_MAIN),
-                         ring_color)) {
-            lv_obj_set_style_arc_color(s_lock_ring, ring_color, LV_PART_MAIN);
-        }
-    }
+    /* The desk-clock cue is its own amber ring at 394 px, inside the 412 px
+     * base and the 430 px battery gauge (444 px clipped at the corners; one
+     * shared path hid the cue at 100%). It shows only when the mode is on
+     * AND the rings are drawn — with rings off the mode still runs, it just
+     * has no jewellery. */
     obj_set_hidden_changed(s_lock_ring, !s_lock_rings);
+    obj_set_hidden_changed(s_lock_ao_ring, !(s_lock_rings && s_always_on));
     obj_set_hidden_changed(s_lock_inner_ring, !s_lock_rings);
     obj_set_hidden_changed(s_lock_batt_arc, !s_lock_rings);
 }
@@ -11193,6 +11185,22 @@ static void build_lock_screen(lv_obj_t *scr) {
     lv_obj_set_style_arc_width(s_lock_ring, 0, LV_PART_INDICATOR);
     lv_obj_set_style_arc_color(s_lock_ring, lv_color_hex(0x123A52), LV_PART_MAIN);
     lv_arc_set_bg_angles(s_lock_ring, 0, 360);
+
+    /* The desk-clock cue: its OWN amber ring, present only while the mode is
+     * on. It used to be a recolor of the base ring above, which coupled two
+     * unrelated settings — rings off force-disabled desk clock "because the
+     * indicator would vanish". Decoupled by request: the mode runs with or
+     * without rings; the cue simply needs rings to have somewhere to live. */
+    s_lock_ao_ring = lv_arc_create(scr);
+    lv_obj_set_size(s_lock_ao_ring, 394, 394);
+    lv_obj_center(s_lock_ao_ring);
+    lv_obj_remove_style(s_lock_ao_ring, NULL, LV_PART_KNOB);
+    lv_obj_remove_flag(s_lock_ao_ring, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_set_style_arc_width(s_lock_ao_ring, 5, LV_PART_MAIN);
+    lv_obj_set_style_arc_width(s_lock_ao_ring, 0, LV_PART_INDICATOR);
+    lv_obj_set_style_arc_color(s_lock_ao_ring, lv_color_hex(0xF59E0B), LV_PART_MAIN);
+    lv_arc_set_bg_angles(s_lock_ao_ring, 0, 360);
+    lv_obj_add_flag(s_lock_ao_ring, LV_OBJ_FLAG_HIDDEN);
 
     s_lock_inner_ring = lv_arc_create(scr);
     lv_obj_set_size(s_lock_inner_ring, 372, 372);
@@ -11583,7 +11591,7 @@ static void app_open(int idx) {
     s_lock_time = NULL; s_lock_date = NULL; s_lock_meridiem = NULL;
     s_lock_batt = NULL;
     s_lock_charge = NULL; s_lock_ring = NULL; s_lock_inner_ring = NULL;
-    s_lock_batt_arc = NULL;
+    s_lock_batt_arc = NULL; s_lock_ao_ring = NULL;
     s_lock_np = NULL;
     s_lock_np_art = NULL; s_lock_np_ph = NULL;
     s_lock_np_track = NULL; s_lock_np_prev = NULL; s_lock_np_play = NULL;
