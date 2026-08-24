@@ -156,6 +156,54 @@ Only the Unsplash Access Key belongs on the device — public read endpoints use
 Client-ID auth. The Secret Key is for OAuth flows Facet does not use, so it
 never reaches the firmware.
 
+## Running more than one cube — read this first
+
+**Every cube needs its own `BROKER_TOKEN`.** The broker identifies a cube purely
+by that bearer, so two cubes carrying the same token *are* the same user: they
+share the Spotify account, the DAYS countdown, and everything else keyed on
+identity. The symptom is a freshly flashed cube opening MUSIC and finding
+somebody else's music already playing — which reads as a broker bug and is not
+one. Generate each with `openssl rand -hex 32`; the broker rejects bearers under
+32 characters and refuses to let two users share one.
+
+Only two of the three layers are per-cube:
+
+| Layer | Identifies | How many |
+|---|---|---|
+| Spotify app — `SPOTIFY_CLIENT_ID` in `broker.env` | the software | **one**, shared by every cube |
+| Spotify account | whose music plays | one per cube |
+| Broker user — an entry in `BROKER_USERS` | which cube is asking | one per cube |
+
+So a second cube means a second `BROKER_USERS` entry and a second token, **not a
+second Spotify app**. Two cubes may equally share one Spotify account and still
+keep separate countdowns, because DAYS is keyed on the broker user rather than on
+Spotify.
+
+### Spotify Development mode admits five accounts, by hand
+
+A Spotify app starts in **Development mode**, which admits only accounts you add
+under **User Management** — five of them. Add the account each cube logs in with
+to the app whose Client ID matches `SPOTIFY_CLIENT_ID` in `broker.env`, and match
+that app **by Client ID, never by name**: two apps in one dashboard can differ in
+a single character and look otherwise identical.
+
+Getting it wrong fails late and misleadingly. The QR login succeeds, the broker
+stores a refresh token and mints access tokens normally, and only the Spotify
+call fails:
+
+```text
+403  The user is not registered for this application.
+```
+
+*Every* endpoint returns it, including `/v1/me` — which is how you tell it from a
+scope problem, where sibling endpoints still answer 200
+([HARDWARE.md pitfall #16](docs/HARDWARE.md)). An authorised account with nothing
+playing returns **204**, not 403.
+
+Lifting the five-account limit means requesting Extended Quota Mode, a manual
+Spotify review measured in weeks. For a handful of personal cubes, adding the
+accounts is the cheaper answer.
+
 ## Documentation
 
 - **[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)** — the app model, the state

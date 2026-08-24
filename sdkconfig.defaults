@@ -193,6 +193,19 @@ CONFIG_FREERTOS_USE_TICKLESS_IDLE=y
 CONFIG_FATFS_LFN_HEAP=y
 CONFIG_FATFS_MAX_LFN=64
 
+#### microSD: what to do with a card the cube cannot mount.
+# exFAT is compiled out (FF_FS_EXFAT=0), so a card formatted by a phone or a
+# camera mounts as FR_NO_FILESYSTEM (13) and every card-backed feature quietly
+# degrades: no wallpapers, no telemetry, app state falls back to NVS. The status
+# line shows it as sd=0.
+#
+# Enabling the option below makes the BSP format such a card as FAT32 with an
+# MBR on the next boot. It is left OFF because it is DESTRUCTIVE and silent:
+# f_mkfs runs with FM_ANY against whatever is inserted, so a card that merely
+# failed to read once loses everything with no prompt. Turn it on deliberately
+# for one boot to reformat a known-expendable card, then turn it off again.
+# CONFIG_BSP_SD_FORMAT_ON_MOUNT_FAIL=y
+
 #### The Wi-Fi setup QR code
 # The cube draws a QR pointing at the setup page, so nobody has to be told a URL.
 # LVGL's encoder renders into a 1-bpp canvas, which LV_DRAW_SW_SUPPORT_I1 above
