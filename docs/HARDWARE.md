@@ -133,7 +133,9 @@ CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_240=y
 CONFIG_BSP_ERROR_CHECK=n                 # init failures return instead of abort
 
 CONFIG_LV_USE_CLIB_MALLOC=y
-CONFIG_LV_DRAW_SW_DRAW_UNIT_CNT=2        # 1 unit + LV_USE_OS gives fps=0.0
+CONFIG_LV_OS_NONE=y                      # threaded dispatch cost ~12% (pitfall #30)
+CONFIG_LV_DRAW_SW_DRAW_UNIT_CNT=1        # inline unit; the old "1 unit stalls"
+                                         # applied only WITH LV_USE_OS
 CONFIG_LV_USE_PERF_MONITOR=n             # otherwise LVGL paints its own grey box
 CONFIG_LV_CACHE_DEF_SIZE=5242880         # defaults to 0 — see §7c
 
@@ -918,14 +920,19 @@ it independently will need the same ones:
    invariant "brightness only ever comes from `s_bright`" would have been
    enforced by nothing but the absence of callers.
 
-A second fork, `esp_lcd_touch_cst9217` (from `waveshare/esp_lcd_touch_cst9217`
-v2.0.0), is **prepared but not yet in the tree** — it was held out while a
-touch-scroll crash repro ran, because a driver with changed sample latency is a
-variable that repro cannot carry. To reinstate: put the directory back under
-`components/` and replace the BSP manifest's
-`waveshare/esp_lcd_touch_cst9217: '*'` with
-`esp_lcd_touch_cst9217: { path: ../esp_lcd_touch_cst9217 }`, then
-`idf.py reconfigure`. Its one change:
+A second fork of the touch driver was attempted and **failed on hardware** —
+it is parked out of the tree, and the registry `waveshare/esp_lcd_touch_cst9217`
+is what ships. The change (single I2C transaction per register access,
+`lcd_cmd_bits = 16`, no inter-phase delay — modelled on SensorLib's
+`i2c_master_transmit_receive`) looked right from source and passed every
+synthetic test, because **no synthetic test moves a finger**: with the fork the
+touch init failed silently — `BSP_ERROR_CHECK=n` swallowed the error, no indev
+was registered, and the boot log simply had no touch lines at all. The glass
+was dead until a human tried it. Two lessons: this chip apparently does need
+the stop-then-delay between address write and data read, whatever SensorLib's
+CST92xx path implies; and verify touch by grepping for the SUCCESS line
+("Touch input device registered"), not for the absence of errors (#28). The
+parked fork's intent, if anyone retries with the chip's datasheet in hand:
 
 1. **Every touch sample parked the LVGL task for 2-3 ms.** `cst9217_read_reg()`
    wrote the 16-bit register address, `vTaskDelay(pdMS_TO_TICKS(2))`, then read
@@ -1217,12 +1224,34 @@ variable that repro cannot carry. To reinstate: put the directory back under
     compare against another scene's numbers to find one — that measures the
     content difference, not a constant. Rounded corners and the translucent
     card border cost nothing (2.75 vs 2.77 with both removed). The per-flush
-    byte swap is ~6%. What is left is the flat fill/blend path itself, which
-    is why the ESP32-S3 PIE blenders are the lever. Separately, every touch
+    byte swap is ~6%. **The lever turned out to be LVGL's draw-task dispatch,
+    not the pixels**: on the identical synthetic scroll (CLAUDE.md, Autonomous
+    hardware verification), `LV_OS_NONE` + one inline draw unit took render
+    from 48.5 to 43.5 ms — **~12%** — while the vendored ESP32-S3 PIE blenders
+    measured a flat zero in BOTH dispatch regimes and were removed. Two
+    method lessons paid for twice here: an earlier "+31%" came from comparing
+    a synthetic scroll against a human one (the touch pipeline inflates the
+    human baseline — only paired workloads compare), and "SIMD must help an
+    87-cycle pixel" was worth one measurement, not a belief — the fills the
+    assembly accelerates were never where the time went. Separately, every touch
     sample used to park the LVGL task 2-3 ms (§9 fork 2), and a slider under
     the finger commits on touch-down because `lv_slider` jumps to the press
     point — `cfg_bright_cb` applied brightness above its RELEASED guard; the
     guards in `cfg_slider()` / `cfg_scroll_guard_cb()` are the fix.
+31. **A LoadProhibited in ROM strlen under vfprintf is `printf("%s", NULL)`,
+    and tonight's ten "heap ghost" crashes were one compiled-out app.** The
+    register dump names it before any backtrace: PC looping in ROM with
+    0xff/0xff00/0xff0000 masks loaded, EXCVADDR = 0. `s_apps[]` keeps a zeroed
+    hole for an app compiled out (`FACET_APP_PET 0`) and `app_open()` was the
+    one table consumer that never called `app_enabled()` — its "opened %s" log
+    then strlen'd the hole's NULL name. No gesture can request a hole (the
+    drawer draws no tile), so the device never crashed for a person; the
+    self-test harness requested it by enum and produced an intermittent-looking
+    string of panics that mimicked heap corruption, then a clean 11 s crash
+    loop once the request came first. Guard added at the top of `app_open()`.
+    Two lessons: read the register dump before theorising — EXCVADDR 0 in a
+    ROM string loop is a five-second diagnosis; and a harness that drives the
+    firmware by enum must skip what the build compiled out.
 
 ## 11. Debugging method that worked
 
@@ -1233,6 +1262,9 @@ variable that repro cannot carry. To reinstate: put the directory back under
 - Watch the *minimum* internal heap watermark, not the current free.
 - Capture serial to a file with a small pyserial script that reconnects across
   resets, rather than an interactive monitor; then grep it.
+  `tools/capture.py` is that script; `tools/snap_rx.py` rebuilds the
+  screenshots the self-test harness dumps (see CLAUDE.md, Autonomous hardware
+  verification).
 - When a symptom is geometric (rotation, touch mapping), find the vendor or
   reference implementation and copy its table. Deriving it from first principles
   took several wrong guesses; `esp_lvgl_port` had the answer.

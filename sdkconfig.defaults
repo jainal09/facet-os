@@ -56,11 +56,16 @@ CONFIG_LV_USE_CLIB_SPRINTF=y
 # 10 ms, not 15: the refresh period caps the frame rate at 1000/period, so 15 ms
 # was a 66 fps ceiling. The panel and the draw buffers can do better now.
 CONFIG_LV_DEF_REFR_PERIOD=10
-CONFIG_LV_OS_FREERTOS=y
+# LV_USE_OS off, one draw unit, rendering inline on the LVGL task. The
+# threaded dispatch (OS_FREERTOS + 2 units) cost ~5 ms of every scroll frame:
+# measured 48.5 -> 43.5 ms render on the identical synthetic CONTROL scroll
+# (2026-08-24, HARDWARE.md pitfall #30). The old vendor note "1 unit +
+# LV_USE_OS stalls" was about that combination only; with LV_USE_OS off a
+# single inline unit is both correct and the fastest measured configuration.
+CONFIG_LV_OS_NONE=y
 CONFIG_LV_OBJ_STYLE_CACHE=y
-# 2 draw units (vendor value): 1 unit + LV_USE_OS stalls LVGL9 render dispatch
 # after the first frame (measured fps=0.0 across all 1-unit builds)
-CONFIG_LV_DRAW_SW_DRAW_UNIT_CNT=2
+CONFIG_LV_DRAW_SW_DRAW_UNIT_CNT=1
 # Drawer tiles use an 18 px glow around a 34 px radius.  Cache that 52 px
 # corner mask (2.7 KB) instead of re-blurring it for every redraw/transition.
 CONFIG_LV_DRAW_SW_SHADOW_CACHE_SIZE=52
@@ -94,7 +99,11 @@ CONFIG_LV_LOG_PRINTF=y
 CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_240=y
 CONFIG_FREERTOS_HZ=1000
 CONFIG_FREERTOS_TIMER_TASK_STACK_DEPTH=4096
-CONFIG_ESP_MAIN_TASK_STACK_SIZE=8192
+# 16 KB, not 8: with LV_OS_NONE anything that calls lv_refr_now or
+# lv_snapshot_take renders the full pipeline — TJpgD album-art decode included
+# — on its OWN stack. The main task does both (app_open reveal, chord
+# screenshots) and 8 KB wild-jumped (IllegalInstruction) rendering MUSIC.
+CONFIG_ESP_MAIN_TASK_STACK_SIZE=16384
 CONFIG_ESP_TASK_WDT_TIMEOUT_S=30
 
 #### TLS — outbound HTTPS to the Funnel endpoint and to Unsplash
@@ -273,9 +282,3 @@ CONFIG_BT_CTRL_BLE_MAX_ACT=2
 CONFIG_BT_CTRL_ADV_DUP_FILT_MAX=1
 CONFIG_BT_CTRL_BLE_SCAN_DUPL=n
 CONFIG_BT_CTRL_BLE_ADV_REPORT_FLOW_CTRL_SUPP=n
-
-# ESP32-S3 PIE blenders for LVGL's plain fill / opaque copy paths, from
-# components/lv_blend_esp32s3 (vendored esp_lvgl_port 2.9.0 SIMD). Only the
-# mask==NULL, opa==COVER paths are accelerated; AA text and masks stay in C.
-CONFIG_LV_DRAW_SW_ASM_CUSTOM=y
-CONFIG_LV_DRAW_SW_ASM_CUSTOM_INCLUDE="esp_lvgl_port_lv_blend.h"
