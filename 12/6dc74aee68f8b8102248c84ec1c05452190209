@@ -1,0 +1,19 @@
+README.md
+  s_50feeff784e1f2::t_1844d0afd88d72 10-13,64-81
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.24",
+  "base_commit_sha": "126dc74aee68f8b8102248c84ec1c05452190209",
+  "prompts": {},
+  "sessions": {
+    "s_50feeff784e1f2": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "4fd2c98c-653c-447f-bb5d-45ae59b02a82",
+        "model": "unknown"
+      },
+      "human_author": "Jainal Gosaliya <jainal09gosalia@gmail.com>"
+    }
+  }
+}
