@@ -1,0 +1,26 @@
+main/main.c
+  s_bd4d271118eabc::t_4a7ed54b4bf950 3148,3153,3157,3173-3176,3189,3191-3196,3202-3216
+  s_bd4d271118eabc::t_a7db85ab7e4f34 3133-3136
+  s_bd4d271118eabc::t_3fbb392f91908a 3177,3183-3186
+  s_bd4d271118eabc::t_b5e6e77e9a42af 3187
+docs/HARDWARE.md
+  s_bd4d271118eabc::t_6ea6e26267536e 1255-1276
+docs/ARCHITECTURE.md
+  s_bd4d271118eabc::t_b7771cad6c616f 365-421
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.24",
+  "base_commit_sha": "d76400868e730c2417d7cc8efd687a371247dfb4",
+  "prompts": {},
+  "sessions": {
+    "s_bd4d271118eabc": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "d96b6df7-9f4d-4c00-8b11-0494e1b58cb8",
+        "model": "claude-fable-5"
+      },
+      "human_author": "Jainal Gosaliya <jainal09gosalia@gmail.com>"
+    }
+  }
+}
