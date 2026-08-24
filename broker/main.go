@@ -116,6 +116,9 @@ type broker struct {
 	pairs        map[string]*pending
 	daysLinks    map[string]daysLink
 	daysSessions map[[sha256.Size]byte]daysSession
+	petLinks     map[string]petLink
+	petSessions  map[[sha256.Size]byte]petSession
+	petWx        map[string]petWeather
 	credentials  map[string]string
 	access       map[string]cachedAccess
 	refreshMu    map[string]*sync.Mutex
@@ -168,6 +171,9 @@ func main() {
 		pairs:        map[string]*pending{},
 		daysLinks:    map[string]daysLink{},
 		daysSessions: map[[sha256.Size]byte]daysSession{},
+		petLinks:     map[string]petLink{},
+		petSessions:  map[[sha256.Size]byte]petSession{},
+		petWx:        map[string]petWeather{},
 		credentials:  map[string]string{},
 		access:       map[string]cachedAccess{},
 		refreshMu:    map[string]*sync.Mutex{},
@@ -194,6 +200,15 @@ func main() {
 	mux.HandleFunc("/days", b.handleDaysPage)
 	mux.HandleFunc("/days/link", b.handleDaysLink)
 	mux.HandleFunc("/days/session", b.handleDaysSession)
+	// The PET designer and its cube endpoints — see pet.go.
+	mux.HandleFunc("/pet", b.handlePetPage)
+	mux.HandleFunc("/pet/link", b.handlePetLink)
+	mux.HandleFunc("/pet/session", b.handlePetSession)
+	mux.HandleFunc("/pet/data", b.handlePetData)
+	mux.HandleFunc("/pet/design", b.handlePetDesign)
+	mux.HandleFunc("/pet/cfg", b.handlePetCfg)
+	mux.HandleFunc("/pet/st", b.handlePetState)
+	mux.HandleFunc("/pet/sheet", b.handlePetSheet)
 
 	srv := &http.Server{
 		Addr:              cfg.addr,
@@ -475,6 +490,7 @@ func (b *broker) reapPairs() {
 			}
 		}
 		b.reapDaysLocked(now)
+		b.reapPetLocked(now)
 		b.mu.Unlock()
 	}
 }

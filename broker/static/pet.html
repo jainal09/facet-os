@@ -1,0 +1,444 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; base-uri 'none'; form-action 'none'; style-src 'sha256-5EruDijMTMjQqO9Ia9MZTtnyFjO1LSQHOuvRKMAbad4='; script-src 'sha256-R+WZ1Tdyk9IiWYBG0U/1GqKmF2pzGIvsYwdEFMA4+Is='; connect-src 'self'; require-trusted-types-for 'script'; trusted-types 'none'">
+<title>Facet · Pet</title>
+<style>
+  :root {
+    --bg: #05070b; --card: #0c111a; --line: #1b2230;
+    --text: #f2e9dc; --dim: #7a8ba5; --accent: #f4a261; --violet: #8b7cf6;
+  }
+  * { box-sizing: border-box; margin: 0; }
+  body {
+    background: var(--bg); color: var(--text); min-height: 100vh;
+    display: grid; place-items: center; padding: 24px;
+    font: 16px/1.5 ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  }
+  .card {
+    width: min(460px, calc(100vw - 32px)); background: var(--card);
+    border: 1px solid var(--line); border-radius: 20px; padding: 26px;
+  }
+  h1 {
+    font-size: 13px; font-weight: 600; letter-spacing: 4px;
+    color: var(--dim); text-transform: uppercase; text-align: center;
+  }
+  .status { text-align: center; margin: 20px 0 8px; }
+  .status b {
+    font-size: 40px; font-weight: 700; letter-spacing: 2px;
+    color: var(--accent); display: block;
+  }
+  .status span { font-size: 12px; letter-spacing: 3px; color: var(--dim); }
+  .meters { display: flex; gap: 10px; margin: 16px 0 4px; }
+  .meter { flex: 1; }
+  .meter i {
+    font-style: normal; font-size: 10px; letter-spacing: 2px; color: var(--dim);
+    display: block; margin-bottom: 4px;
+  }
+  .meter u {
+    display: block; height: 8px; border-radius: 4px; background: var(--bg);
+    border: 1px solid var(--line); overflow: hidden; text-decoration: none;
+  }
+  .meter u s {
+    display: block; height: 100%; background: var(--accent); width: 0%;
+    text-decoration: none; transition: width .4s;
+  }
+  #mhap s { background: var(--violet); }
+  .facts { font-size: 11px; letter-spacing: 2px; color: var(--dim); text-align: center; margin: 10px 0 4px; }
+  label { font-size: 11px; letter-spacing: 2px; color: var(--dim); display: block; margin: 16px 0 6px; }
+  input {
+    width: 100%; padding: 12px 14px; border-radius: 12px;
+    border: 1px solid var(--line); background: var(--bg); color: var(--text);
+    font: inherit; outline: none; appearance: none;
+  }
+  input:focus { border-color: var(--accent); }
+  .row { display: flex; gap: 10px; }
+  .row > div { flex: 1; }
+  .cards { display: flex; gap: 8px; flex-wrap: wrap; }
+  .pick {
+    flex: 1; min-width: 86px; padding: 8px 6px; border-radius: 12px;
+    border: 2px solid var(--line); background: var(--bg); cursor: pointer;
+    display: grid; justify-items: center; gap: 6px;
+  }
+  .pick.sel { border-color: var(--accent); }
+  .pick span { font-size: 10px; letter-spacing: 1px; color: var(--dim); text-align: center; }
+  .pick.sel span { color: var(--accent); }
+  .pick canvas { border-radius: 8px; display: block; }
+  button {
+    width: 100%; margin-top: 22px; padding: 14px; border: 0; border-radius: 12px;
+    background: var(--accent); color: #0b0616; font: inherit; font-weight: 700;
+    letter-spacing: 3px; cursor: pointer;
+  }
+  button:active { transform: translateY(1px); }
+  button:disabled, input:disabled { opacity: .45; cursor: not-allowed; }
+  .pick[data-off="1"] { opacity: .45; pointer-events: none; }
+  #coax {
+    display: none; margin-top: 20px; padding: 16px; border-radius: 12px;
+    border: 1px solid var(--accent);
+  }
+  #coax.away { display: block; }
+  #coax p { font-size: 12px; letter-spacing: 1px; color: var(--text); margin-bottom: 8px; }
+  #coax button { background: var(--violet); color: #fff; margin-top: 12px; }
+  #intro { text-align: center; font-size: 12px; letter-spacing: 2px; color: var(--dim); margin: 20px 0 4px; }
+  #hint {
+    margin-top: 14px; padding: 12px; border-radius: 12px; border: 1px dashed var(--line);
+    font-size: 11px; letter-spacing: 1px; color: var(--dim); text-align: center;
+  }
+  #msg { text-align: center; font-size: 12px; letter-spacing: 2px; color: var(--dim); margin-top: 14px; min-height: 18px; }
+  #msg.ok { color: #35c759; }
+  #msg.err { color: #ff453a; }
+</style>
+</head>
+<body>
+<div class="card">
+  <h1>Pet Designer</h1>
+  <div class="status"><b id="pn">—</b><span id="pw">CONNECT TO MEET YOUR PET</span></div>
+  <div class="meters">
+    <div class="meter" id="mhun"><i>FED</i><u><s></s></u></div>
+    <div class="meter" id="mhap"><i>HAPPY</i><u><s></s></u></div>
+  </div>
+  <div class="facts" id="pf"></div>
+
+  <div id="coax">
+    <p>YOUR PET PACKED A TINY SUITCASE AND LEFT.</p>
+    <label for="sorry">WRITE A SHORT APOLOGY (IT STAYS BETWEEN YOU TWO)</label>
+    <input id="sorry" type="text" maxlength="120" autocomplete="off" spellcheck="false"
+           placeholder="I AM SORRY, COME HOME">
+    <label for="meal">LEAVE OUT A FAVOURITE MEAL</label>
+    <div class="cards" id="mealCards"></div>
+    <button id="coaxbtn" type="button">LEAVE IT ON THE DOORSTEP</button>
+  </div>
+
+  <label for="name">NAME</label>
+  <input id="name" type="text" maxlength="11" autocomplete="off" spellcheck="false" placeholder="PIP">
+
+  <label>SPECIES — WHO LIVES ON YOUR CUBE</label>
+  <div class="cards" id="speciesCards"></div>
+
+  <label>WORLD — WHERE THEY LIVE</label>
+  <div class="cards" id="worldCards"></div>
+
+  <label>THEME — HOW THE SCREEN DRESSES</label>
+  <div class="cards" id="themeCards"></div>
+
+  <label>HAT</label>
+  <div class="cards" id="hatCards"></div>
+
+  <div class="row">
+    <div>
+      <label for="ss">BEDTIME</label>
+      <input id="ss" type="time" value="22:00">
+    </div>
+    <div>
+      <label for="se">WAKES UP</label>
+      <input id="se" type="time" value="07:00">
+    </div>
+  </div>
+
+  <div class="row">
+    <div>
+      <label for="bday">YOUR BIRTHDAY (MM-DD)</label>
+      <input id="bday" type="text" maxlength="5" autocomplete="off" spellcheck="false" placeholder="07-14">
+    </div>
+    <div>
+      <label for="city">CITY, FOR REAL WEATHER</label>
+      <input id="city" type="text" maxlength="40" autocomplete="off" spellcheck="false" placeholder="BOSTON">
+    </div>
+  </div>
+
+  <div id="intro">SCAN THE QR ON YOUR CUBE TO CONNECT</div>
+  <button id="save" type="button" disabled>SAVE TO CUBE</button>
+  <div id="hint">HOW SYNC WORKS: SAVE HERE, THEN TAP THE QR SCREEN ON YOUR CUBE.
+    IT SAYS "SYNCING..." AND REDRAWS WITH YOUR DESIGN.</div>
+  <div id="msg"></div>
+</div>
+
+<script>
+  const $ = id => document.getElementById(id);
+  let accessToken = '';
+  const STAGES = ['EGG', 'BABY', 'CHILD', 'TEEN', 'ADULT', 'AWAY'];
+  const sel = { species: 0, world: 0, theme: 0, hat: 0, meal: 0 };
+
+  // ---- tiny scene painters: every option shows itself ----
+  const BIT = [ // must match the broker's sprite frame 0
+    '............', '..d......d..', '..dd....dd..', '..oooooooo..',
+    '.oooooooooo.', '.ooeooooeoo.', '.oooooooooo.', '.opoodoopoo.',
+    '.oooooooooo.', '..oooooooo..', '..oo....oo..', '............'
+  ];
+  const THEMES = [
+    { name: 'MODERN',    bg: '#0A0F22', o: '#F4F1DE', d: '#264653', e: '#10162A', p: '#E76F51', hi: '#8DE0D2' },
+    { name: 'RETRO LCD', bg: '#9BBC0F', o: '#0F380F', d: '#306230', e: '#9BBC0F', p: '#306230', hi: '#8BAC0F' },
+    { name: 'INK',       bg: '#F2F2F2', o: '#141414', d: '#4D4D4D', e: '#F2F2F2', p: '#8A8A8A', hi: '#FFFFFF' },
+    { name: 'NEON',      bg: '#000000', o: '#00E5FF', d: '#0077AA', e: '#001018', p: '#FF2D95', hi: '#FFFFFF' }
+  ];
+
+  function stars(x, w, h) {
+    x.fillStyle = '#FFF3D6';
+    for (const [sx, sy] of [[8,8],[24,14],[40,6],[58,16],[74,9],[30,24],[66,26]])
+      if (sx < w - 4 && sy < h - 20) x.fillRect(sx, sy, 2, 2);
+  }
+  function drawPip(x, w, h, t) {
+    x.fillStyle = t.bg; x.fillRect(0, 0, w, h); stars(x, w, h);
+    x.fillStyle = '#2A9D8F'; x.beginPath(); x.arc(w / 2, h + 26, 40, 0, 7); x.fill();
+    const cx = w / 2 - 11, cy = h - 34;
+    x.fillStyle = '#E76F51'; x.fillRect(cx - 5, cy + 4, 7, 12);          // pack
+    x.fillStyle = t.o; x.beginPath(); x.roundRect(cx, cy, 22, 17, 6); x.fill();
+    x.fillStyle = '#264653'; x.beginPath(); x.roundRect(cx + 4, cy + 3, 14, 8, 4); x.fill();
+    x.fillStyle = t.hi; x.fillRect(cx + 7, cy + 5, 2, 4); x.fillRect(cx + 13, cy + 5, 2, 4);
+    x.fillStyle = '#264653'; x.fillRect(cx + 3, cy + 17, 5, 6); x.fillRect(cx + 14, cy + 17, 5, 6);
+  }
+  function drawBit(x, w, h, t) {
+    x.fillStyle = t.bg; x.fillRect(0, 0, w, h);
+    const s = 4, ox = (w - 12 * s) / 2, oy = (h - 12 * s) / 2;
+    const map = { o: t.o, d: t.d, e: t.e, p: t.p, w: t.hi };
+    for (let r = 0; r < 12; r++) for (let c = 0; c < 12; c++) {
+      const ch = BIT[r][c];
+      if (ch === '.') continue;
+      x.fillStyle = map[ch] || t.o;
+      x.fillRect(ox + c * s, oy + r * s, s, s);
+    }
+  }
+  function drawWorld(x, w, h, kind) {
+    if (kind === 0) {          // tiny planet
+      x.fillStyle = '#0A0F22'; x.fillRect(0, 0, w, h); stars(x, w, h);
+      x.fillStyle = '#E9C46A'; x.beginPath(); x.arc(16, 12, 6, 0, 7); x.fill();
+      x.fillStyle = '#2A9D8F'; x.beginPath(); x.arc(w / 2, h + 34, 48, 0, 7); x.fill();
+    } else if (kind === 1) {   // ocean floor
+      x.fillStyle = '#04182E'; x.fillRect(0, 0, w, h);
+      x.fillStyle = '#0A2E4E'; x.fillRect(0, 0, w, 18);
+      x.fillStyle = '#C2B280'; x.fillRect(0, h - 12, w, 12);
+      x.strokeStyle = '#8DE0D2'; x.lineWidth = 1;
+      for (const [bx, by, r] of [[18, 22, 3], [26, 14, 2], [70, 18, 3], [78, 10, 2]]) {
+        x.beginPath(); x.arc(bx, by, r, 0, 7); x.stroke();
+      }
+      x.fillStyle = '#2E5E4E';
+      x.fillRect(58, h - 26, 3, 14); x.fillRect(64, h - 22, 3, 10);
+    } else if (kind === 2) {   // forest glade
+      x.fillStyle = '#0F1A2E'; x.fillRect(0, 0, w, h);
+      x.fillStyle = '#2E7D32'; x.fillRect(0, h - 14, w, 14);
+      x.fillStyle = '#5D4037'; x.fillRect(22, h - 30, 5, 16);
+      x.fillStyle = '#388E3C'; x.beginPath(); x.arc(24, h - 34, 12, 0, 7); x.fill();
+      x.fillStyle = '#66BB6A'; x.beginPath(); x.arc(66, h - 20, 8, 0, 7); x.fill();
+      x.fillStyle = '#FFF3D6'; x.fillRect(78, 8, 2, 2); x.fillRect(60, 12, 2, 2);
+    } else {                   // city rooftop
+      x.fillStyle = '#0B1020'; x.fillRect(0, 0, w, h);
+      x.fillStyle = '#1B2430';
+      x.fillRect(6, 16, 16, h - 28); x.fillRect(30, 8, 18, h - 20); x.fillRect(56, 20, 14, h - 32);
+      x.fillStyle = '#E9C46A';
+      for (const [wx, wy] of [[10, 22], [16, 30], [36, 14], [42, 26], [60, 26]]) x.fillRect(wx, wy, 3, 3);
+      x.fillStyle = '#37474F'; x.fillRect(0, h - 12, w, 12);
+    }
+  }
+  function drawHat(x, w, h, kind) {
+    x.fillStyle = '#0C111A'; x.fillRect(0, 0, w, h);
+    x.fillStyle = '#F4F1DE'; x.beginPath(); x.arc(w / 2, h - 14, 13, 0, 7); x.fill();
+    if (kind === 1) {          // cap
+      x.fillStyle = '#E76F51';
+      x.beginPath(); x.arc(w / 2, h - 24, 10, Math.PI, 0); x.fill();
+      x.fillRect(w / 2 - 10, h - 25, 24, 4);
+    } else if (kind === 2) {   // crown
+      x.fillStyle = '#E9C46A';
+      x.beginPath();
+      x.moveTo(w / 2 - 11, h - 23);
+      x.lineTo(w / 2 - 11, h - 33); x.lineTo(w / 2 - 5, h - 26); x.lineTo(w / 2, h - 35);
+      x.lineTo(w / 2 + 5, h - 26); x.lineTo(w / 2 + 11, h - 33); x.lineTo(w / 2 + 11, h - 23);
+      x.closePath(); x.fill();
+    } else if (kind === 3) {   // bow
+      x.fillStyle = '#FF2D95';
+      x.beginPath();
+      x.moveTo(w / 2, h - 27); x.lineTo(w / 2 - 10, h - 33); x.lineTo(w / 2 - 10, h - 21);
+      x.closePath(); x.fill();
+      x.beginPath();
+      x.moveTo(w / 2, h - 27); x.lineTo(w / 2 + 10, h - 33); x.lineTo(w / 2 + 10, h - 21);
+      x.closePath(); x.fill();
+      x.fillRect(w / 2 - 2, h - 30, 4, 6);
+    } else {
+      x.strokeStyle = '#3A4556'; x.lineWidth = 1;
+      x.beginPath(); x.moveTo(w / 2 - 12, h - 30); x.lineTo(w / 2 + 12, h - 30); x.stroke();
+    }
+  }
+  function drawMeal(x, w, h, kind) {
+    x.fillStyle = '#0C111A'; x.fillRect(0, 0, w, h);
+    const cy = h / 2 + 4;
+    if (kind === 0) {          // warm soup
+      x.fillStyle = '#B85C38'; x.beginPath(); x.arc(w / 2, cy, 13, 0, Math.PI); x.fill();
+      x.fillStyle = '#E9C46A'; x.fillRect(w / 2 - 13, cy - 3, 26, 4);
+    } else if (kind === 1) {   // pie
+      x.fillStyle = '#E9C46A'; x.beginPath(); x.arc(w / 2, cy, 13, Math.PI, 0); x.fill();
+      x.fillStyle = '#E76F51'; x.fillRect(w / 2 - 13, cy - 1, 26, 4);
+    } else if (kind === 2) {   // cookies
+      x.fillStyle = '#C68B59';
+      x.beginPath(); x.arc(w / 2 - 8, cy, 7, 0, 7); x.fill();
+      x.beginPath(); x.arc(w / 2 + 8, cy - 4, 7, 0, 7); x.fill();
+      x.fillStyle = '#5D4037';
+      x.fillRect(w / 2 - 10, cy - 2, 2, 2); x.fillRect(w / 2 - 5, cy + 2, 2, 2);
+      x.fillRect(w / 2 + 6, cy - 6, 2, 2); x.fillRect(w / 2 + 10, cy - 2, 2, 2);
+    } else {                   // ramen
+      x.fillStyle = '#264653'; x.beginPath(); x.arc(w / 2, cy, 13, 0, Math.PI); x.fill();
+      x.strokeStyle = '#F4F1DE'; x.lineWidth = 2;
+      for (const dx of [-7, 0, 7]) {
+        x.beginPath(); x.moveTo(w / 2 + dx, cy - 8); x.lineTo(w / 2 + dx - 2, cy); x.stroke();
+      }
+    }
+  }
+
+  function makeCards(holder, key, items, cw, ch, painter) {
+    items.forEach((item, i) => {
+      const d = document.createElement('div');
+      d.className = 'pick';
+      const cv = document.createElement('canvas');
+      cv.width = cw; cv.height = ch;
+      painter(cv.getContext('2d'), cw, ch, i, item);
+      const sp = document.createElement('span');
+      sp.textContent = item.name;
+      d.appendChild(cv); d.appendChild(sp);
+      d.addEventListener('click', () => { if (!d.dataset.off) { sel[key] = i; refreshCards(); } });
+      holder.appendChild(d);
+    });
+  }
+  function refreshCards() {
+    for (const [key, holder] of [['species', 'speciesCards'], ['world', 'worldCards'],
+                                 ['theme', 'themeCards'], ['hat', 'hatCards'], ['meal', 'mealCards']]) {
+      const kids = $(holder).children;
+      for (let i = 0; i < kids.length; i++)
+        kids[i].className = 'pick' + (sel[key] === i ? ' sel' : '');
+    }
+  }
+  makeCards($('speciesCards'), 'species',
+    [{ name: 'PIP · ASTRONAUT' }, { name: 'BIT · PIXEL CAT' }], 92, 64,
+    (x, w, h, i) => i === 0 ? drawPip(x, w, h, THEMES[0]) : drawBit(x, w, h, THEMES[0]));
+  makeCards($('worldCards'), 'world',
+    [{ name: 'TINY PLANET' }, { name: 'OCEAN FLOOR' }, { name: 'FOREST GLADE' }, { name: 'CITY ROOFTOP' }],
+    92, 56, (x, w, h, i) => drawWorld(x, w, h, i));
+  makeCards($('themeCards'), 'theme', THEMES, 92, 56,
+    (x, w, h, i, t) => drawBit(x, w, h, t));
+  makeCards($('hatCards'), 'hat',
+    [{ name: 'NONE' }, { name: 'CAP' }, { name: 'CROWN' }, { name: 'BOW' }],
+    64, 52, (x, w, h, i) => drawHat(x, w, h, i));
+  makeCards($('mealCards'), 'meal',
+    [{ name: 'WARM SOUP' }, { name: 'STARBERRY PIE' }, { name: 'MOON COOKIES' }, { name: 'COMET RAMEN' }],
+    72, 44, (x, w, h, i) => drawMeal(x, w, h, i));
+  refreshCards();
+
+  function msg(text, cls) { const m = $('msg'); m.textContent = text; m.className = cls || ''; }
+  function enabled(on) {
+    ['name', 'ss', 'se', 'bday', 'city', 'save'].forEach(id => { $(id).disabled = !on; });
+    document.querySelectorAll('.pick').forEach(p => { p.dataset.off = on ? '' : '1'; });
+    $('intro').textContent = on ? 'SECURE SESSION CONNECTED' : 'SCAN THE QR ON YOUR CUBE TO CONNECT';
+  }
+  function minutes(hhmm) {
+    const m = /^(\d\d):(\d\d)$/.exec(hhmm);
+    return m ? (+m[1]) * 60 + (+m[2]) : 0;
+  }
+  function hhmm(mins) {
+    const h = Math.floor(mins / 60) % 24, m = mins % 60;
+    return String(h).padStart(2, '0') + ':' + String(m).padStart(2, '0');
+  }
+
+  function showState(j) {
+    const d = j.design || {}, s = j.state || {};
+    $('pn').textContent = d.name || 'PIP';
+    const away = s.away === 1;
+    $('coax').className = away ? 'away' : '';
+    if (away) {
+      $('pw').textContent = 'RAN AWAY - COAX IT BACK BELOW';
+    } else if (s.updated) {
+      $('pw').textContent = STAGES[s.stage || 0] + ' · ' + (s.mistakes || 0) + ' CARE MISTAKES';
+    } else {
+      $('pw').textContent = 'NO NEWS FROM THE CUBE YET';
+    }
+    $('mhun').querySelector('s').style.width = (s.hunger || 0) + '%';
+    $('mhap').querySelector('s').style.width = (s.happy || 0) + '%';
+    const facts = [];
+    if (s.stardust) facts.push(s.stardust + ' STARDUST');
+    if (s.steps) facts.push(s.steps + ' STEPS TODAY');
+    if (j.weather) facts.push(j.weather.temp + 'C AT HOME');
+    $('pf').textContent = facts.join(' · ');
+  }
+
+  function fillDesign(d) {
+    $('name').value = d.name || '';
+    sel.species = d.species || 0;
+    sel.world = d.world || 0;
+    sel.theme = d.theme || 0;
+    sel.hat = d.hat || 0;
+    refreshCards();
+    $('ss').value = hhmm(d.sleep_start || 1320);
+    $('se').value = hhmm(d.sleep_end || 420);
+    $('bday').value = d.bday || '';
+    $('city').value = d.city || '';
+  }
+
+  async function load() {
+    try {
+      const r = await fetch('/pet/data', { headers: { Authorization: 'Bearer ' + accessToken } });
+      if (r.status === 401) { accessToken = ''; enabled(false); msg('SESSION EXPIRED - SCAN A NEW QR', 'err'); return; }
+      if (!r.ok) { msg('LOAD FAILED (' + r.status + ')', 'err'); return; }
+      const j = await r.json();
+      fillDesign(j.design || {});
+      showState(j);
+      msg('CONNECTED TO YOUR CUBE', 'ok');
+    } catch { msg('BROKER UNREACHABLE', 'err'); }
+  }
+
+  async function connect() {
+    const code = new URLSearchParams(location.search).get('c') || '';
+    history.replaceState(null, '', '/pet');
+    enabled(false);
+    if (!code) { msg('OPEN THE PET APP ON THE CUBE AND TAP ITS NAME'); return; }
+    try {
+      const r = await fetch('/pet/session', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ code })
+      });
+      if (!r.ok) { msg('LINK EXPIRED OR ALREADY USED - SCAN A NEW QR', 'err'); return; }
+      const j = await r.json();
+      if (!j.access_token) { msg('BROKER RETURNED AN INVALID SESSION', 'err'); return; }
+      accessToken = j.access_token;
+      enabled(true);
+      await load();
+    } catch { msg('BROKER UNREACHABLE', 'err'); }
+  }
+
+  async function put(body, okText) {
+    if (!accessToken) { msg('SESSION EXPIRED - SCAN A NEW QR', 'err'); return; }
+    try {
+      const r = await fetch('/pet/design', {
+        method: 'PUT',
+        headers: { Authorization: 'Bearer ' + accessToken, 'Content-Type': 'application/json' },
+        body: JSON.stringify(body)
+      });
+      if (r.ok) { msg(okText, 'ok'); await load(); }
+      else if (r.status === 401) { accessToken = ''; enabled(false); msg('SESSION EXPIRED - SCAN A NEW QR', 'err'); }
+      else msg('SAVE FAILED (' + r.status + ')', 'err');
+    } catch { msg('BROKER UNREACHABLE', 'err'); }
+  }
+
+  $('save').addEventListener('click', () => {
+    const bday = $('bday').value.trim();
+    if (bday && !/^\d\d-\d\d$/.test(bday)) { msg('BIRTHDAY MUST BE MM-DD', 'err'); return; }
+    put({
+      name: $('name').value,
+      species: sel.species,
+      world: sel.world,
+      theme: sel.theme,
+      hat: sel.hat,
+      sleep_start: minutes($('ss').value),
+      sleep_end: minutes($('se').value),
+      bday: bday,
+      city: $('city').value
+    }, 'SAVED! NOW TAP THE QR SCREEN ON YOUR CUBE TO SYNC');
+  });
+
+  $('coaxbtn').addEventListener('click', () => {
+    // The apology is the ritual, not data: it is deliberately never sent
+    // anywhere. Only the completed gesture travels.
+    if ($('sorry').value.trim().length < 8) { msg('IT DESERVES MORE OF AN APOLOGY THAN THAT', 'err'); return; }
+    put({ coax: true }, 'THE MEAL IS OUT - NOW TAP THE QR SCREEN ON YOUR CUBE');
+  });
+
+  connect();
+</script>
+</body>
+</html>

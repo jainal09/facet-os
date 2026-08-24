@@ -78,7 +78,6 @@ static const char *TAG = "funnel";
 #define PERF_PERIOD_MS    (3 * 1000)
 #define BATTERY_PERIOD_MS (2 * 1000)
 #define HTTPS_PERIOD_MS   (45 * 1000)
-#define PET_TICK_MS       (180 * 1000)  /* one stat point of decay (~5 h to empty) */
 
 /* Physical layout, per the label on the back of the board:
  *   leftmost  = BOOT / minus   GPIO0    (the strap; an ordinary pulled-up
@@ -240,10 +239,57 @@ static volatile bool    s_vbus;
 static volatile bool    s_bypass;           /* on USB, charge finished, cell idle */
 static volatile uint8_t s_chg_state;        /* reg 0x01[2:0] */
 
-/* pet state (persisted) */
-static int s_food = 80, s_fun = 75, s_nrg = 90;
-static uint32_t s_pet_age_min;
+/* ---- pet: persisted life (the engine lives near pet_load, below) ----
+ *
+ * The pet follows the FOCUS pattern taken further: the ENGINE is file-scope
+ * state ticked from the main loop on every screen, and survives power-off by
+ * being anchored to wall-clock time; the pet APP is only a view onto it. The
+ * broker is authoritative for what the owner DESIGNS (species, world, theme,
+ * name, sleep window — s_pet.cfg_ver tracks what has been applied); the cube
+ * is authoritative for the life actually lived (stage, meters, mistakes).
+ *
+ * Field order is largest-first so natural alignment needs no packing — a
+ * packed struct would put int64s at odd offsets, and this blob is accessed as
+ * ordinary struct members, not memcpy'd fields. */
+typedef struct {
+    int64_t  hatched_utc;        /* epoch seconds; RTC makes these trustworthy */
+    int64_t  stage_utc;          /* when the current stage began */
+    int64_t  tick_utc;           /* last minute credited — the offline anchor */
+    int64_t  seen_utc;           /* last owner interaction — departure timer */
+    int64_t  wx_utc;             /* weather fetch time; stale > 6 h = not drawn */
+    uint32_t seed;               /* personality, rolled once at egg creation */
+    uint32_t cfg_ver;            /* last broker config version applied */
+    uint32_t stardust;           /* step/mini-game currency */
+    uint32_t steps_today;
+    uint32_t day_stamp;          /* civil day steps_today belongs to */
+    uint16_t ver;                /* PET_BLOB_VER */
+    uint16_t cue_left_s;         /* awake-seconds before the cue is a mistake */
+    uint16_t mistakes;           /* lifetime care mistakes — pick the adult */
+    uint16_t sleep_start;        /* minutes from local midnight */
+    uint16_t sleep_end;
+    uint16_t bday;               /* month<<8|day, 0 = unset */
+    uint8_t  stage;              /* pet_stage_t */
+    uint8_t  form;               /* branch within the stage */
+    uint8_t  species, world, theme, hat;
+    uint8_t  hunger, happy;      /* the two coupled meters, 0..100 */
+    uint8_t  sick, poop;
+    uint8_t  cue;                /* active attention cue, PET_CUE_NONE = 0 */
+    uint8_t  snack_run;          /* consecutive snacks — the meal tradeoff */
+    uint8_t  happy_hist;         /* EWMA of happy, 0..100 — picks the teen */
+    uint8_t  wx;                 /* cached weather kind */
+    uint8_t  flags;
+    int8_t   wx_temp;
+    char     name[12];           /* ASCII, broker-set, default "PIP" */
+} pet_blob2_t;
+
+enum { PET_EGG = 0, PET_BABY, PET_CHILD, PET_TEEN, PET_ADULT, PET_AWAY };
+enum { PET_CUE_NONE = 0, PET_CUE_HUNGRY, PET_CUE_LONELY };
+
+static pet_blob2_t s_pet;
 static volatile bool s_pet_dirty;
+/* Sleep pressure, presentation-only: recomputable from the clock, so it is
+ * deliberately not part of the persisted blob. Resets mid-range on boot. */
+static int s_nrg = 75;
 
 /* Wi-Fi credentials in use, and a pending change from the setup screen */
 static char s_ssid[33];
@@ -549,34 +595,363 @@ static void creds_save(const char *ssid, const char *pass) {
     nvs_close(h);
 }
 
-typedef struct {
+typedef struct {                     /* legacy v1 blob, read once to migrate */
     uint16_t ver;
     int16_t  food, fun, nrg;
     uint32_t age_min;
-} pet_blob_t;
-#define PET_BLOB_VER 1
+} pet_blob_v1_t;
+
+#define PET_BLOB_VER 2
+
+/* 1 for real life. 60 compresses the egg-to-adult arc into ~3.5 hours for a
+ * bench soak: durations divide by it, decay rates multiply by it. Keep it 1
+ * in commits, like the self-test defines. */
+#define PET_TIME_SCALE 1
+
+/* Nothing below trusts the clock until it reads as real. The RTC seeds it in
+ * early boot, so this only bites on a cold board with a drained RTC cell —
+ * where the honest answer is that no time passed that we can vouch for. */
+#define PET_EPOCH_MIN 1750000000LL
+
+typedef struct { uint32_t dur_min; uint8_t hunger_per_h, happy_per_h; } pet_stage_row_t;
+static const pet_stage_row_t s_pet_stages[] = {
+    [PET_EGG]   = { 30,          0, 0 },
+    [PET_BABY]  = { 24 * 60,     6, 5 },
+    [PET_CHILD] = { 2 * 24 * 60, 4, 4 },
+    [PET_TEEN]  = { 3 * 24 * 60, 4, 3 },
+    [PET_ADULT] = { 0,           3, 3 },   /* dur 0 = terminal */
+    [PET_AWAY]  = { 0,           0, 0 },
+};
+
+#define PET_CUE_WINDOW_S   (900 / PET_TIME_SCALE)     /* 15 awake-visible min */
+#define PET_CUE_COOLDOWN_S (1800 / PET_TIME_SCALE)
+#define PET_AWAY_AFTER_S   (3 * 86400 / PET_TIME_SCALE)
+
+/* Consumed by the main loop: an engine event (evolution, departure) wants the
+ * scene rebuilt if PET is on screen. The engine cannot call app_request()
+ * directly — it is defined much later in the file. */
+static volatile bool s_req_pet_rebuild;
+
+static const char *pet_stage_word(void) {
+    static const char *w[] = { "EGG", "BABY", "CHILD", "TEEN", "GROWN", "AWAY" };
+    return w[s_pet.stage <= PET_AWAY ? s_pet.stage : PET_ADULT];
+}
+
+static void pet_fresh_egg(void) {
+    memset(&s_pet, 0, sizeof(s_pet));
+    s_pet.ver = PET_BLOB_VER;
+    s_pet.stage = PET_EGG;
+    s_pet.hunger = s_pet.happy = 70;
+    s_pet.happy_hist = 70;
+    s_pet.seed = esp_random();          /* personality, decided in the shell */
+    s_pet.sleep_start = 22 * 60;
+    s_pet.sleep_end = 7 * 60;
+    snprintf(s_pet.name, sizeof(s_pet.name), "PIP");
+    /* Timestamps stay 0 until the clock is real; pet_credit() stamps them. */
+}
 
 static void pet_load(void) {
-    pet_blob_t b;
+    pet_blob2_t b;
     if (store_load("pet", &b, sizeof(b)) && b.ver == PET_BLOB_VER) {
-        s_food = clampi(b.food, 0, 100);
-        s_fun  = clampi(b.fun,  0, 100);
-        s_nrg  = clampi(b.nrg,  0, 100);
-        s_pet_age_min = b.age_min;
+        s_pet = b;
+        s_pet.name[sizeof(s_pet.name) - 1] = '\0';
+        ESP_LOGI(TAG, "pet restored: %s %s hunger=%d happy=%d mistakes=%d",
+                 s_pet.name, pet_stage_word(), s_pet.hunger, s_pet.happy,
+                 (int)s_pet.mistakes);
+        return;
     }
-    if (s_food + s_fun + s_nrg == 0) {
-        s_food = s_fun = s_nrg = 70;
-        ESP_LOGI(TAG, "pet had run flat — starting it fresh");
+    pet_blob_v1_t v1;
+    if (store_load("pet", &v1, sizeof(v1)) && v1.ver == 1) {
+        /* The old astronaut lived through v1; keep the life, not just the
+         * numbers. Age places it on the stage table, three meters fold into
+         * two, and the stamps are back-dated so growth continues mid-arc. */
+        pet_fresh_egg();
+        s_pet.hunger = clampi(v1.food, 0, 100);
+        s_pet.happy  = clampi((v1.fun + v1.nrg) / 2, 0, 100);
+        s_pet.happy_hist = s_pet.happy;
+        uint32_t acc = 0, into = v1.age_min;
+        s_pet.stage = PET_ADULT;
+        for (int st = PET_EGG; st < PET_ADULT; st++) {
+            if (v1.age_min < acc + s_pet_stages[st].dur_min) {
+                s_pet.stage = st;
+                into = v1.age_min - acc;
+                break;
+            }
+            acc += s_pet_stages[st].dur_min;
+        }
+        time_t now = time(NULL);
+        if (now >= PET_EPOCH_MIN) {
+            s_pet.hatched_utc = now - (int64_t)v1.age_min * 60;
+            s_pet.stage_utc   = now - (int64_t)into * 60;
+            s_pet.tick_utc    = now;
+            s_pet.seen_utc    = now;
+        }
+        s_pet_dirty = true;
+        ESP_LOGI(TAG, "pet migrated from v1: %lumin old -> %s",
+                 (unsigned long)v1.age_min, pet_stage_word());
+        return;
     }
-    ESP_LOGI(TAG, "pet restored: food=%d fun=%d nrg=%d age=%lumin",
-             s_food, s_fun, s_nrg, (unsigned long)s_pet_age_min);
+    pet_fresh_egg();
+    s_pet_dirty = true;
+    ESP_LOGI(TAG, "pet: a new egg appears");
 }
 
 static void pet_save(void) {
-    pet_blob_t b = { .ver = PET_BLOB_VER, .food = s_food, .fun = s_fun,
-                     .nrg = s_nrg, .age_min = s_pet_age_min };
-    store_save("pet", &b, sizeof(b));
+    store_save("pet", &s_pet, sizeof(s_pet));
     s_pet_dirty = false;
+}
+
+/* ---- broker handoff ----
+ *
+ * The net task and the engine never touch each other's state directly: the
+ * net task publishes a parsed config into a staging struct the engine
+ * consumes on its own tick, and the engine publishes a report snapshot the
+ * net task serialises — the DAYS publish/snapshot discipline, because both
+ * of tonight's owners live on different tasks. */
+typedef struct {
+    uint32_t ver;
+    uint16_t ss, se, bday;
+    uint8_t  species, world, theme, hat;
+    uint8_t  wx, coax, has_wx;
+    int8_t   wx_temp;
+    char     name[12];
+    char     sheet[8];
+} pet_cfg_msg_t;
+
+typedef struct {
+    uint32_t stardust, steps, seed;
+    int64_t  hatched;
+    uint16_t mistakes;
+    uint8_t  stage, form, hunger, happy, sick, poop, away;
+} pet_report_t;
+
+static pet_cfg_msg_t s_pet_cfg_in;
+static volatile bool s_pet_cfg_ready;
+static pet_report_t  s_pet_report;
+static volatile bool s_req_pet_push;
+static volatile bool s_req_pet_cfg = true;   /* first fetch rides the boot */
+static portMUX_TYPE  s_pet_net_lock = portMUX_INITIALIZER_UNLOCKED;
+
+static void pet_report_publish(void) {
+    pet_report_t r = {
+        .stardust = s_pet.stardust, .steps = s_pet.steps_today,
+        .seed = s_pet.seed, .hatched = s_pet.hatched_utc,
+        .mistakes = s_pet.mistakes, .stage = s_pet.stage, .form = s_pet.form,
+        .hunger = s_pet.hunger, .happy = s_pet.happy,
+        .sick = s_pet.sick, .poop = s_pet.poop,
+        .away = s_pet.stage == PET_AWAY,
+    };
+    portENTER_CRITICAL(&s_pet_net_lock);
+    s_pet_report = r;
+    portEXIT_CRITICAL(&s_pet_net_lock);
+    __atomic_store_n(&s_req_pet_push, true, __ATOMIC_RELEASE);
+}
+
+/* Runs on the engine's tick. Weather applies on every response (it changes
+ * under a constant version); the design applies only when the version moved,
+ * because applying it rebuilds the scene and cfg_ver is the whole gate. */
+static void pet_cfg_consume(void) {
+    if (!__atomic_load_n(&s_pet_cfg_ready, __ATOMIC_ACQUIRE)) return;
+    pet_cfg_msg_t m;
+    portENTER_CRITICAL(&s_pet_net_lock);
+    m = s_pet_cfg_in;
+    portEXIT_CRITICAL(&s_pet_net_lock);
+    __atomic_store_n(&s_pet_cfg_ready, false, __ATOMIC_RELEASE);
+
+    time_t now = time(NULL);
+    if (m.has_wx && now >= PET_EPOCH_MIN) {
+        s_pet.wx = m.wx;
+        s_pet.wx_temp = m.wx_temp;
+        s_pet.wx_utc = now;
+        s_pet_dirty = true;
+    }
+    if (m.coax && s_pet.stage == PET_AWAY) {
+        /* The doorstep meal worked. Meters restart mid-range: a returning
+         * pet is glad to be home, not fixed. */
+        s_pet.stage = PET_ADULT;
+        s_pet.hunger = s_pet.happy = 60;
+        if (now >= PET_EPOCH_MIN) { s_pet.seen_utc = now; s_pet.stage_utc = now; }
+        log_event("pet came home");
+        ESP_LOGI(TAG, "pet %s came home", s_pet.name);
+        s_pet_dirty = true;
+        s_req_pet_rebuild = true;
+        pet_report_publish();      /* the broker clears its coax flag on this */
+    }
+    if (m.ver == s_pet.cfg_ver) return;
+
+    if (m.name[0]) {
+        snprintf(s_pet.name, sizeof(s_pet.name), "%s", m.name);
+        /* The broker folds to ASCII; keep a hostile or stale deployment from
+         * feeding boxes to the subset fonts anyway. */
+        for (char *p = s_pet.name; *p; p++)
+            if ((unsigned char)*p < 0x20 || (unsigned char)*p > 0x7E) *p = '?';
+    }
+    s_pet.species     = m.species;
+    s_pet.world       = m.world;
+    s_pet.theme       = m.theme;
+    s_pet.hat         = m.hat;
+    s_pet.sleep_start = m.ss;
+    s_pet.sleep_end   = m.se;
+    s_pet.bday        = m.bday;
+    s_pet.cfg_ver     = m.ver;
+    s_pet_dirty = true;
+    s_req_pet_rebuild = true;
+    ESP_LOGI(TAG, "pet cfg v%lu applied: %s species=%d world=%d theme=%d hat=%d",
+             (unsigned long)m.ver, s_pet.name, s_pet.species, s_pet.world,
+             s_pet.theme, s_pet.hat);
+}
+
+/* ---- the life itself ---- */
+
+static int pet_minute_of_day(time_t t) {
+    struct tm ti;
+    localtime_r(&t, &ti);
+    return ti.tm_hour * 60 + ti.tm_min;
+}
+
+static bool pet_asleep_at(int mod) {
+    int ss = s_pet.sleep_start, se = s_pet.sleep_end;
+    if (ss == se) return false;
+    return ss < se ? (mod >= ss && mod < se) : (mod >= ss || mod < se);
+}
+
+static void pet_seen(void) {
+    time_t now = time(NULL);
+    if (now >= PET_EPOCH_MIN) s_pet.seen_utc = now;
+}
+
+/* Promotion runs on wall time, so a pet hatches, grows and evolves while the
+ * cube sits in a drawer — exactly like the 1996 toy. The teen is picked by
+ * how happy the childhood was; the adult by how few cues went unanswered. */
+static void pet_promote_check(time_t now) {
+    while (s_pet.stage < PET_ADULT) {
+        uint32_t dur = s_pet_stages[s_pet.stage].dur_min;
+        if (!dur || !s_pet.stage_utc) break;
+        int64_t dur_s = (int64_t)dur * 60 / PET_TIME_SCALE;
+        if (now - s_pet.stage_utc < dur_s) break;
+        s_pet.stage_utc += dur_s;
+        s_pet.stage++;
+        if (s_pet.stage == PET_TEEN)
+            s_pet.form = s_pet.happy_hist >= 67 ? 0 : (s_pet.happy_hist >= 34 ? 1 : 2);
+        else if (s_pet.stage == PET_ADULT)
+            s_pet.form = s_pet.mistakes <= 2 ? 0 : (s_pet.mistakes <= 6 ? 1 : 2);
+        else
+            s_pet.form = 0;
+        log_event(s_pet.stage == PET_BABY ? "pet hatched" : "pet evolved");
+        ESP_LOGI(TAG, "pet %s is now %s (form %d, happy_hist=%d, mistakes=%d)",
+                 s_pet.name, pet_stage_word(), s_pet.form,
+                 s_pet.happy_hist, (int)s_pet.mistakes);
+        s_pet_dirty = true;
+        s_req_pet_rebuild = true;
+        pet_report_publish();          /* evolutions reach the dashboard */
+    }
+}
+
+static void pet_credit(time_t now) {
+    if (s_pet.tick_utc == 0 || s_pet.tick_utc > now) {
+        /* First sighting of a real clock, or the clock moved backwards.
+         * Either way, credit nothing we cannot vouch for. */
+        s_pet.tick_utc = now;
+        if (!s_pet.hatched_utc) {
+            s_pet.hatched_utc = now;
+            s_pet.stage_utc   = now;
+            s_pet.seen_utc    = now;
+        }
+        s_pet_dirty = true;
+        return;
+    }
+    int64_t mins = (int64_t)(now - s_pet.tick_utc) / 60;
+    if (mins <= 0) return;
+
+    /* Decay is capped at 4 days of it: a cube found in a drawer resumes
+     * hungry-but-alive rather than instantly departed. Promotion and the
+     * departure check use wall time directly, so the cap never delays
+     * growing up — only starving. Decay pauses through the sleep window:
+     * the pet sleeps, it does not starve overnight. */
+    int64_t decay_mins = mins > 4 * 1440 ? 4 * 1440 : mins;
+    if (s_pet.stage >= PET_BABY && s_pet.stage <= PET_ADULT) {
+        static uint32_t hunger_acc, happy_acc, nrg_acc;
+        int mod = pet_minute_of_day(now - decay_mins * 60);
+        const pet_stage_row_t *row = &s_pet_stages[s_pet.stage];
+        for (int64_t i = 0; i < decay_mins; i++, mod = (mod + 1) % 1440) {
+            if (pet_asleep_at(mod)) {
+                if (++nrg_acc >= 3) { nrg_acc = 0; s_nrg = clampi(s_nrg + 1, 5, 100); }
+                continue;
+            }
+            hunger_acc += (uint32_t)row->hunger_per_h * PET_TIME_SCALE;
+            happy_acc  += (uint32_t)row->happy_per_h * PET_TIME_SCALE;
+            while (hunger_acc >= 60) { hunger_acc -= 60; s_pet.hunger = clampi(s_pet.hunger - 1, 0, 100); }
+            while (happy_acc >= 60)  { happy_acc -= 60;  s_pet.happy  = clampi(s_pet.happy - 1, 0, 100); }
+            if (++nrg_acc >= 8) { nrg_acc = 0; s_nrg = clampi(s_nrg - 1, 5, 100); }
+            s_pet.happy_hist = (uint8_t)((s_pet.happy_hist * 15 + s_pet.happy + 8) / 16);
+        }
+        s_pet_dirty = true;
+    }
+    s_pet.tick_utc = now;
+    pet_promote_check(now);
+
+    if (s_pet.stage == PET_ADULT && s_pet.hunger == 0 && s_pet.happy == 0 &&
+        s_pet.seen_utc && now - s_pet.seen_utc > PET_AWAY_AFTER_S) {
+        s_pet.stage = PET_AWAY;
+        log_event("pet left");
+        ESP_LOGW(TAG, "pet %s packed a tiny suitcase and left "
+                      "(unseen %llds, both meters empty)",
+                 s_pet.name, (long long)(now - s_pet.seen_utc));
+        s_pet_dirty = true;
+        s_req_pet_rebuild = true;
+        pet_report_publish();          /* the dashboard offers the coax-back */
+    }
+}
+
+/* The Uni-style care loop: a need raises a cue; a cue answered in time is
+ * bonding, a cue ignored for its whole window is one care mistake, and the
+ * mistakes pick which adult arrives. The window only counts down while the
+ * pet is awake AND the screen is on — mistakes never accrue where nobody
+ * could have seen the ask. That asymmetry is the no-guilt rule from the
+ * research, and it is also what makes offline time safe to credit. */
+static void pet_cue_service(time_t now) {
+    static time_t s_next_cue;
+    if (s_pet.stage < PET_BABY || s_pet.stage > PET_ADULT) return;
+    if (!s_screen_on || s_doze || pet_asleep_at(pet_minute_of_day(now))) return;
+
+    if (s_pet.cue == PET_CUE_NONE) {
+        if (now < s_next_cue) return;
+        if (s_pet.hunger < 25)     s_pet.cue = PET_CUE_HUNGRY;
+        else if (s_pet.happy < 25) s_pet.cue = PET_CUE_LONELY;
+        else return;
+        s_pet.cue_left_s = PET_CUE_WINDOW_S;
+        s_pet_dirty = true;
+        return;
+    }
+    /* Met by any route — feeding, playing, or decay reversing — it resolves
+     * silently; there is no wrong way to answer a need. */
+    if ((s_pet.cue == PET_CUE_HUNGRY && s_pet.hunger >= 40) ||
+        (s_pet.cue == PET_CUE_LONELY && s_pet.happy >= 40)) {
+        s_pet.cue = PET_CUE_NONE;
+        s_pet_dirty = true;
+        return;
+    }
+    if (s_pet.cue_left_s > 0) { s_pet.cue_left_s--; return; }
+    s_pet.mistakes++;
+    s_pet.cue = PET_CUE_NONE;
+    s_next_cue = now + PET_CUE_COOLDOWN_S;
+    s_pet_dirty = true;
+    ESP_LOGI(TAG, "pet: care mistake #%d", (int)s_pet.mistakes);
+}
+
+/* ~1 Hz from the main loop, on every screen, awake or dozing. */
+static void pet_engine_service(void) {
+    static int64_t s_last_ms;
+    int64_t t = now_ms();
+    if (t - s_last_ms < 1000) return;
+    s_last_ms = t;
+    /* Config applies even before the clock is trusted — a renamed pet does
+     * not need to know what time it is. */
+    pet_cfg_consume();
+    time_t now = time(NULL);
+    if (now < PET_EPOCH_MIN) return;
+    pet_credit(now);
+    pet_cue_service(now);
 }
 
 /* ---------------- Wi-Fi ---------------- */
@@ -1206,6 +1581,10 @@ static bool days_http_get(const char *path) {
     snprintf(auth, sizeof(auth), "Bearer %.72s", BROKER_TOKEN);
     esp_http_client_set_header(s_days_http, "Authorization", auth);
     esp_http_client_set_method(s_days_http, HTTP_METHOD_GET);
+    /* The pet sync POSTs on this same handle, and esp_http_client resends a
+     * stale body silently — post_data is never cleared automatically
+     * (HARDWARE.md 7f). Clear it before every GET. */
+    esp_http_client_set_post_field(s_days_http, NULL, 0);
 
     esp_err_t err = esp_http_client_perform(s_days_http);
     int status = esp_http_client_get_status_code(s_days_http);
@@ -1313,6 +1692,197 @@ static void days_service(void) {
     if (ok) s_days_last_ok_ms = t;
 }
 
+/* ---------------- PET broker sync ----------------
+ *
+ * Rides the DAYS client: same broker host, same task, same keep-alive handle,
+ * so a pet fetch after a countdown fetch costs 6 ms instead of a 390 ms
+ * handshake. The engine's side of this lives beside the pet blob
+ * (pet_cfg_consume / pet_report_publish). */
+
+#define PET_CFG_FETCH_MS (2 * 60 * 60 * 1000LL)
+#define PET_CFG_RETRY_MS (15 * 60 * 1000LL)
+#define PET_LINK_URL_MAX 256
+
+static bool s_req_pet_link;
+static bool s_pet_cfg_fetching, s_pet_link_fetching;
+static int64_t s_pet_cfg_ok_ms, s_pet_cfg_attempt_ms;
+static char s_pet_link_url[PET_LINK_URL_MAX];
+static uint32_t s_pet_link_version;
+
+static void pet_link_publish(const char *url) {
+    portENTER_CRITICAL(&s_pet_net_lock);
+    snprintf(s_pet_link_url, sizeof(s_pet_link_url), "%s", url ? url : "");
+    s_pet_link_version++;
+    portEXIT_CRITICAL(&s_pet_net_lock);
+}
+
+static void pet_link_snapshot(char *out, size_t cap, uint32_t *version) {
+    portENTER_CRITICAL(&s_pet_net_lock);
+    snprintf(out, cap, "%s", s_pet_link_url);
+    if (version) *version = s_pet_link_version;
+    portEXIT_CRITICAL(&s_pet_net_lock);
+}
+
+static bool days_http_post_json(const char *path, const char *body) {
+    /* Prime the handle exactly like days_http_get, then flip it to POST. */
+    if (!s_days_http) {
+        if (!days_http_get("/healthz")) return false;    /* builds the handle */
+    }
+    s_days_rx.len = 0;
+    s_days_rx.overflow = false;
+    s_days_rx.data[0] = '\0';
+    esp_http_client_set_url(s_days_http, path);
+    char auth[96];
+    snprintf(auth, sizeof(auth), "Bearer %.72s", BROKER_TOKEN);
+    esp_http_client_set_header(s_days_http, "Authorization", auth);
+    esp_http_client_set_header(s_days_http, "Content-Type", "application/json");
+    esp_http_client_set_method(s_days_http, HTTP_METHOD_POST);
+    esp_http_client_set_post_field(s_days_http, body, (int)strlen(body));
+
+    esp_err_t err = esp_http_client_perform(s_days_http);
+    int status = esp_http_client_get_status_code(s_days_http);
+    esp_http_client_set_post_field(s_days_http, NULL, 0);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "pet %.24s: %s (HTTP %d) - redial next time",
+                 path, esp_err_to_name(err), status);
+        esp_http_client_close(s_days_http);
+        return false;
+    }
+    if (status != 200 || s_days_rx.overflow) {
+        ESP_LOGW(TAG, "pet %.24s: HTTP %d", path, status);
+        return false;
+    }
+    return true;
+}
+
+static bool pet_cfg_fetch(void) {
+    if (!days_http_get("/pet/cfg")) return false;
+
+    cJSON *root = cJSON_Parse(s_days_rx.data);
+    cJSON *v  = root ? cJSON_GetObjectItem(root, "v") : NULL;
+    cJSON *n  = root ? cJSON_GetObjectItem(root, "n") : NULL;
+    if (!root || !cJSON_IsNumber(v) || !cJSON_IsString(n)) {
+        ESP_LOGW(TAG, "pet: malformed cfg response");
+        if (root) cJSON_Delete(root);
+        return false;
+    }
+    pet_cfg_msg_t m = { .ver = (uint32_t)v->valuedouble };
+    snprintf(m.name, sizeof(m.name), "%.11s", n->valuestring);
+    cJSON *it;
+    if (cJSON_IsNumber(it = cJSON_GetObjectItem(root, "s")))  m.species = (uint8_t)clampi(it->valueint, 0, 8);
+    if (cJSON_IsNumber(it = cJSON_GetObjectItem(root, "w")))  m.world   = (uint8_t)clampi(it->valueint, 0, 8);
+    if (cJSON_IsNumber(it = cJSON_GetObjectItem(root, "t")))  m.theme   = (uint8_t)clampi(it->valueint, 0, 8);
+    if (cJSON_IsNumber(it = cJSON_GetObjectItem(root, "h")))  m.hat     = (uint8_t)clampi(it->valueint, 0, 8);
+    if (cJSON_IsNumber(it = cJSON_GetObjectItem(root, "ss"))) m.ss      = (uint16_t)clampi(it->valueint, 0, 1439);
+    if (cJSON_IsNumber(it = cJSON_GetObjectItem(root, "se"))) m.se      = (uint16_t)clampi(it->valueint, 0, 1439);
+    if (cJSON_IsNumber(it = cJSON_GetObjectItem(root, "cb"))) m.coax    = it->valueint ? 1 : 0;
+    if (cJSON_IsString(it = cJSON_GetObjectItem(root, "b")) && strlen(it->valuestring) == 5) {
+        int mo = (it->valuestring[0] - '0') * 10 + (it->valuestring[1] - '0');
+        int dy = (it->valuestring[3] - '0') * 10 + (it->valuestring[4] - '0');
+        if (mo >= 1 && mo <= 12 && dy >= 1 && dy <= 31) m.bday = (uint16_t)(mo << 8 | dy);
+    }
+    if (cJSON_IsNumber(it = cJSON_GetObjectItem(root, "wx"))) {
+        m.wx = (uint8_t)clampi(it->valueint, 0, 7);
+        m.has_wx = 1;
+        cJSON *wt = cJSON_GetObjectItem(root, "wt");
+        if (cJSON_IsNumber(wt)) m.wx_temp = (int8_t)clampi(wt->valueint, -99, 99);
+    }
+    if (cJSON_IsString(it = cJSON_GetObjectItem(root, "sn")))
+        snprintf(m.sheet, sizeof(m.sheet), "%.7s", it->valuestring);
+    cJSON_Delete(root);
+
+    portENTER_CRITICAL(&s_pet_net_lock);
+    s_pet_cfg_in = m;
+    portEXIT_CRITICAL(&s_pet_net_lock);
+    __atomic_store_n(&s_pet_cfg_ready, true, __ATOMIC_RELEASE);
+    ESP_LOGI(TAG, "pet: cfg v%lu fetched, %u B", (unsigned long)m.ver,
+             (unsigned)s_days_rx.len);
+    return true;
+}
+
+static bool pet_link_fetch(void) {
+    if (!days_http_get("/pet/link")) return false;
+
+    cJSON *root = cJSON_Parse(s_days_rx.data);
+    cJSON *url = root ? cJSON_GetObjectItem(root, "authorization_url") : NULL;
+    const char *value = cJSON_IsString(url) ? url->valuestring : NULL;
+    size_t n = value ? strlen(value) : 0;
+    bool valid = value && strncmp(value, "https://", 8) == 0 &&
+                 n > 8 && n < PET_LINK_URL_MAX;
+    if (valid) {
+        for (size_t i = 0; i < n; i++) {
+            unsigned char c = (unsigned char)value[i];
+            if (c < 0x21 || c > 0x7E) { valid = false; break; }
+        }
+    }
+    if (!valid) {
+        ESP_LOGW(TAG, "pet: malformed designer-link response");
+        if (root) cJSON_Delete(root);
+        return false;
+    }
+    pet_link_publish(value);
+    cJSON_Delete(root);
+    ESP_LOGI(TAG, "pet: designer QR ready (%u B)", (unsigned)n);
+    return true;
+}
+
+static bool pet_push(void) {
+    pet_report_t r;
+    portENTER_CRITICAL(&s_pet_net_lock);
+    r = s_pet_report;
+    portEXIT_CRITICAL(&s_pet_net_lock);
+    char body[224];
+    snprintf(body, sizeof(body),
+             "{\"g\":%u,\"f\":%u,\"hu\":%u,\"ha\":%u,\"m\":%u,\"sd\":%lu,"
+             "\"st\":%lu,\"sk\":%u,\"pp\":%u,\"aw\":%u,\"hz\":%lld,\"e\":%lu}",
+             r.stage, r.form, r.hunger, r.happy, (unsigned)r.mistakes,
+             (unsigned long)r.stardust, (unsigned long)r.steps,
+             r.sick, r.poop, r.away, (long long)r.hatched,
+             (unsigned long)r.seed);
+    if (!days_http_post_json("/pet/st", body)) return false;
+    /* The response carries the current config version, so a state push
+     * doubles as a drift check — a design saved on the phone minutes ago is
+     * noticed here instead of waiting out the 2 h cycle. */
+    cJSON *root = cJSON_Parse(s_days_rx.data);
+    cJSON *v = root ? cJSON_GetObjectItem(root, "v") : NULL;
+    if (cJSON_IsNumber(v) && (uint32_t)v->valuedouble != s_pet.cfg_ver)
+        __atomic_store_n(&s_req_pet_cfg, true, __ATOMIC_RELEASE);
+    if (root) cJSON_Delete(root);
+    ESP_LOGI(TAG, "pet: state reported (%s)", body);
+    return true;
+}
+
+static void pet_net_service(void) {
+    if (!s_wifi_up || ble_prov_active() || BROKER_URL[0] == '\0' ||
+        BROKER_TOKEN[0] == '\0') return;
+
+    if (__atomic_exchange_n(&s_req_pet_link, false, __ATOMIC_ACQ_REL)) {
+        __atomic_store_n(&s_pet_link_fetching, true, __ATOMIC_RELEASE);
+        if (!pet_link_fetch()) pet_link_publish("");
+        __atomic_store_n(&s_pet_link_fetching, false, __ATOMIC_RELEASE);
+    }
+
+    if (__atomic_exchange_n(&s_req_pet_push, false, __ATOMIC_ACQ_REL)) {
+        if (!pet_push()) {
+            /* keep the report; retry rides the next service pass */
+            __atomic_store_n(&s_req_pet_push, true, __ATOMIC_RELEASE);
+        }
+    }
+
+    int64_t t = now_ms();
+    bool forced = __atomic_exchange_n(&s_req_pet_cfg, false, __ATOMIC_ACQ_REL);
+    bool due = !s_pet_cfg_ok_ms || t - s_pet_cfg_ok_ms >= PET_CFG_FETCH_MS;
+    if (!forced && !due) return;
+    if (!forced && s_pet_cfg_attempt_ms &&
+        t - s_pet_cfg_attempt_ms < PET_CFG_RETRY_MS) return;
+
+    s_pet_cfg_attempt_ms = t;
+    __atomic_store_n(&s_pet_cfg_fetching, true, __ATOMIC_RELEASE);
+    bool ok = pet_cfg_fetch();
+    __atomic_store_n(&s_pet_cfg_fetching, false, __ATOMIC_RELEASE);
+    if (ok) s_pet_cfg_ok_ms = t;
+}
+
 /* The network task.
  *
  * Once polled a stand-in "speech to text" endpoint every 45 s to characterise
@@ -1335,6 +1905,7 @@ static void net_task(void *arg) {
          * several-hundred-KB wallpaper. Both stay off the main loop, so a slow
          * request cannot stall button handling or the app switcher. */
         days_service();
+        pet_net_service();
         wall_service();
 
         /* A wallpaper request breaks the wait, so pressing Fetch acts now
@@ -1342,7 +1913,10 @@ static void net_task(void *arg) {
         int period = s_doze ? (10 * 60 * 1000) : HTTPS_PERIOD_MS;
         for (int w = 0; w < period / 100 && !s_req_wallpaper &&
                         !__atomic_load_n(&s_req_days_fetch, __ATOMIC_ACQUIRE) &&
-                        !__atomic_load_n(&s_req_days_link, __ATOMIC_ACQUIRE); w++) {
+                        !__atomic_load_n(&s_req_days_link, __ATOMIC_ACQUIRE) &&
+                        !__atomic_load_n(&s_req_pet_link, __ATOMIC_ACQUIRE) &&
+                        !__atomic_load_n(&s_req_pet_cfg, __ATOMIC_ACQUIRE) &&
+                        !__atomic_load_n(&s_req_pet_push, __ATOMIC_ACQUIRE); w++) {
             vTaskDelay(pdMS_TO_TICKS(100));
         }
     }
@@ -2076,7 +2650,12 @@ static void imu_poll(void) {
      * running while it was off, so an already-settled orientation commits on the
      * next poll rather than 800 ms later. */
     if (s_autorot && s_rot_votes >= QMI_VOTES_NEEDED && s_rot_cand != s_rot &&
-        s_app != APP_POMO) {
+        s_app != APP_POMO && s_app != APP_PET) {
+        /* PET is pinned like FOCUS, but for the opposite reason: FOCUS reads
+         * orientation as its dial; PET reads TILT as its joystick, and a
+         * panel that counter-rotated under the tilt would move the ground
+         * out from under the pet mid-walk. Whatever orientation the app is
+         * entered with holds until the user goes home. */
         rotation_apply(s_rot_cand);
     }
 }
@@ -2410,6 +2989,9 @@ static lv_obj_t *s_food_item;
 static int s_food_x, s_food_fall;
 static bool s_food_ready;
 
+/* the egg (stage PET_EGG) sits where the astronaut will stand */
+static lv_obj_t *s_pet_egg;
+
 /* character parts */
 static lv_obj_t *s_ch_wrap, *s_ch_body, *s_ch_pack, *s_ch_visor;
 static lv_obj_t *s_ch_eye_l, *s_ch_eye_r, *s_ch_leg_l, *s_ch_leg_r;
@@ -2420,6 +3002,16 @@ static int s_bubble_life;
 /* HUD */
 static lv_obj_t *s_pet_name, *s_pet_mood;
 static lv_obj_t *s_bar_food, *s_bar_fun, *s_bar_nrg;
+/* Change-gate memory for the HUD labels; cleared on every scene build so a
+ * fresh label is never left showing its placeholder by a stale gate. */
+static char s_pet_prev_mood[48], s_pet_prev_name[24];
+
+/* The designer QR overlay — tap the pet's name to open it. Same machinery as
+ * the DAYS edit QR: the link is minted by the broker, single-use, and the
+ * phone lands on /pet already holding a session code. */
+static lv_obj_t *s_pet_qr_panel, *s_pet_qr, *s_pet_qr_note;
+static char s_pet_link_drawn[256];
+static uint32_t s_pet_link_seen_ver = UINT32_MAX;
 
 static int isin(int deg, int amp) {
     while (deg < 0) deg += 360;
@@ -2437,14 +3029,17 @@ static int ground_y(int x) {
 }
 
 static const char *pet_mood_text(int *worst) {
-    int m = s_food;
+    int m = s_pet.hunger;
     const char *s = "hungry";
-    if (s_fun < m) { m = s_fun; s = "bored"; }
+    if (s_pet.happy < m) { m = s_pet.happy; s = "bored"; }
     if (s_nrg < m) { m = s_nrg; s = "sleepy"; }
     *worst = m;
+    /* An unanswered cue overrides everything: it is the ask on the clock. */
+    if (s_pet.cue == PET_CUE_HUNGRY) return "feed me?";
+    if (s_pet.cue == PET_CUE_LONELY) return "play with me?";
     if (m > 60) return "having a good day";
     if (m > 30) return s;
-    return (m == s_food) ? "starving!" : (m == s_fun ? "lonely!" : "exhausted!");
+    return (m == s_pet.hunger) ? "starving!" : (m == s_pet.happy ? "lonely!" : "exhausted!");
 }
 
 static void say(const char *txt) {
@@ -2499,38 +3094,136 @@ static void pick_activity(void) {
 }
 
 /* ---- actions from the keys / touch buttons ---- */
+/* Nothing to feed, play with, or tuck in before hatching or after leaving —
+ * these also arrive via the long-press key path, not just the hidden buttons. */
+static bool pet_absent(void) {
+    return s_pet.stage == PET_EGG || s_pet.stage == PET_AWAY;
+}
+
+/* ---- motion controls: the cube itself is the joystick ----
+ *
+ * Tilt the cube and the pet walks downhill toward the dipped edge, faster
+ * the steeper the lean; shake it and the pet is knocked into a hop. Runs at
+ * the main loop's PET-mode 50 Hz IMU cadence, only while PET is the active
+ * app with the screen awake.
+ *
+ * The first version read the lean from s_base_rot and was dead on arrival:
+ * the base detector only flips once an axis DOMINATES (45 degrees plus the
+ * anti-ambiguity margin), so the pet ignored every tilt short of tipping the
+ * cube onto its edge. This one reads the gravity COMPONENT along the screen
+ * edge directly — the direction-to-axis mapping still goes through
+ * rot_from_base(), the same calibrated table autorotate trusts, so all
+ * eight mounting states work. A tilt whose dipped edge would autorotate the
+ * panel to (s_rot + 3) & 3 is one dipping the screen's left edge; PET pins
+ * the panel rotation (see imu_poll) precisely so that mapping cannot change
+ * under the tilt mid-walk. */
+#define PET_LEAN_TH      4200   /* ~0.26 g: a deliberate ~15 degree tip */
+#define PET_LEAN_RELEASE 3000   /* hysteresis so a wobble does not stutter */
+
+static int pet_base_accel(int b) {  /* accel component toward base edge b */
+    switch (b & 3) {
+    case 1:  return s_acc_x;
+    case 3:  return -s_acc_x;
+    case 2:  return s_acc_y;
+    default: return -s_acc_y;       /* base 0 */
+    }
+}
+
+/* Gravity along the screen edge that autorotate would call rotation
+ * (s_rot + rot_delta): +3 is the screen's left edge, +1 its right. */
+static int pet_lean_signal(int rot_delta) {
+    int want = (s_rot + rot_delta) & 3;
+    for (int b = 0; b < 4; b++)
+        if (rot_from_base(b) == want) return pet_base_accel(b);
+    return 0;
+}
+
+static void pet_motion_poll(void) {
+    static int16_t px, py, pz;
+    static bool primed, tilt_walking;
+    static int64_t last_shake_ms;
+
+    if (pet_absent() || !s_screen_on || s_doze || !s_ch_wrap) {
+        primed = false;
+        tilt_walking = false;
+        return;
+    }
+
+    if (primed) {
+        int jerk = abs(s_acc_x - px) + abs(s_acc_y - py) + abs(s_acc_z - pz);
+        int64_t t = now_ms();
+        if (jerk > 6500 && t - last_shake_ms > 1200) {
+            last_shake_ms = t;
+            set_act(ACT_JUMP, 34);
+            say("wobble!");
+            s_pet.happy = clampi(s_pet.happy + 2, 0, 100);
+            s_pet_dirty = true;
+            pet_seen();
+            ESP_LOGI(TAG, "pet imu: shake jerk=%d", jerk);
+        }
+    }
+    px = s_acc_x; py = s_acc_y; pz = s_acc_z;
+    primed = true;
+
+    int left = pet_lean_signal(3), right = pet_lean_signal(1);
+    int mag = left > right ? left : right;
+    int tx = -1;
+    if (left > PET_LEAN_TH && left >= right)  tx = WALK_MIN_X;
+    else if (right > PET_LEAN_TH)             tx = WALK_MAX_X;
+
+    if (tx >= 0) {
+        /* Analog, like a marble: steeper is faster. Steer only when it
+         * changes something — walk_to() resets the activity clock, and
+         * re-issuing it every poll would pin the animation's first frame. */
+        int speed = clampi(2 + (mag - PET_LEAN_TH) / 2500, 2, 6);
+        if (s_act != ACT_WALK || s_tx != tx) {
+            walk_to(tx);
+            pet_seen();
+            ESP_LOGI(TAG, "pet imu: lean %s (L=%d R=%d)",
+                     tx == WALK_MIN_X ? "left" : "right", left, right);
+        }
+        s_walk_speed = speed;
+        tilt_walking = true;
+    } else if (tilt_walking && mag < PET_LEAN_RELEASE) {
+        /* The cube levelled out: the marble stops rolling. Only a walk WE
+         * started is stopped — a tap-commanded walk keeps its target. */
+        tilt_walking = false;
+        if (s_act == ACT_WALK) set_act(ACT_IDLE, 40);
+    }
+}
+
 static void pet_feed(void) {
-    s_food = clampi(s_food + 18, 0, 100);
+    if (pet_absent()) return;
+    /* A meal: most of it lands now, the rest when the snack is caught and
+     * eaten (ACT_EAT), totalling the meal's +30. Meals reset the snack run. */
+    s_pet.hunger = clampi(s_pet.hunger + 22, 0, 100);
+    s_pet.snack_run = 0;
     s_pet_dirty = true;
+    pet_seen();
     drop_food();
     log_event("pet fed");
 }
 static void pet_play(void) {
-    s_fun = clampi(s_fun + 20, 0, 100);
+    if (pet_absent()) return;
+    s_pet.happy = clampi(s_pet.happy + 20, 0, 100);
     s_nrg = clampi(s_nrg - 8, 0, 100);
     s_pet_dirty = true;
+    pet_seen();
     set_act(ACT_DANCE, 140);
     say("yay!");
     log_event("pet danced");
 }
 static void pet_rest(void) {
+    if (pet_absent()) return;
     s_nrg = clampi(s_nrg + 22, 0, 100);
     s_pet_dirty = true;
+    pet_seen();
     set_act(ACT_NAP, 200);
     say("zzz");
     log_event("pet napped");
 }
-
-/* decay + age, runs whichever screen is showing so the pet really lives */
-static void pet_tick(void) {
-    s_food = clampi(s_food - 1, 0, 100);
-    s_fun  = clampi(s_fun  - 1, 0, 100);
-    s_nrg  = clampi(s_nrg  - 1, 0, 100);
-    static uint32_t sec_acc;
-    sec_acc += PET_TICK_MS / 1000;
-    while (sec_acc >= 60) { sec_acc -= 60; s_pet_age_min++; }
-    s_pet_dirty = true;
-}
+/* Decay, aging, evolution and cues all live in pet_engine_service() now,
+ * beside the blob — the engine runs whichever screen is showing. */
 
 /* tap empty space to send it there, tap the astronaut to pet it,
  * double-tap anywhere to make it dance */
@@ -2540,9 +3233,18 @@ static void scene_tap_cb(lv_event_t *e) {
     bool dbl = (now - last_tap) < 400;
     last_tap = now;
 
+    if (pet_absent()) {
+        /* Tapping the egg is acknowledged — a shiver and a murmur — but an
+         * egg cannot be hurried, and a departed pet is not here to answer. */
+        if (s_pet.stage == PET_EGG) say("...!");
+        pet_seen();
+        return;
+    }
+
     if (dbl) {
-        s_fun = clampi(s_fun + 8, 0, 100);
+        s_pet.happy = clampi(s_pet.happy + 8, 0, 100);
         s_pet_dirty = true;
+        pet_seen();
         set_act(ACT_DANCE, 140);
         say("wheee!");
         return;
@@ -2551,8 +3253,9 @@ static void scene_tap_cb(lv_event_t *e) {
     lv_point_t p;
     lv_indev_get_point(lv_indev_active(), &p);
     if (abs(p.x - s_cx) < 46 && p.y > 180) {          /* on the astronaut */
-        s_fun = clampi(s_fun + 4, 0, 100);
+        s_pet.happy = clampi(s_pet.happy + 4, 0, 100);
         s_pet_dirty = true;
+        pet_seen();
         set_act(ACT_WAVE, 70);
         say("hehe");
     } else {
@@ -2565,6 +3268,13 @@ static bool home_gesture_from_bottom(lv_indev_t *indev);
 /* swipe: up = jump, left/right = dash; bottom-edge up = home */
 static void pet_gesture_cb(lv_event_t *e) {
     lv_indev_t *indev = lv_indev_active();
+    if (pet_absent()) {
+        if (home_gesture_from_bottom(indev)) {
+            lv_indev_wait_release(indev);
+            app_request(APP_DRAWER);
+        }
+        return;
+    }
     switch (lv_indev_get_gesture_dir(indev)) {
     case LV_DIR_TOP:
         if (home_gesture_from_bottom(indev)) {
@@ -2590,10 +3300,95 @@ static void pet_gesture_cb(lv_event_t *e) {
     }
 }
 
+/* HUD refresh, change-gated: lv_label_set_text has no equality short-circuit,
+ * so an unconditional rewrite here is a flush per tick forever. The bars gate
+ * themselves (lv_bar ignores an unchanged value). */
+static void pet_hud_refresh(const char *mood) {
+    if (s_fcount % 10) return;
+    char name[24];
+    uint32_t age_d = s_pet.hatched_utc
+        ? (uint32_t)((time(NULL) - s_pet.hatched_utc) * PET_TIME_SCALE / 86400)
+        : 0;
+    if (s_pet.stage == PET_ADULT)
+        snprintf(name, sizeof(name), "%s  %lud", s_pet.name, (unsigned long)age_d);
+    else
+        snprintf(name, sizeof(name), "%s  %s", s_pet.name, pet_stage_word());
+    if (strcmp(mood, s_pet_prev_mood) != 0) {
+        snprintf(s_pet_prev_mood, sizeof(s_pet_prev_mood), "%s", mood);
+        lv_label_set_text(s_pet_mood, mood);
+    }
+    if (strcmp(name, s_pet_prev_name) != 0) {
+        snprintf(s_pet_prev_name, sizeof(s_pet_prev_name), "%s", name);
+        lv_label_set_text(s_pet_name, name);
+    }
+    lv_bar_set_value(s_bar_food, s_pet.hunger, LV_ANIM_OFF);
+    lv_bar_set_value(s_bar_fun,  s_pet.happy,  LV_ANIM_OFF);
+    lv_bar_set_value(s_bar_nrg,  s_nrg,  LV_ANIM_OFF);
+}
+
+/* Mirrors days_timer_cb's QR section: redraw the code only when the link
+ * actually changed, show honest text while it is being minted or failing. */
+static void pet_qr_refresh(void) {
+    if (!s_pet_qr_panel || lv_obj_has_flag(s_pet_qr_panel, LV_OBJ_FLAG_HIDDEN))
+        return;
+    char url[PET_LINK_URL_MAX];
+    uint32_t version;
+    pet_link_snapshot(url, sizeof(url), &version);
+    bool fetching = __atomic_load_n(&s_pet_link_fetching, __ATOMIC_ACQUIRE) ||
+                    __atomic_load_n(&s_req_pet_link, __ATOMIC_ACQUIRE);
+    if (url[0] && s_pet_qr &&
+        (version != s_pet_link_seen_ver || strcmp(url, s_pet_link_drawn) != 0)) {
+        size_t n = strlen(url);
+        if (lv_qrcode_update(s_pet_qr, url, (uint32_t)n) == LV_RESULT_OK) {
+            snprintf(s_pet_link_drawn, sizeof(s_pet_link_drawn), "%s", url);
+            lv_obj_remove_flag(s_pet_qr, LV_OBJ_FLAG_HIDDEN);
+            lv_label_set_text(s_pet_qr_note,
+                              "SCAN, THEN DESIGN ON YOUR PHONE\n"
+                              "When you have saved there,\n"
+                              "TAP THIS SCREEN to sync the cube");
+        } else {
+            lv_obj_add_flag(s_pet_qr, LV_OBJ_FLAG_HIDDEN);
+            lv_label_set_text(s_pet_qr_note, "QR ENCODE FAILED\nTap to close and retry");
+            ESP_LOGW(TAG, "pet: designer QR encode failed (%u bytes)", (unsigned)n);
+        }
+        s_pet_link_seen_ver = version;
+    } else if (!url[0]) {
+        lv_obj_add_flag(s_pet_qr, LV_OBJ_FLAG_HIDDEN);
+        lv_label_set_text(s_pet_qr_note, fetching ? "CREATING SECURE LINK..." :
+                          "BROKER UNAVAILABLE\nTap to close and retry");
+        s_pet_link_seen_ver = version;
+    }
+}
+
+static void pet_qr_open_cb(lv_event_t *e) {
+    lv_event_stop_bubbling(e);        /* the name sits over the tap-to-walk scene */
+    if (!s_pet_qr_panel) return;
+    pet_link_publish("");
+    s_pet_link_drawn[0] = '\0';
+    s_pet_link_seen_ver = UINT32_MAX;
+    lv_obj_add_flag(s_pet_qr, LV_OBJ_FLAG_HIDDEN);
+    lv_label_set_text(s_pet_qr_note, "CREATING SECURE LINK...");
+    lv_obj_remove_flag(s_pet_qr_panel, LV_OBJ_FLAG_HIDDEN);
+    __atomic_store_n(&s_req_pet_link, true, __ATOMIC_RELEASE);
+}
+
+static void pet_qr_close_cb(lv_event_t *e) {
+    lv_event_stop_bubbling(e);
+    if (s_pet_qr_panel) lv_obj_add_flag(s_pet_qr_panel, LV_OBJ_FLAG_HIDDEN);
+    /* Saving happens on the phone; closing the handoff is the signal to
+     * fetch the result now rather than on the 2 h cycle. The bubble is the
+     * acknowledgement that a sync is actually happening — without it the
+     * tap looked like a plain dismiss and the design seemed lost. */
+    __atomic_store_n(&s_req_pet_cfg, true, __ATOMIC_RELEASE);
+    say("syncing...");
+}
+
 static void pet_timer_cb(lv_timer_t *t) {
     if (!s_ch_wrap) return;
     s_fcount++;
     s_aframe++;
+
+    pet_qr_refresh();
 
     int worst;
     const char *mood = pet_mood_text(&worst);
@@ -2645,6 +3440,29 @@ static void pet_timer_cb(lv_timer_t *t) {
         }
     }
 
+    /* An egg or an empty world: ambient sky only, plus the egg's small signs
+     * of life. Everything below assumes a creature that exists. */
+    if (s_pet.stage == PET_EGG || s_pet.stage == PET_AWAY) {
+        if (s_pet_egg) {
+            /* an occasional shiver, not a metronome — it is supposed to make
+             * you look twice */
+            int ph = s_fcount % 300;
+            lv_obj_set_style_translate_x(s_pet_egg,
+                ph < 24 ? isin(ph * 45, 2) : 0, 0);
+            if (s_fcount % 420 == 200) say("...");
+        }
+        if (s_bubble_life > 0) {
+            s_bubble_life--;
+            lv_obj_set_style_opa(s_bubble,
+                (lv_opa_t)(s_bubble_life > 35 ? 255 : s_bubble_life * 7), 0);
+            if (!s_bubble_life) lv_obj_add_flag(s_bubble, LV_OBJ_FLAG_HIDDEN);
+        }
+        pet_hud_refresh(s_pet.stage == PET_EGG
+                            ? "any day now"
+                            : "gone to see the stars - tap my name");
+        return;
+    }
+
     /* falling snack */
     if (!lv_obj_has_flag(s_food_item, LV_OBJ_FLAG_HIDDEN)) {
         int gy = ground_y(s_food_x) - 14;
@@ -2681,7 +3499,7 @@ static void pet_timer_cb(lv_timer_t *t) {
         if (s_aframe == 4) { say("yum!"); }
         if (s_aframe == 10) {
             lv_obj_add_flag(s_food_item, LV_OBJ_FLAG_HIDDEN);
-            s_food = clampi(s_food + 10, 0, 100);
+            s_pet.hunger = clampi(s_pet.hunger + 8, 0, 100);
             s_pet_dirty = true;
         }
         squash = isin(s_aframe * 40, 5);
@@ -2792,14 +3610,7 @@ static void pet_timer_cb(lv_timer_t *t) {
         if (!s_bubble_life) lv_obj_add_flag(s_bubble, LV_OBJ_FLAG_HIDDEN);
     }
 
-    /* HUD refresh is cheap but pointless every frame */
-    if (s_fcount % 10 == 0) {
-        lv_label_set_text(s_pet_mood, mood);
-        lv_label_set_text_fmt(s_pet_name, "PIP  %lum", (unsigned long)s_pet_age_min);
-        lv_bar_set_value(s_bar_food, s_food, LV_ANIM_OFF);
-        lv_bar_set_value(s_bar_fun,  s_fun,  LV_ANIM_OFF);
-        lv_bar_set_value(s_bar_nrg,  s_nrg,  LV_ANIM_OFF);
-    }
+    pet_hud_refresh(mood);
 }
 
 /* ---------------- scene construction ---------------- */
@@ -2864,23 +3675,30 @@ static void gesture_home_cb(lv_event_t *e) {
     }
 }
 
+/* 76 px tall with widened hit test and 20 px type — the touch-target rule
+ * from HARDWARE.md pitfall #24. The first pass shipped these at 48 px and
+ * they mis-tapped on the glass, the same mistake MUSIC's transport and
+ * CONTROL both made once and fixed at 76. */
 static lv_obj_t *make_action_btn(lv_obj_t *parent, const char *txt,
                                  uint32_t color, lv_event_cb_t cb) {
     lv_obj_t *b = lv_button_create(parent);
-    lv_obj_set_size(b, 104, 48);
+    lv_obj_set_size(b, 104, 76);
     lv_obj_set_style_bg_color(b, lv_color_hex(color), 0);
-    lv_obj_set_style_radius(b, 24, 0);
+    lv_obj_set_style_radius(b, 26, 0);
     lv_obj_set_style_shadow_width(b, 0, 0);
+    lv_obj_set_ext_click_area(b, 8);
     lv_obj_add_event_cb(b, cb, LV_EVENT_CLICKED, NULL);
     lv_obj_t *l = lv_label_create(b);
+    lv_obj_set_style_text_font(l, &lv_font_montserrat_20, 0);
     lv_label_set_text(l, txt);
     lv_obj_set_style_text_color(l, lv_color_hex(0x10162A), 0);
     lv_obj_center(l);
     return b;
 }
 
-/* Unreferenced while FACET_APP_PET is 0. Kept compiled rather than deleted so it
- * cannot bit-rot; --gc-sections drops it from the image, so it costs no flash. */
+/* Unreferenced whenever FACET_APP_PET is 0 — kept compiled rather than deleted
+ * so it cannot bit-rot; --gc-sections drops it from such an image, so the
+ * attribute and this note stay even while the app ships. */
 __attribute__((unused))
 static void build_pet_app(lv_obj_t *scr) {
     s_scr_pet = scr;
@@ -2982,6 +3800,29 @@ static void build_pet_app(lv_obj_t *scr) {
     lv_label_set_text(s_bubble, "");
     lv_obj_add_flag(s_bubble, LV_OBJ_FLAG_HIDDEN);
 
+    /* --- before hatching / after leaving, the astronaut is not here --- */
+    s_pet_egg = NULL;
+    if (s_pet.stage == PET_EGG) {
+        lv_obj_add_flag(s_ch_wrap, LV_OBJ_FLAG_HIDDEN);
+        int gy = ground_y(240);
+        s_pet_egg = rect(s_scr_pet, 44, 54, 22, 0xF4F1DE);
+        lv_obj_set_pos(s_pet_egg, 240 - 22, gy - 50);
+        lv_obj_t *spot = rect(s_pet_egg, 12, 10, 5, 0xE9C46A);
+        lv_obj_set_pos(spot, 8, 14);
+        lv_obj_t *spot2 = rect(s_pet_egg, 8, 7, 3, 0xE9C46A);
+        lv_obj_set_pos(spot2, 26, 30);
+        /* the murmurs rise from the shell, not from a walking character */
+        lv_obj_set_pos(s_bubble, 240 + 30, gy - 76);
+    } else if (s_pet.stage == PET_AWAY) {
+        lv_obj_add_flag(s_ch_wrap, LV_OBJ_FLAG_HIDDEN);
+        /* a tiny sign planted where it used to stand */
+        int gy = ground_y(262);
+        lv_obj_t *post = rect(s_scr_pet, 4, 26, 2, 0xB8C4D9);
+        lv_obj_set_pos(post, 262, gy - 26);
+        lv_obj_t *board = rect(s_scr_pet, 34, 18, 4, 0xE9C46A);
+        lv_obj_set_pos(board, 247, gy - 42);
+    }
+
     /* --- HUD: name + mood + three slim bars, kept out of the scene --- */
     s_pet_name = lv_label_create(s_scr_pet);
     lv_obj_set_style_text_color(s_pet_name, lv_color_hex(0xF4F1DE), 0);
@@ -3007,24 +3848,61 @@ static void build_pet_app(lv_obj_t *scr) {
     lv_label_set_text(s_pet_mood, "having a good day");
     lv_obj_align(s_pet_mood, LV_ALIGN_TOP_MID, 0, TOP_MARGIN + 34);
 
-    /* --- touch action bar --- */
-    lv_obj_t *acts = lv_obj_create(s_scr_pet);
-    lv_obj_remove_style_all(acts);
-    lv_obj_set_size(acts, 330, 50);
-    lv_obj_align(acts, LV_ALIGN_BOTTOM_MID, 0, -BOTTOM_MARGIN);
-    lv_obj_set_flex_flow(acts, LV_FLEX_FLOW_ROW);
-    lv_obj_set_flex_align(acts, LV_FLEX_ALIGN_SPACE_BETWEEN,
-                          LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
-    lv_obj_remove_flag(acts, LV_OBJ_FLAG_SCROLLABLE);
-    make_action_btn(acts, "FEED",  0xF4A261, act_feed_cb);
-    make_action_btn(acts, "DANCE", 0xE76F51, act_play_cb);
-    make_action_btn(acts, "NAP",   0x8DE0D2, act_rest_cb);
+    /* --- touch action bar (an egg or an empty world offers no verbs) --- */
+    if (!pet_absent()) {
+        lv_obj_t *acts = lv_obj_create(s_scr_pet);
+        lv_obj_remove_style_all(acts);
+        lv_obj_set_size(acts, 340, 76);
+        lv_obj_align(acts, LV_ALIGN_BOTTOM_MID, 0, -BOTTOM_MARGIN);
+        lv_obj_set_flex_flow(acts, LV_FLEX_FLOW_ROW);
+        lv_obj_set_flex_align(acts, LV_FLEX_ALIGN_SPACE_BETWEEN,
+                              LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+        lv_obj_remove_flag(acts, LV_OBJ_FLAG_SCROLLABLE);
+        make_action_btn(acts, "FEED",  0xF4A261, act_feed_cb);
+        make_action_btn(acts, "DANCE", 0xE76F51, act_play_cb);
+        make_action_btn(acts, "NAP",   0x8DE0D2, act_rest_cb);
+    }
+
+    /* Fresh labels must not be gated against a previous build's text. */
+    s_pet_prev_mood[0] = '\0';
+    s_pet_prev_name[0] = '\0';
+
+    /* The name doubles as the door to the phone designer. */
+    lv_obj_add_flag(s_pet_name, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_set_ext_click_area(s_pet_name, 24);
+    lv_obj_add_event_cb(s_pet_name, pet_qr_open_cb, LV_EVENT_CLICKED, NULL);
+
+    /* Designer QR overlay, built last so it sits over everything. White
+     * panel: a QR drawn onto a dark scene scans poorly (the setup QR learned
+     * this); black modules on white with the quiet zone kept. */
+    s_pet_qr_panel = lv_obj_create(s_scr_pet);
+    lv_obj_remove_style_all(s_pet_qr_panel);
+    lv_obj_set_size(s_pet_qr_panel, 480, 480);
+    lv_obj_set_style_bg_color(s_pet_qr_panel, lv_color_hex(0xFFFFFF), 0);
+    lv_obj_set_style_bg_opa(s_pet_qr_panel, LV_OPA_COVER, 0);
+    lv_obj_remove_flag(s_pet_qr_panel, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_event_cb(s_pet_qr_panel, pet_qr_close_cb, LV_EVENT_CLICKED, NULL);
+    s_pet_qr = lv_qrcode_create(s_pet_qr_panel);
+    lv_qrcode_set_size(s_pet_qr, 220);
+    lv_qrcode_set_dark_color(s_pet_qr, lv_color_hex(0x000000));
+    lv_qrcode_set_light_color(s_pet_qr, lv_color_hex(0xFFFFFF));
+    lv_qrcode_set_quiet_zone(s_pet_qr, true);
+    lv_obj_align(s_pet_qr, LV_ALIGN_CENTER, 0, -28);
+    lv_obj_remove_flag(s_pet_qr, LV_OBJ_FLAG_CLICKABLE);
+    s_pet_qr_note = lv_label_create(s_pet_qr_panel);
+    lv_obj_set_width(s_pet_qr_note, CONTENT_W);
+    lv_obj_set_style_text_align(s_pet_qr_note, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_style_text_color(s_pet_qr_note, lv_color_hex(0x10162A), 0);
+    lv_label_set_text(s_pet_qr_note, "");
+    lv_obj_align(s_pet_qr_note, LV_ALIGN_CENTER, 0, 116);
+    lv_obj_add_flag(s_pet_qr_panel, LV_OBJ_FLAG_HIDDEN);
 
     /* tap the world to send it walking, tap the astronaut to pet it */
     lv_obj_add_flag(s_scr_pet, LV_OBJ_FLAG_CLICKABLE);
     lv_obj_add_event_cb(s_scr_pet, scene_tap_cb, LV_EVENT_CLICKED, NULL);
     lv_obj_add_event_cb(s_scr_pet, pet_gesture_cb, LV_EVENT_GESTURE, NULL);
 
+    pet_seen();                     /* opening the app counts as a visit */
     s_app_timer = lv_timer_create(pet_timer_cb, PET_FPS_MS, NULL);
 }
 
@@ -7844,10 +8722,11 @@ static void build_music_app(lv_obj_t *scr) {
 
 /* ---------------- app drawer ---------------- */
 
-/* PIP is compiled but not registered. Its code stays — this is a build-time
- * choice about what ships in THIS image, not a deletion. Flip to 1 to bring it
- * back; nothing else needs changing. */
-#define FACET_APP_PET 0
+/* PIP ships in this image. The flag stays because it is a build-time choice,
+ * not a constant: flipping it to 0 compiles the app out again, leaving a
+ * zeroed hole in s_apps that everything walking the table must skip — see
+ * app_enabled() and HARDWARE.md pitfall #31. */
+#define FACET_APP_PET 1
 
 typedef struct {
     const char *name;                 /* shown in the drawer */
@@ -7927,24 +8806,65 @@ static void tile_cb(lv_event_t *e) {
     app_request((int)(intptr_t)lv_obj_get_user_data(lv_event_get_target(e)));
 }
 
+/* The scroll hint: a faint pulsing chevron under the grid. Four tiles fill
+ * the viewport exactly, so nothing about the resting drawer says "there is
+ * more" — the hint is that sentence. It hides once the user has scrolled,
+ * because at that point they know, and an arrow pointing down from the last
+ * row would be a lie. */
+static void drawer_hint_opa_cb(void *obj, int32_t v) {
+    lv_obj_set_style_opa(obj, (lv_opa_t)v, 0);
+}
+
+static void drawer_scroll_cb(lv_event_t *e) {
+    lv_obj_t *hint = lv_event_get_user_data(e);
+    bool scrolled = lv_obj_get_scroll_y(lv_event_get_target(e)) > 24;
+    if (scrolled == lv_obj_has_flag(hint, LV_OBJ_FLAG_HIDDEN)) return;
+    if (scrolled) {
+        lv_anim_delete(hint, drawer_hint_opa_cb);
+        lv_obj_add_flag(hint, LV_OBJ_FLAG_HIDDEN);
+    }
+}
+
 static void build_drawer(lv_obj_t *scr) {
     lv_obj_set_style_bg_color(scr, lv_color_hex(0x000000), 0);
     lv_obj_remove_flag(scr, LV_OBJ_FLAG_SCROLLABLE);
 
-    /* 2x2 of 196 px tiles with a 16 px gap fills 408 px of the 480 px panel.
-     * The outer tile corners land at (36,36), still inside the display's
-     * corner radius, so nothing is clipped. */
+    /* Two 196 px tiles per row with a 16 px gap fill 408 px of the 480 px
+     * panel; the outer tile corners land at (36,36), still inside the
+     * display's corner radius, so nothing is clipped. Five apps outgrow the
+     * 2x2, so rows past the second scroll into view. The viewport stays
+     * 412 px: growing it to show a sliver of row three would lift the top
+     * corners to (36,22), which is OUTSIDE the r=110 corner arc — (36,36)
+     * is already near the limit. */
     lv_obj_t *grid = lv_obj_create(scr);
     lv_obj_remove_style_all(grid);
     lv_obj_set_size(grid, 412, 412);
     lv_obj_center(grid);
     lv_obj_set_flex_flow(grid, LV_FLEX_FLOW_ROW_WRAP);
+    /* Tracks pack from the TOP, not the centre. Centring tracks in a
+     * container their content overflows makes the content spill both ends:
+     * the drawer opened half-scrolled ("row one cut, PIP peeking") and the
+     * scroller, whose limits assume top-packed content, sprang every upward
+     * drag straight back down. START shows exactly the first four tiles and
+     * gives the scroller honest limits. */
     lv_obj_set_flex_align(grid, LV_FLEX_ALIGN_CENTER,
-                          LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+                          LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_START);
     lv_obj_set_style_pad_row(grid, 16, 0);
     lv_obj_set_style_pad_column(grid, 16, 0);
-    lv_obj_remove_flag(grid, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_scroll_dir(grid, LV_DIR_VER);
+    /* remove_style_all stripped the theme's scrollbar, so give the ACTIVE
+     * mode something visible: a thin accent sliver during the drag is the
+     * only hint the drawer holds more than four tiles. */
+    lv_obj_set_scrollbar_mode(grid, LV_SCROLLBAR_MODE_ACTIVE);
+    lv_obj_set_style_bg_color(grid, lv_color_hex(0x3A4556), LV_PART_SCROLLBAR);
+    lv_obj_set_style_bg_opa(grid, 140, LV_PART_SCROLLBAR);
+    lv_obj_set_style_width(grid, 4, LV_PART_SCROLLBAR);
+    lv_obj_set_style_radius(grid, 2, LV_PART_SCROLLBAR);
+    /* The grid owns a drag now; without this the drag would also reach any
+     * screen-level gesture handler (HARDWARE.md pitfall #25). */
+    lv_obj_remove_flag(grid, LV_OBJ_FLAG_GESTURE_BUBBLE);
 
+    int shown = 0;
     for (int i = 0; i < APP_COUNT; i++) {
         if (!app_enabled(i)) continue;          /* compiled out of this image */
         lv_color_t accent = lv_color_hex(s_apps[i].color);
@@ -7952,15 +8872,15 @@ static void build_drawer(lv_obj_t *scr) {
         lv_obj_t *tile = lv_button_create(grid);
         lv_obj_set_size(tile, 196, 196);
         lv_obj_set_style_radius(tile, 34, 0);
-        lv_obj_set_style_bg_color(tile, lv_color_hex(0x0C1018), 0);
-        lv_obj_set_style_bg_grad_color(tile, lv_color_hex(0x141B26), 0);
-        lv_obj_set_style_bg_grad_dir(tile, LV_GRAD_DIR_VER, 0);
+        /* Flat fill, no gradient, no shadow. The drawer scrolls now, and a
+         * scroll repaints every visible tile per frame: an 18 px shadow is a
+         * blur re-run per tile per frame (the known 20 fps route), and a
+         * vertical gradient both fills slower than flat and bands on RGB565.
+         * The accent glow the shadow used to give survives in the border. */
+        lv_obj_set_style_bg_color(tile, lv_color_hex(0x10151F), 0);
         lv_obj_set_style_border_width(tile, 2, 0);
         lv_obj_set_style_border_color(tile, accent, 0);
-        lv_obj_set_style_border_opa(tile, 130, 0);
-        lv_obj_set_style_shadow_width(tile, 18, 0);
-        lv_obj_set_style_shadow_color(tile, accent, 0);
-        lv_obj_set_style_shadow_opa(tile, 45, 0);
+        lv_obj_set_style_border_opa(tile, 150, 0);
         /* pressed state gives the tap somewhere to land visually */
         lv_obj_set_style_bg_color(tile, lv_color_hex(0x1B2432), LV_STATE_PRESSED);
         lv_obj_set_style_border_opa(tile, 255, LV_STATE_PRESSED);
@@ -7979,6 +8899,27 @@ static void build_drawer(lv_obj_t *scr) {
         lv_obj_set_style_text_letter_space(l, 2, 0);
         lv_label_set_text(l, s_apps[i].name);
         lv_obj_align(l, LV_ALIGN_CENTER, 0, 46);
+        shown++;
+    }
+
+    if (shown > 4) {
+        lv_obj_t *hint = lv_label_create(scr);
+        lv_obj_set_style_text_font(hint, &lv_font_montserrat_20, 0);
+        lv_obj_set_style_text_color(hint, lv_color_hex(0x7A8BA5), 0);
+        lv_label_set_text(hint, LV_SYMBOL_DOWN);
+        /* In the strip below the grid: grid bottom is y446, panel edge 480.
+         * Centred, so the corner arcs are nowhere near it. */
+        lv_obj_align(hint, LV_ALIGN_BOTTOM_MID, 0, -6);
+        lv_anim_t a;
+        lv_anim_init(&a);
+        lv_anim_set_var(&a, hint);
+        lv_anim_set_exec_cb(&a, drawer_hint_opa_cb);
+        lv_anim_set_values(&a, 30, 150);
+        lv_anim_set_duration(&a, 900);
+        lv_anim_set_playback_duration(&a, 900);
+        lv_anim_set_repeat_count(&a, LV_ANIM_REPEAT_INFINITE);
+        lv_anim_start(&a);
+        lv_obj_add_event_cb(grid, drawer_scroll_cb, LV_EVENT_SCROLL, hint);
     }
 }
 
@@ -9627,11 +10568,15 @@ static void app_open(int idx) {
     if (s_app >= 0 && s_app < APP_COUNT && s_apps[s_app].save) {
         s_apps[s_app].save();
     }
+    /* Closing PET is the natural moment the dashboard's picture goes stale;
+     * report what the visit changed. */
+    if (s_app == APP_PET) pet_report_publish();
     if (s_app_timer) { lv_timer_delete(s_app_timer); s_app_timer = NULL; }
     s_scr_home = s_scr_setup = s_scr_pet = NULL;
     s_status_label = NULL; s_batt_bar = NULL; s_batt_label = NULL;
     s_bolt_label = NULL; s_fps_label = NULL; s_events_label = NULL;
-    s_ch_wrap = NULL;
+    s_ch_wrap = NULL; s_pet_egg = NULL;
+    s_pet_qr_panel = NULL; s_pet_qr = NULL; s_pet_qr_note = NULL;
     s_cfg_wall_pool = NULL; s_cfg_wall_state = NULL;
     s_cfg_wall_bar = NULL; s_cfg_wall_sub = NULL;
     s_cfg_days_val = NULL;
@@ -10018,16 +10963,19 @@ static void perf_mini_tick(lv_timer_t *t) {
     static int idx;
     lv_display_trigger_activity(NULL);
     switch (idx++) {
-    /* No PET: FACET_APP_PET is 0 in this profile, so the app does not exist
-     * in this image — requesting it was tonight's crash loop. */
+    /* PET is requested through app_enabled(), never by bare enum: a build
+     * with FACET_APP_PET 0 leaves a hole in s_apps, and requesting a hole
+     * was one night's entire crash loop (HARDWARE.md #31). */
     case 0: app_request(APP_DRAWER);                                  break;
     case 1: perf_snap_dump("drawer");
+            app_request(app_enabled(APP_PET) ? APP_PET : APP_DRAWER); break;
+    case 2: if (app_enabled(APP_PET)) perf_snap_dump("pet");
             s_lock_rings = false; s_lock_np_off = true;
             app_request(APP_LOCK);                                    break;
-    case 2: perf_snap_dump("lock_noring");
+    case 3: perf_snap_dump("lock_noring");
             s_lock_rings = true; s_lock_np_off = false;
             app_request(APP_MUSIC);                                   break;
-    case 3: /* second settle period: give MUSIC two full polls so the edge
+    case 4: /* second settle period: give MUSIC two full polls so the edge
              * chrome (shuffle/like/devices column, volume slider) has every
              * chance to arrive before the frame is judged */          break;
     default:
@@ -10287,7 +11235,7 @@ void app_main(void) {
     }
 
     int64_t last_stats = now_ms(), last_perf = now_ms();
-    int64_t last_batt = 0, last_imu = 0, last_pet = now_ms(), last_pet_save = now_ms();
+    int64_t last_batt = 0, last_imu = 0, last_pet_save = now_ms();
     int64_t last_tele = now_ms(), last_rejoin = now_ms(), last_sp_poll = 0;
     uint32_t last_refr = 0;
     int64_t s_last_btn = now_ms();
@@ -10774,9 +11722,12 @@ void app_main(void) {
             }
         }
 
-        if (t - last_pet >= PET_TICK_MS) {
-            last_pet = t;
-            pet_tick();
+        pet_engine_service();          /* self-paced to ~1 Hz internally */
+        if (s_req_pet_rebuild) {
+            s_req_pet_rebuild = false;
+            /* An evolution or departure changes what the scene IS; rebuilding
+             * through the normal request path reuses all the teardown rules. */
+            if (s_app == APP_PET) app_request(APP_PET);
         }
         /* NVS commits erase flash, which stalls a BLE controller running
          * from flash. The dirty flag stays set, so the write lands on the
@@ -10785,11 +11736,23 @@ void app_main(void) {
             last_pet_save = t;
             pet_save();
         }
+        /* An hourly heartbeat keeps the dashboard honest even when nobody
+         * opens the app; event pushes (evolution, departure) are immediate. */
+        static int64_t last_pet_push;
+        if (t - last_pet_push >= 60 * 60 * 1000LL) {
+            last_pet_push = t;
+            pet_report_publish();
+        }
 
-        if (!s_doze && t - last_imu >= 100) {     /* rotation is meaningless dozing */
+        /* PET reads the IMU as a joystick and a shake detector; 10 Hz
+         * undersamples a hand shake (one sample per half-oscillation), so
+         * the cadence rises to 50 Hz only while PET is the active app. The
+         * read is one 6-byte I2C burst, ~2% bus time at 50 Hz. */
+        if (!s_doze && t - last_imu >= (s_app == APP_PET ? 20 : 100)) {
             last_imu = t;
             imu_poll();
             pomo_poll(t);                         /* needs fresh accelerometer */
+            if (s_app == APP_PET) pet_motion_poll();
         }
 
         if (!s_rtc_written && s_time_synced) {
@@ -10861,7 +11824,7 @@ void app_main(void) {
                 }
             }
             ESP_LOGI(TAG, "uptime=%llds clock=%s scr=%d idle=%lu/%llds wifi=%s%d screen=%s batt=%d%% %dmV%s%s cap=%dmV%s fps=%u.%u "
-                          "rot=%d sd=%lu pet[%d/%d/%d]%s",
+                          "rot=%d sd=%lu pet[%s f%d %d/%d m%d]%s",
                      (long long)(t / 1000), clock, (int)s_app,
                      (unsigned long)lv_display_get_inactive_time(NULL),
                      (long long)((t - s_last_btn) / 1000),
@@ -10872,7 +11835,9 @@ void app_main(void) {
                      s_bypass ? " BYP" : (s_vbus ? " PLUG" : ""),
                      chg_cv_mv(chg_cv_code()), s_chg_once ? " ONCE" : "",
                      (unsigned)(s_last_fps_x10 / 10), (unsigned)(s_last_fps_x10 % 10),
-                     s_rot * 90, (unsigned long)s_tele_rows, s_food, s_fun, s_nrg,
+                     s_rot * 90, (unsigned long)s_tele_rows, pet_stage_word(),
+                     (int)s_pet.form, (int)s_pet.hunger, (int)s_pet.happy,
+                     (int)s_pet.mistakes,
                      s_stack_fallback ? " STACK-FALLBACK!" : "");
             log_mem("periodic");
         }
