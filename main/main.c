@@ -280,7 +280,21 @@ typedef struct {
     uint8_t  flags;
     int8_t   wx_temp;
     char     name[12];           /* ASCII, broker-set, default "PIP" */
+    /* v3 appends — append-only from here on, so a version bump is a prefix
+     * read plus zeroed tail, never a field-by-field migration. The spare
+     * bytes are the down payment on v4. */
+    uint32_t odo_m;              /* lifetime metres walked (10 px = 1 m) */
+    uint16_t laps;               /* full trips around the world */
+    uint16_t best_alt;           /* highest jetpack flight, metres */
+    uint8_t  spare[8];
 } pet_blob2_t;
+
+/* The v2 file is the struct without the appended tail: 100 payload bytes
+ * padded to 104. Frozen by assert so an innocent field reorder cannot
+ * silently orphan every saved pet. */
+#define PET_BLOB_V2_SIZE 104
+_Static_assert(offsetof(pet_blob2_t, odo_m) == 100, "v2 prefix moved");
+_Static_assert(sizeof(pet_blob2_t) == 120, "blob layout changed — bump the version");
 
 enum { PET_EGG = 0, PET_BABY, PET_CHILD, PET_TEEN, PET_ADULT, PET_AWAY };
 enum { PET_CUE_NONE = 0, PET_CUE_HUNGRY, PET_CUE_LONELY };
@@ -601,7 +615,7 @@ typedef struct {                     /* legacy v1 blob, read once to migrate */
     uint32_t age_min;
 } pet_blob_v1_t;
 
-#define PET_BLOB_VER 2
+#define PET_BLOB_VER 3
 
 /* 1 for real life. 60 compresses the egg-to-adult arc into ~3.5 hours for a
  * bench soak: durations divide by it, decay rates multiply by it. Keep it 1
@@ -654,12 +668,22 @@ static void pet_fresh_egg(void) {
 
 static void pet_load(void) {
     pet_blob2_t b;
-    if (store_load("pet", &b, sizeof(b)) && b.ver == PET_BLOB_VER) {
+    memset(&b, 0, sizeof(b));
+    bool have = store_load("pet", &b, sizeof(b)) && b.ver == PET_BLOB_VER;
+    if (!have && store_load("pet", &b, PET_BLOB_V2_SIZE) && b.ver == 2) {
+        /* v3 is v2 plus appended fields: prefix-read the old file, zero the
+         * tail, stamp the version. This is what append-only buys. */
+        memset((uint8_t *)&b + PET_BLOB_V2_SIZE, 0,
+               sizeof(b) - PET_BLOB_V2_SIZE);
+        b.ver = PET_BLOB_VER;
+        have = true;
+    }
+    if (have) {
         s_pet = b;
         s_pet.name[sizeof(s_pet.name) - 1] = '\0';
-        ESP_LOGI(TAG, "pet restored: %s %s hunger=%d happy=%d mistakes=%d",
+        ESP_LOGI(TAG, "pet restored: %s %s hunger=%d happy=%d mistakes=%d odo=%lum",
                  s_pet.name, pet_stage_word(), s_pet.hunger, s_pet.happy,
-                 (int)s_pet.mistakes);
+                 (int)s_pet.mistakes, (unsigned long)s_pet.odo_m);
         return;
     }
     pet_blob_v1_t v1;
@@ -3023,12 +3047,28 @@ static uint32_t pet_col(int role) {
 static int s_pet_quake;             /* frames of world-shake left */
 static int s_pet_quake_amp;
 
-/* the planet is a big circle whose top cap forms the horizon */
+/* The ground is a circle whose top cap forms the horizon — and the RADIUS is
+ * what makes a world a world. The pocket planet curves hard; the seabed and
+ * the rooftop are so large they read as flat with sky to spare. Same math,
+ * four geographies, which is what "the worlds all look the same" was missing:
+ * under the mono themes palette differences vanish, so the ground SHAPE has
+ * to carry the difference. */
 #define PLANET_CX    240
-#define PLANET_CY    510
-#define PLANET_R     270
 #define WALK_MIN_X   120
 #define WALK_MAX_X   360
+
+typedef struct { int16_t horizon; int16_t r; } pet_geo_t;
+static const pet_geo_t s_world_geo[4] = {
+    /* tiny planet  */ { 240, 270 },     /* the classic high curvature */
+    /* ocean floor  */ { 300, 1500 },    /* long low seabed, water above */
+    /* forest glade */ { 276, 700 },     /* one rolling hill */
+    /* city rooftop */ { 312, 2400 },    /* a slab; the sky is the view */
+};
+static int pet_geo_r(void)  { return s_world_geo[s_pet.world & 3].r; }
+static int pet_geo_cy(void) {
+    const pet_geo_t *g = &s_world_geo[s_pet.world & 3];
+    return g->horizon + g->r;
+}
 
 #define CH_W         54
 #define CH_H         62
@@ -3076,7 +3116,7 @@ static lv_obj_t *s_pet_egg;
  * around the back), stars parallax at quarter speed, the moon at an eighth.
  * The walker eases to centre stage and just walks. Velocity ramps toward
  * the tilt instead of snapping — momentum is most of the fidget. */
-#define WOBJ_N     8
+#define WOBJ_N     12
 #define WOBJ_WRAP  640
 static lv_obj_t *s_wobj[WOBJ_N];
 static int16_t   s_wobj_x[WOBJ_N];     /* virtual track x of the centre */
@@ -3092,6 +3132,47 @@ static void wobj_add(lv_obj_t *o, int track_x, int dy) {
     s_wobj_dy[s_wobj_n] = (int16_t)dy;
     s_wobj_n++;
 }
+
+/* ---- the encounter reel: what the road serves up ----
+ * Variable-ratio payouts on the infinite walk: crystals to walk through,
+ * a stranger now and then, a golden flyby that drops a little treasure,
+ * and every full lap a small ceremony. The road must keep paying, or the
+ * walk is a treadmill. */
+#define PET_LAP_M 500
+static lv_obj_t *s_gem[2];
+static int16_t   s_gem_x[2];
+static bool      s_gem_on[2];
+static uint32_t  s_gem_next_m;
+static lv_obj_t *s_walker;             /* the stranger */
+static int16_t   s_walker_x;
+static int8_t    s_walker_dir;
+static bool      s_walker_on, s_walker_waved;
+static uint32_t  s_walker_next_m;
+static int       s_travel_acc;         /* px toward the next metre */
+static bool      s_ufo_gold, s_ufo_dropped;
+static bool      s_was_traveling;
+static char      s_trav_hud[40];
+static lv_obj_t *s_pet_planet;         /* the ground, for tinting and liftoff */
+static lv_obj_t *s_sign, *s_sign_label;   /* the distance signpost */
+static int16_t   s_sign_x;
+static bool      s_sign_on;
+
+/* ---- jetpack: pitch the cube back and the sky opens ----
+ * Ground hides, stars stream downward, altitude climbs with the pitch;
+ * level out and you parachute home. The one number that persists is the
+ * altitude record — a reason to try again tomorrow. */
+static lv_obj_t *s_jet_flame;
+static int  s_fly_mode;                /* 0 ground, 1 climbing, 2 descending */
+static int  s_fly_alt, s_fly_peak;
+static int  s_fly_arm;                 /* consecutive frames of held pitch */
+static int  s_fly_pitch;               /* signed z-delta, written at 50 Hz */
+static int64_t s_shake_ms;             /* last shake, file-scope so the fly
+                                        * trigger can ignore shake spikes */
+static int16_t s_gem_y[2];             /* sky-gem drop height while flying */
+static bool    s_gem_sky[2];
+/* star home rows, shared by the build and the flight streamer */
+static const uint16_t s_star_by[STAR_N] = { 96, 52, 112, 40, 78, 34,
+                                            96, 130, 168, 150, 168, 74 };
 
 /* character parts */
 static lv_obj_t *s_ch_wrap, *s_ch_body, *s_ch_pack, *s_ch_visor;
@@ -3130,9 +3211,10 @@ static int rnd(int n) { return (int)(esp_random() % (uint32_t)n); }
 /* surface height under a given x */
 static int ground_y(int x) {
     int dx = x - PLANET_CX;
-    int r2 = PLANET_R * PLANET_R - dx * dx;
+    int r = pet_geo_r();
+    int r2 = r * r - dx * dx;
     if (r2 < 0) r2 = 0;
-    return PLANET_CY - (int)sqrtf((float)r2);
+    return pet_geo_cy() - (int)sqrtf((float)r2);
 }
 
 static const char *pet_mood_text(int *worst) {
@@ -3251,7 +3333,6 @@ static int pet_lean_signal(int rot_delta) {
 static void pet_motion_poll(void) {
     static int16_t px, py, pz;
     static bool primed;
-    static int64_t last_shake_ms;
     static int8_t logged_dir;
 
     if (pet_absent() || !s_screen_on || s_doze || !s_ch_wrap) {
@@ -3283,8 +3364,8 @@ static void pet_motion_poll(void) {
     } else if (shake_hot > 0) {
         if (--shake_hot == 0) shake_peak = 0;
     }
-    if (shake_hot >= 8 && shake_peak > 12000 && t - last_shake_ms > 1200) {
-        last_shake_ms = t;
+    if (shake_hot >= 8 && shake_peak > 12000 && t - s_shake_ms > 1200) {
+        s_shake_ms = t;
         lv_display_trigger_activity(NULL);
         set_act(ACT_JUMP, 34);
         /* the world gets it too: harder shake, bigger rattle */
@@ -3307,24 +3388,37 @@ static void pet_motion_poll(void) {
 
     /* A shake IS a violent transient lean; let it be a hop, not a sprint.
      * The window also swallows the rebound of the hand arresting the shake. */
-    if (t - last_shake_ms < 400) return;
+    if (t - s_shake_ms < 400) return;
 
     /* A cube PARKED on its side is not a command. When the accelerometer has
      * been rock-still for ~4 s, whatever pose it rests in becomes the new
      * level, so a cube leaned against a book stops pinning the pet to a wall
-     * — while a hand-held tilt (never still) steers relative to level. */
-    static int base_l, base_r;
+     * — while a hand-held tilt (never still) steers relative to level.
+     * Baselines seed from the first sample after the app opens: without
+     * that, a cube lying screen-up reads a permanent full-scale pitch and
+     * the jetpack fires itself on open. */
+    static int base_l, base_r, base_z;
+    static bool based;
     static int still_polls;
     int raw_l = pet_lean_signal(1), raw_r = pet_lean_signal(3);
+    if (!based) {
+        based = true;
+        base_l = raw_l;
+        base_r = raw_r;
+        base_z = s_acc_z;
+    }
     if (jerk < 900) {
         if (still_polls < 200) still_polls++;
         if (still_polls >= 200) {                /* adopt the resting pose */
             base_l += (raw_l - base_l) / 8;
             base_r += (raw_r - base_r) / 8;
+            base_z += (s_acc_z - base_z) / 8;
         }
     } else {
         still_polls = 0;
     }
+    /* the jetpack throttle: how far the screen has pitched from its level */
+    s_fly_pitch = s_acc_z - base_z;
 
     int left = raw_l - base_l, right = raw_r - base_r;
     int mag = left > right ? left : right;
@@ -3626,10 +3720,26 @@ static void pet_timer_cb(lv_timer_t *t) {
         s_ufo_x += 3;
         lv_obj_set_x(s_ufo, s_ufo_x);
         lv_obj_set_y(s_ufo, 96 + isin(s_ufo_life * 5, 12));
+        /* a golden one drops its treasure as it passes overhead */
+        if (s_ufo_gold && !s_ufo_dropped && s_ufo_x > 150) {
+            s_ufo_dropped = true;
+            for (int g = 0; g < 2; g++) {
+                if (s_gem_on[g]) continue;
+                s_gem_on[g] = true;
+                s_gem_x[g] = (int16_t)(s_cx + (g ? 120 : -90) + rnd(50));
+                lv_obj_remove_flag(s_gem[g], LV_OBJ_FLAG_HIDDEN);
+            }
+            say("!!");
+        }
         if (!s_ufo_life) lv_obj_add_flag(s_ufo, LV_OBJ_FLAG_HIDDEN);
     } else if (rnd(1400) == 0) {
         s_ufo_life = 190;
         s_ufo_x = -70;
+        /* one flyby in five turns up gold */
+        s_ufo_gold = rnd(5) == 0;
+        s_ufo_dropped = false;
+        lv_obj_set_style_bg_color(s_ufo,
+            lv_color_hex(s_ufo_gold ? 0xFFD54A : pet_col(PC_PROP)), 0);
         lv_obj_remove_flag(s_ufo, LV_OBJ_FLAG_HIDDEN);
     }
 
@@ -3677,7 +3787,110 @@ static void pet_timer_cb(lv_timer_t *t) {
      * speed, the moon at an eighth, which is what sells the distance. */
     if ((s_fcount & 1) && s_tilt_vel != s_tilt_vel_tgt)
         s_tilt_vel += (s_tilt_vel_tgt > s_tilt_vel) ? 1 : -1;
-    bool traveling = s_tilt_vel != 0;
+
+    /* ---- jetpack: a steep pitch, held, from a standstill ----
+     * The first cut armed at ~18 degrees after 150 ms and launched itself
+     * constantly during ordinary tilt-walking — a hand that rolls also
+     * pitches, sloppily. Liftoff now wants ~33 degrees of clean pitch held
+     * for 300 ms with NO steering in progress: deliberate, repeatable, and
+     * unreachable by accident from the walk. */
+    int pitch = abs(s_fly_pitch);
+    if (s_fly_mode == 0) {
+        bool qr_open = s_pet_qr_panel &&
+                       !lv_obj_has_flag(s_pet_qr_panel, LV_OBJ_FLAG_HIDDEN);
+        if (pitch > 9000 && !qr_open && s_tilt_vel_tgt == 0 &&
+            s_tilt_vel == 0 && now_ms() - s_shake_ms > 600)
+            s_fly_arm++;
+        else
+            s_fly_arm = 0;
+        if (s_fly_arm >= 12) {
+            s_fly_mode = 1;
+            s_fly_alt = s_fly_peak = 0;
+            s_tilt_vel = s_tilt_vel_tgt = 0;
+            lv_obj_add_flag(s_pet_planet, LV_OBJ_FLAG_HIDDEN);
+            for (int i = 0; i < s_wobj_n; i++)
+                lv_obj_add_flag(s_wobj[i], LV_OBJ_FLAG_HIDDEN);
+            if (s_sign_on) { s_sign_on = false; lv_obj_add_flag(s_sign, LV_OBJ_FLAG_HIDDEN); }
+            if (s_walker_on) { s_walker_on = false; lv_obj_add_flag(s_walker, LV_OBJ_FLAG_HIDDEN); }
+            for (int g = 0; g < 2; g++) {
+                if (!s_gem_on[g]) continue;
+                s_gem_on[g] = false;
+                lv_obj_add_flag(s_gem[g], LV_OBJ_FLAG_HIDDEN);
+            }
+            lv_obj_add_flag(s_food_item, LV_OBJ_FLAG_HIDDEN);
+            s_food_ready = false;
+            s_walking_to_food = false;
+            lv_obj_remove_flag(s_jet_flame, LV_OBJ_FLAG_HIDDEN);
+            set_act(ACT_IDLE, 40);
+            say("liftoff!");
+            log_event("pet flew");
+        }
+    } else {
+        lv_display_trigger_activity(NULL);
+        int climb = -6;                          /* descending default */
+        if (s_fly_mode == 1) {
+            climb = clampi((pitch - 3200) / 900, 0, 8);
+            if (pitch < 3200) s_fly_mode = 2;
+        }
+        s_fly_alt += climb;
+        if (s_fly_alt > s_fly_peak) s_fly_peak = s_fly_alt;
+        if (s_fly_mode == 2 && s_fly_alt <= 0) {
+            /* ---- touchdown ---- */
+            s_fly_alt = 0;
+            s_fly_mode = 0;
+            s_fly_arm = 0;
+            lv_obj_remove_flag(s_pet_planet, LV_OBJ_FLAG_HIDDEN);
+            for (int i = 0; i < s_wobj_n; i++) {
+                lv_obj_remove_flag(s_wobj[i], LV_OBJ_FLAG_HIDDEN);
+                lv_obj_set_pos(s_wobj[i],
+                               s_wobj_x[i] - lv_obj_get_width(s_wobj[i]) / 2,
+                               ground_y(s_wobj_x[i]) + s_wobj_dy[i]);
+            }
+            for (int g = 0; g < 2; g++) {
+                if (!s_gem_sky[g]) continue;
+                s_gem_sky[g] = false;
+                s_gem_on[g] = false;
+                lv_obj_add_flag(s_gem[g], LV_OBJ_FLAG_HIDDEN);
+            }
+            lv_obj_add_flag(s_jet_flame, LV_OBJ_FLAG_HIDDEN);
+            int m = s_fly_peak / 8;
+            if (m > (int)s_pet.best_alt) {
+                s_pet.best_alt = (uint16_t)m;
+                s_pet.stardust += 10;
+                say("new record!");
+            } else {
+                say("touchdown");
+            }
+            s_pet_dirty = true;
+            s_pet_quake = 10;
+            s_pet_quake_amp = 4;
+        } else if (s_fly_mode) {
+            /* the sky goes by: star field derived from altitude, so climb
+             * and descent replay the same sky in reverse */
+            if ((s_fcount & 1) == 0) {
+                for (int i = 0; i < STAR_N; i++) {
+                    int y = (s_star_by[i] + s_fly_alt * 2 + i * 17) % 500 - 10;
+                    lv_obj_set_y(s_star[i], y);
+                }
+                lv_obj_set_y(s_moon, (58 + s_fly_alt / 2) % 600 - 60);
+            }
+            s_cx = clampi(s_cx + s_tilt_vel_tgt / 2, 100, 380);
+            if (s_fcount & 1) lv_obj_set_height(s_jet_flame, 10 + rnd(10));
+            if (s_fly_mode == 1 && climb > 0 && (s_fly_alt % 96) < climb) {
+                for (int g = 0; g < 2; g++) {
+                    if (s_gem_on[g]) continue;
+                    s_gem_on[g] = true;
+                    s_gem_sky[g] = true;
+                    s_gem_x[g] = (int16_t)(90 + rnd(300));
+                    s_gem_y[g] = -20;
+                    lv_obj_remove_flag(s_gem[g], LV_OBJ_FLAG_HIDDEN);
+                    break;
+                }
+            }
+        }
+    }
+
+    bool traveling = s_tilt_vel != 0 && s_fly_mode == 0;
     if (traveling) {
         s_face = s_tilt_vel > 0 ? 1 : -1;
         if (s_cx < 238)      s_cx += 2;
@@ -3724,6 +3937,158 @@ static void pet_timer_cb(lv_timer_t *t) {
                 set_act(ACT_EAT, 90);
             }
         }
+
+        /* ---- the road pays out ---- */
+        s_travel_acc += abs(dx);
+        while (s_travel_acc >= 10) {
+            s_travel_acc -= 10;
+            s_pet.odo_m++;
+            if (s_pet.odo_m % PET_LAP_M == 0) {
+                s_pet.laps++;
+                s_pet.stardust += 25;
+                s_pet_quake = 18;                 /* celebratory rattle */
+                s_pet_quake_amp = 7;
+                say("LAP!");
+                s_pet_dirty = true;
+                log_event("pet lap");
+            }
+            /* every 250 m the land subtly changes its mind — biome drift.
+             * Color only, boundary only: retinting the ground is one big
+             * invalidation, affordable at walking pace, never per frame.
+             * Mono themes skip it; two tones are their whole contract. */
+            if (s_pet.odo_m % 250 == 0 && s_pet_planet &&
+                !s_pet_theme_pal[s_pet.theme & 3].mono) {
+                lv_color_t g = lv_color_hex(pet_col(PC_GROUND));
+                switch ((s_pet.odo_m / 250) & 3) {
+                case 1:  g = lv_color_darken(g, 40); break;
+                case 2:  g = lv_color_lighten(g, 28); break;
+                case 3:  g = lv_color_darken(g, 78); break;
+                default: break;
+                }
+                lv_obj_set_style_bg_color(s_pet_planet, g, 0);
+            }
+            /* a signpost stands 12 m short of every quarter-lap mark */
+            if (!s_sign_on && (s_pet.odo_m + 12) % 125 == 0) {
+                s_sign_on = true;
+                s_sign_x = (int16_t)(s_cx + s_face * (330 + rnd(90)));
+                lv_label_set_text_fmt(s_sign_label, "%lu",
+                                      (unsigned long)(s_pet.odo_m + 12));
+                lv_obj_remove_flag(s_sign, LV_OBJ_FLAG_HIDDEN);
+            }
+        }
+        if (s_sign_on) {
+            int x = s_sign_x + dx;
+            if (x < -80 || x >= 560) {
+                s_sign_on = false;
+                lv_obj_add_flag(s_sign, LV_OBJ_FLAG_HIDDEN);
+            } else {
+                s_sign_x = (int16_t)x;
+                lv_obj_set_pos(s_sign, x - 24, ground_y(x) - 54);
+            }
+        }
+        if (s_pet.odo_m >= s_gem_next_m) {
+            for (int g = 0; g < 2; g++) {
+                if (s_gem_on[g]) continue;
+                s_gem_on[g] = true;
+                s_gem_x[g] = (int16_t)(s_cx + s_face * (300 + rnd(160)));
+                lv_obj_remove_flag(s_gem[g], LV_OBJ_FLAG_HIDDEN);
+                break;
+            }
+            s_gem_next_m = s_pet.odo_m + 15 + rnd(35);
+        }
+        for (int g = 0; g < 2; g++) {
+            if (!s_gem_on[g]) continue;
+            int x = s_gem_x[g] + dx;
+            if (x < -80 || x >= 560) {            /* left behind */
+                s_gem_on[g] = false;
+                lv_obj_add_flag(s_gem[g], LV_OBJ_FLAG_HIDDEN);
+                continue;
+            }
+            s_gem_x[g] = (int16_t)x;
+        }
+        if (!s_walker_on && s_pet.odo_m >= s_walker_next_m) {
+            s_walker_on = true;
+            s_walker_waved = false;
+            s_walker_dir = (int8_t)-s_face;       /* coming the other way */
+            s_walker_x = (int16_t)(s_cx + s_face * (340 + rnd(120)));
+            lv_obj_remove_flag(s_walker, LV_OBJ_FLAG_HIDDEN);
+        }
+        if (s_walker_on) s_walker_x = (int16_t)(s_walker_x + dx);
+    }
+
+    if (s_was_traveling && !traveling) s_pet_dirty = true;   /* bank the odometer */
+    s_was_traveling = traveling;
+
+    /* The stranger walks on its own feet whether or not the world scrolls,
+     * waves once as you cross, and leaves the way it came. */
+    if (s_walker_on) {
+        s_walker_x = (int16_t)(s_walker_x + s_walker_dir * 2);
+        if (s_walker_x < -60 || s_walker_x > 540) {
+            s_walker_on = false;
+            lv_obj_add_flag(s_walker, LV_OBJ_FLAG_HIDDEN);
+            s_walker_next_m = s_pet.odo_m + 60 + rnd(120);
+        } else {
+            lv_obj_set_pos(s_walker, s_walker_x - 10,
+                           ground_y(s_walker_x) - 17 + isin(s_fcount * 20, 2));
+            if (!s_walker_waved && abs(s_walker_x - s_cx) < 52) {
+                s_walker_waved = true;
+                s_pet.happy = clampi(s_pet.happy + 2, 0, 100);
+                say("* waves *");
+                if (s_act == ACT_IDLE) set_act(ACT_WAVE, 60);
+            }
+        }
+    }
+
+    /* Crystals shine and get collected whether moving, standing or flying. */
+    for (int g = 0; g < 2; g++) {
+        if (!s_gem_on[g]) continue;
+        lv_obj_set_style_opa(s_gem[g],
+            (lv_opa_t)(200 + isin((s_fcount * 9 + g * 120) % 360, 55)), 0);
+        if (s_gem_sky[g]) {
+            /* sky treasure sails past the climber */
+            s_gem_y[g] = (int16_t)(s_gem_y[g] + (s_fly_mode == 1 ? 6 : 2));
+            if (s_gem_y[g] > 500) {
+                s_gem_on[g] = false;
+                s_gem_sky[g] = false;
+                lv_obj_add_flag(s_gem[g], LV_OBJ_FLAG_HIDDEN);
+                continue;
+            }
+            lv_obj_set_pos(s_gem[g], s_gem_x[g] - 6, s_gem_y[g]);
+            int fly_y = clampi(360 - s_fly_alt, 170, 400);
+            if (abs(s_gem_x[g] - s_cx) < 34 && abs(s_gem_y[g] - fly_y) < 40) {
+                s_gem_on[g] = false;
+                s_gem_sky[g] = false;
+                lv_obj_add_flag(s_gem[g], LV_OBJ_FLAG_HIDDEN);
+                s_pet.stardust += 5;
+                s_pet.happy = clampi(s_pet.happy + 1, 0, 100);
+                s_pet_dirty = true;
+                say("+5*");
+            }
+            continue;
+        }
+        lv_obj_set_pos(s_gem[g], s_gem_x[g] - 6, ground_y(s_gem_x[g]) - 15);
+        if (abs(s_gem_x[g] - s_cx) < 26) {
+            s_gem_on[g] = false;
+            lv_obj_add_flag(s_gem[g], LV_OBJ_FLAG_HIDDEN);
+            s_pet.stardust += 5;
+            s_pet.happy = clampi(s_pet.happy + 1, 0, 100);
+            s_pet_dirty = true;
+            say("+5*");
+        }
+    }
+
+    /* the odometer takes over the mood line while the road is rolling;
+     * the altimeter takes over from the odometer in the sky */
+    if (traveling) {
+        snprintf(s_trav_hud, sizeof(s_trav_hud), "%lum  lap %u",
+                 (unsigned long)(s_pet.odo_m - s_pet.odo_m % 5),
+                 (unsigned)s_pet.laps);
+        mood = s_trav_hud;
+    }
+    if (s_fly_mode) {
+        snprintf(s_trav_hud, sizeof(s_trav_hud), "ALT %dm  best %um",
+                 s_fly_alt / 8, (unsigned)s_pet.best_alt);
+        mood = s_trav_hud;
     }
 
     /* falling snack */
@@ -3740,7 +4105,14 @@ static void pet_timer_cb(lv_timer_t *t) {
     int bob = 0, lean = 0, leg_l = 0, leg_r = 0, arm = 0;
     int eye_h = 12, squash = 0;
 
-    if (traveling && s_act == ACT_IDLE) {
+    if (s_fly_mode) {
+        /* airborne: limbs trail, eyes wide, everything floats */
+        bob   = isin(s_fcount * 6, 4);
+        arm   = 12;
+        leg_l = isin(s_fcount * 10, 3);
+        leg_r = -leg_l;
+        eye_h = 14;
+    } else if (traveling && s_act == ACT_IDLE) {
         /* the travelling gait: same limbs as ACT_WALK, cadence scaled to
          * how hard the world is being tilted */
         int step = (s_fcount * (14 + abs(s_tilt_vel) * 4)) % 360;
@@ -3857,10 +4229,12 @@ static void pet_timer_cb(lv_timer_t *t) {
         }
     }
 
-    /* ---- place the character on the surface ---- */
+    /* ---- place the character on the surface (or above it) ---- */
     int gy = ground_y(s_cx);
+    int base_y = gy - CH_H;
+    if (s_fly_mode) base_y = clampi(360 - s_fly_alt, 170, gy - CH_H);
     lv_obj_set_x(s_ch_wrap, s_cx - CH_W / 2 + lean + qx);
-    lv_obj_set_y(s_ch_wrap, gy - CH_H + bob + qy);
+    lv_obj_set_y(s_ch_wrap, base_y + bob + qy);
 
     static int p_eye = -1, p_ll = 999, p_arm = 999, p_sq = 999, p_face = 0;
     if (eye_h != p_eye) {
@@ -4155,8 +4529,24 @@ static void build_pet_app(lv_obj_t *scr) {
     lv_obj_align(ufo_dome, LV_ALIGN_TOP_MID, 0, -6);
 
     /* --- the ground: a big circle, only its cap is on screen --- */
-    lv_obj_t *planet = rect(s_scr_pet, PLANET_R * 2, PLANET_R * 2, PLANET_R, pet_col(PC_GROUND));
-    lv_obj_set_pos(planet, PLANET_CX - PLANET_R, PLANET_CY - PLANET_R);
+    /* The pocket planet is a true circle; the big-radius worlds draw as a
+     * flat slab. This is a renderer constraint, not a style choice: a
+     * radius-2400 rounded rect sends LVGL's software corner mask
+     * (circ_calc_aa4) into a Cache-error panic on every full redraw — the
+     * crash loop of 2026-08-24. The walking surface still follows ground_y's
+     * gentle curve; the few px of sag against the slab's straight horizon
+     * are invisible at these radii. */
+    int gr = pet_geo_r();
+    lv_obj_t *planet;
+    if (gr <= 300) {
+        planet = rect(s_scr_pet, gr * 2, gr * 2, gr, pet_col(PC_GROUND));
+        lv_obj_set_pos(planet, PLANET_CX - gr, pet_geo_cy() - gr);
+    } else {
+        int horizon = pet_geo_cy() - gr;
+        planet = rect(s_scr_pet, 520, 480 - horizon + 40, 0, pet_col(PC_GROUND));
+        lv_obj_set_pos(planet, -20, horizon);
+    }
+    s_pet_planet = planet;
     lv_obj_set_style_border_width(planet, 4, 0);
     lv_obj_set_style_border_color(planet, lv_color_hex(pet_col(PC_GROUND_HI)), 0);
     lv_obj_set_style_border_opa(planet, 190, 0);
@@ -4175,37 +4565,106 @@ static void build_pet_app(lv_obj_t *scr) {
     lv_obj_t *c3 = rect(s_scr_pet, 22, 10, 5, pet_col(PC_SPOT));
     wobj_add(c3, 235, 66);
 
-    /* --- per-world set dressing, also on the track --- */
+    /* --- per-world set dressing, also on the track. Enough of it that a
+     * lap keeps changing scenery even in a mono theme, where structure is
+     * the only signature a world has. --- */
     switch (s_pet.world & 3) {
-    case 1: {                                        /* kelp on the seabed */
+    case 1: {                                        /* the seabed */
         lv_obj_t *k1 = rect(s_scr_pet, 6, 44, 3, pet_col(PC_SPOT));
         wobj_add(k1, 99, -40);
         lv_obj_t *k2 = rect(s_scr_pet, 5, 30, 2, pet_col(PC_GROUND_HI));
         wobj_add(k2, 390, -26);
+        lv_obj_t *k3 = rect(s_scr_pet, 6, 36, 3, pet_col(PC_GROUND_HI));
+        wobj_add(k3, 505, -32);
+        lv_obj_t *rock = rect(s_scr_pet, 30, 16, 8, pet_col(PC_SPOT));
+        wobj_add(rock, -40, -12);
         break;
     }
-    case 2: {                                        /* one good tree */
+    case 2: {                                        /* the glade */
         lv_obj_t *trunk = rect(s_scr_pet, 10, 46, 3, 0x5D4037);
         wobj_add(trunk, 377, -42);
         lv_obj_t *crown = rect(s_scr_pet, 62, 52, 26, pet_col(PC_GROUND_HI));
         wobj_add(crown, 377, -88);
+        lv_obj_t *bush = rect(s_scr_pet, 34, 20, 10, pet_col(PC_GROUND_HI));
+        wobj_add(bush, 96, -16);
+        lv_obj_t *trunk2 = rect(s_scr_pet, 8, 30, 3, 0x5D4037);
+        wobj_add(trunk2, 520, -26);
+        lv_obj_t *crown2 = rect(s_scr_pet, 40, 34, 17, pet_col(PC_SPOT));
+        wobj_add(crown2, 520, -56);
         break;
     }
-    case 3: {                                        /* rooftop water towers */
+    case 3: {                                        /* the rooftop */
         lv_obj_t *b1 = rect(s_scr_pet, 44, 90, 3, pet_col(PC_SKY2));
         wobj_add(b1, 82, -84);
         lv_obj_t *b2 = rect(s_scr_pet, 34, 62, 3, pet_col(PC_SKY2));
         wobj_add(b2, 400, -58);
+        lv_obj_t *mast = rect(s_scr_pet, 4, 54, 2, pet_col(PC_PROP));
+        wobj_add(mast, 500, -50);
+        lv_obj_t *duct = rect(s_scr_pet, 40, 18, 4, pet_col(PC_SPOT));
+        wobj_add(duct, -30, -14);
         break;
     }
-    default:
+    default: {                                       /* the pocket planet */
+        lv_obj_t *flag_pole = rect(s_scr_pet, 3, 26, 1, pet_col(PC_PROP));
+        wobj_add(flag_pole, 520, -24);
+        lv_obj_t *flag = rect(s_scr_pet, 14, 9, 2, pet_col(PC_ACCENT));
+        wobj_add(flag, 528, -24);
+        lv_obj_t *c4 = rect(s_scr_pet, 40, 16, 8, pet_col(PC_SPOT));
+        wobj_add(c4, -50, 22);
         break;
+    }
     }
     /* park every track object where it belongs before the first scroll */
     for (int i = 0; i < s_wobj_n; i++) {
         lv_obj_set_pos(s_wobj[i], s_wobj_x[i] - lv_obj_get_width(s_wobj[i]) / 2,
                        ground_y(s_wobj_x[i]) + s_wobj_dy[i]);
     }
+
+    /* --- the encounter reel's cast, hidden until the road deals them --- */
+    for (int g = 0; g < 2; g++) {
+        s_gem[g] = rect(s_scr_pet, 12, 12, 4, pet_col(PC_STAR));
+        lv_obj_set_style_border_width(s_gem[g], 2, 0);
+        lv_obj_set_style_border_color(s_gem[g], lv_color_hex(pet_col(PC_ACCENT)), 0);
+        lv_obj_add_flag(s_gem[g], LV_OBJ_FLAG_HIDDEN);
+        s_gem_on[g] = false;
+    }
+    s_walker = lv_obj_create(s_scr_pet);
+    lv_obj_remove_style_all(s_walker);
+    lv_obj_set_size(s_walker, 20, 18);
+    lv_obj_remove_flag(s_walker, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_remove_flag(s_walker, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_t *wb = rect(s_walker, 20, 14, 6, pet_col(PC_PROP));
+    lv_obj_align(wb, LV_ALIGN_BOTTOM_MID, 0, 0);
+    lv_obj_t *we1 = rect(s_walker, 3, 5, 1, pet_col(PC_SKY));
+    lv_obj_align(we1, LV_ALIGN_BOTTOM_MID, -4, -6);
+    lv_obj_t *we2 = rect(s_walker, 3, 5, 1, pet_col(PC_SKY));
+    lv_obj_align(we2, LV_ALIGN_BOTTOM_MID, 4, -6);
+    lv_obj_add_flag(s_walker, LV_OBJ_FLAG_HIDDEN);
+    s_walker_on = false;
+    s_travel_acc = 0;
+    s_was_traveling = false;
+    s_ufo_gold = s_ufo_dropped = false;
+    s_gem_sky[0] = s_gem_sky[1] = false;
+
+    /* the distance signpost, planted ahead of each lap-quarter */
+    s_sign = lv_obj_create(s_scr_pet);
+    lv_obj_remove_style_all(s_sign);
+    lv_obj_set_size(s_sign, 48, 56);
+    lv_obj_remove_flag(s_sign, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_remove_flag(s_sign, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_t *pole = rect(s_sign, 4, 30, 1, pet_col(PC_PROP));
+    lv_obj_align(pole, LV_ALIGN_BOTTOM_MID, 0, 0);
+    lv_obj_t *board = rect(s_sign, 48, 26, 5, pet_col(PC_STAR));
+    lv_obj_align(board, LV_ALIGN_TOP_MID, 0, 0);
+    s_sign_label = lv_label_create(s_sign);
+    lv_obj_set_style_text_color(s_sign_label, lv_color_hex(pet_col(PC_SKY)), 0);
+    lv_label_set_text(s_sign_label, "");
+    lv_obj_align(s_sign_label, LV_ALIGN_TOP_MID, 0, 4);
+    lv_obj_add_flag(s_sign, LV_OBJ_FLAG_HIDDEN);
+    s_sign_on = false;
+    /* first payouts land soon after the first stroll begins */
+    s_gem_next_m = s_pet.odo_m + 10 + rnd(20);
+    s_walker_next_m = s_pet.odo_m + 40 + rnd(60);
 
     /* rocket on the pad, hidden until it flies */
     s_rocket = rect(s_scr_pet, 18, 34, 8, pet_col(PC_ACCENT));
@@ -4228,6 +4687,13 @@ static void build_pet_app(lv_obj_t *scr) {
     if (s_pet.species == 1) pet_build_cat();
     else                    pet_build_astro();
     pet_build_hat();
+
+    /* the jetpack flame, tucked under the character until liftoff */
+    s_jet_flame = rect(s_ch_wrap, 10, 16, 4, pet_col(PC_STAR));
+    lv_obj_align(s_jet_flame, LV_ALIGN_BOTTOM_MID, 0, 16);
+    lv_obj_add_flag(s_jet_flame, LV_OBJ_FLAG_HIDDEN);
+    s_fly_mode = 0;
+    s_fly_alt = s_fly_peak = s_fly_arm = 0;
 
     s_bubble = lv_label_create(s_scr_pet);
     lv_obj_set_style_text_color(s_bubble, lv_color_hex(pet_col(PC_STAR)), 0);
@@ -11051,6 +11517,11 @@ static void app_open(int idx) {
     s_status_label = NULL; s_batt_bar = NULL; s_batt_label = NULL;
     s_bolt_label = NULL; s_fps_label = NULL; s_events_label = NULL;
     s_ch_wrap = NULL; s_pet_egg = NULL;
+    s_gem[0] = s_gem[1] = NULL; s_walker = NULL;
+    s_gem_on[0] = s_gem_on[1] = false; s_walker_on = false;
+    s_gem_sky[0] = s_gem_sky[1] = false;
+    s_pet_planet = NULL; s_sign = NULL; s_sign_label = NULL;
+    s_jet_flame = NULL; s_sign_on = false; s_fly_mode = 0;
     s_pet_qr_panel = NULL; s_pet_qr = NULL; s_pet_qr_note = NULL;
     s_pet_qr_btn = NULL; s_pet_qr_btn_l = NULL; s_pet_qr_tick = NULL;
     s_pet_qr_state = PET_QR_SHOWING;
@@ -12211,9 +12682,12 @@ void app_main(void) {
         pet_engine_service();          /* self-paced to ~1 Hz internally */
         if (s_req_pet_rebuild) {
             s_req_pet_rebuild = false;
-            /* An evolution or departure changes what the scene IS; rebuilding
-             * through the normal request path reuses all the teardown rules. */
-            if (s_app == APP_PET) app_request(APP_PET);
+            /* Straight to app_open, NOT app_request: the request consumer
+             * filters same-app requests (want != s_app), which silently ate
+             * every mid-app rebuild — a design applied while the user stood
+             * in the pet app changed the data and never the screen. app_open
+             * handles a same-app rebuild through all the teardown rules. */
+            if (s_app == APP_PET) app_open(APP_PET);
         }
         /* NVS commits erase flash, which stalls a BLE controller running
          * from flash. The dirty flag stays set, so the write lands on the

@@ -1275,6 +1275,19 @@ parked fork's intent, if anyone retries with the chip's datasheet in hand:
     its effect survived to the panel. Same family as pitfall #23 (one writer
     per output), applied to animations.
 
+34. **A rounded rect with a huge radius is a crash, not a slow draw.** Ground
+    circles of radius 1500-2400 px (flat-world horizons) sent LVGL's software
+    corner mask (`lv_draw_sw_mask_radius_init` → `circ_calc_aa4`) into a
+    repeating "Guru Meditation (Cache error)" panic on full redraws, while the
+    long-serving 270 px planet circle was always fine. The panic does not point
+    anywhere near the cause — it looks like a memory-system fault. Two
+    lessons: keep `lv_obj` corner radii in the low hundreds and draw a "flat"
+    horizon as a radius-0 slab (the walking-surface math can stay curved —
+    nobody can see a 5 px sag); and `xtensa-esp32s3-elf-addr2line -pfiaC -e
+    build/facet.elf <backtrace addrs>` turns a raw Guru backtrace into named
+    frames in seconds — the fastest diagnosis in this file, provided the ELF
+    still matches the flashed image.
+
 ## 11. Debugging method that worked
 
 - Log a one-line periodic status with everything at once: uptime, wall clock,
