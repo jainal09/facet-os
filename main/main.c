@@ -3170,8 +3170,12 @@ static bool      s_sign_on;
 static lv_obj_t *s_jet_flame;
 static int  s_fly_mode;                /* 0 ground, 1 climbing, 2 descending */
 static int  s_fly_alt, s_fly_peak;
-static int  s_fly_arm;                 /* consecutive frames of held pitch */
 static int  s_fly_pitch;               /* signed z-delta, written at 50 Hz */
+static int  s_lean_mag;                /* current L/R lean, for the level gate */
+/* Lift-burst events from the 50 Hz vertical-velocity sense: +1 the cube was
+ * raised sharply, -1 lowered sharply. Written by the motion poll, consumed
+ * by the view's flight machine. */
+static volatile int8_t s_fly_burst;
 static int64_t s_shake_ms;             /* last shake, file-scope so the fly
                                         * trigger can ignore shake spikes */
 static int16_t s_gem_y[2];             /* sky-gem drop height while flying */
@@ -3404,14 +3408,26 @@ static void pet_motion_poll(void) {
      * that, a cube lying screen-up reads a permanent full-scale pitch and
      * the jetpack fires itself on open. */
     static int base_l, base_r, base_z;
+    static int gx_lp, gy_lp, gz_lp;    /* slow gravity estimate, LSB */
     static bool based;
     static int still_polls;
     int raw_l = pet_lean_signal(1), raw_r = pet_lean_signal(3);
     if (!based) {
         based = true;
-        base_l = raw_l;
-        base_r = raw_r;
+        /* Only Z seeds from the live pose: flat-on-desk and upright grips
+         * legitimately differ there and absolute zero means nothing. The
+         * L/R baselines MUST stay absolute — seeding them from the opening
+         * pose once declared a tilted pickup "level" and gave the pet a
+         * permanent phantom lean (L=5483 on a level grip, straight from the
+         * log) that also sat on the jetpack's level-gate and refused every
+         * launch. Level is level; only the parked-still adaptation below
+         * may redefine it. */
+        base_l = 0;
+        base_r = 0;
         base_z = s_acc_z;
+        gx_lp = s_acc_x;
+        gy_lp = s_acc_y;
+        gz_lp = s_acc_z;
     }
     if (jerk < 900) {
         if (still_polls < 200) still_polls++;
@@ -3423,11 +3439,54 @@ static void pet_motion_poll(void) {
     } else {
         still_polls = 0;
     }
-    /* the jetpack throttle: how far the screen has pitched from its level */
+    /* how far the screen has pitched from its level — the flight trigger
+     * only uses this as a "roughly level grip" gate now */
     s_fly_pitch = s_acc_z - base_z;
+
+    /* ---- vertical-motion sense: the jetpack's real trigger ----
+     * True altitude cannot survive double integration (accelerometer noise
+     * drifts metres in seconds, and this board has no barometer), but a
+     * LIFT is unmistakable: project acceleration onto the low-passed
+     * gravity direction, subtract gravity, and leaky-integrate. A sharp
+     * raise of the whole cube swings the integral hard positive; lowering
+     * the hand swings it negative; a shake alternates and cancels. The
+     * integral leaks to zero in ~0.3 s, so it cannot drift. */
+    gx_lp += (s_acc_x - gx_lp) / 16;
+    gy_lp += (s_acc_y - gy_lp) / 16;
+    gz_lp += (s_acc_z - gz_lp) / 16;
+    static int s_vv;
+    float gxl = gx_lp, gyl = gy_lp, gzl = gz_lp;
+    float gmag = sqrtf(gxl * gxl + gyl * gyl + gzl * gzl);
+    if (gmag > 2000.f) {
+        float av = ((float)s_acc_x * gxl + (float)s_acc_y * gyl +
+                    (float)s_acc_z * gzl) / gmag - gmag;
+        s_vv += (int)av;
+        s_vv -= s_vv / 16;
+        if (s_fly_mode == 0) {
+            /* liftoff wants a sharp raise from a roughly level grip —
+             * generous tolerance, hands are not spirit levels. Near-misses
+             * log too (throttled), so tuning works from the owner's own
+             * lifts instead of another guess. */
+            static int64_t last_miss_log;
+            if (s_vv > 14000 && s_lean_mag < 6500 &&
+                abs(s_fly_pitch) < 8000 && t - s_shake_ms > 600) {
+                s_fly_burst = 1;
+                ESP_LOGI(TAG, "pet imu: lift v=%d", s_vv);
+                s_vv = 0;
+            } else if (s_vv > 9000 && t - last_miss_log > 1500) {
+                last_miss_log = t;
+                ESP_LOGI(TAG, "pet imu: lift near-miss v=%d lean=%d pitch=%d",
+                         s_vv, s_lean_mag, abs(s_fly_pitch));
+            }
+        } else {
+            if (s_vv > 12000)       { s_fly_burst = 1;  s_vv = 0; }
+            else if (s_vv < -12000) { s_fly_burst = -1; s_vv = 0; }
+        }
+    }
 
     int left = raw_l - base_l, right = raw_r - base_r;
     int mag = left > right ? left : right;
+    s_lean_mag = mag > 0 ? mag : 0;
     int dir = 0;
     if (left > PET_LEAN_TH && left >= right)  dir = -1;
     else if (right > PET_LEAN_TH)             dir = 1;
@@ -3794,22 +3853,21 @@ static void pet_timer_cb(lv_timer_t *t) {
     if ((s_fcount & 1) && s_tilt_vel != s_tilt_vel_tgt)
         s_tilt_vel += (s_tilt_vel_tgt > s_tilt_vel) ? 1 : -1;
 
-    /* ---- jetpack: a steep pitch, held, from a standstill ----
-     * The first cut armed at ~18 degrees after 150 ms and launched itself
-     * constantly during ordinary tilt-walking — a hand that rolls also
-     * pitches, sloppily. Liftoff now wants ~33 degrees of clean pitch held
-     * for 300 ms with NO steering in progress: deliberate, repeatable, and
-     * unreachable by accident from the walk. */
-    int pitch = abs(s_fly_pitch);
+    /* ---- jetpack: lift the cube, and the pet lifts with it ----
+     * The trigger went through four shapes before landing on the owner's
+     * own spec: not a pitch angle at all, but a sharp physical RAISE of the
+     * whole cube (the vertical-velocity burst from the motion poll), from a
+     * roughly level grip. In flight the same sense keeps flying it: raise
+     * again to climb, lower the hand to descend. Pitch-angle triggers all
+     * failed the hand they were built for — too eager at 18 degrees,
+     * unreachable at 33 from a reclined grip, and a zero-lean gate reset on
+     * the roll every real wrist leaks. */
     if (s_fly_mode == 0) {
         bool qr_open = s_pet_qr_panel &&
                        !lv_obj_has_flag(s_pet_qr_panel, LV_OBJ_FLAG_HIDDEN);
-        if (pitch > 9000 && !qr_open && s_tilt_vel_tgt == 0 &&
-            s_tilt_vel == 0 && now_ms() - s_shake_ms > 600)
-            s_fly_arm++;
-        else
-            s_fly_arm = 0;
-        if (s_fly_arm >= 12) {
+        int8_t burst = s_fly_burst;
+        s_fly_burst = 0;
+        if (burst == 1 && !qr_open) {
             s_fly_mode = 1;
             s_fly_alt = s_fly_peak = 0;
             s_tilt_vel = s_tilt_vel_tgt = 0;
@@ -3833,18 +3891,19 @@ static void pet_timer_cb(lv_timer_t *t) {
         }
     } else {
         lv_display_trigger_activity(NULL);
-        int climb = -6;                          /* descending default */
-        if (s_fly_mode == 1) {
-            climb = clampi((pitch - 3200) / 900, 0, 8);
-            if (pitch < 3200) s_fly_mode = 2;
-        }
+        /* burst-driven: another raise climbs, a lowered hand descends,
+         * silence keeps doing whatever the last gesture said */
+        int8_t burst = s_fly_burst;
+        s_fly_burst = 0;
+        if (burst == 1)       s_fly_mode = 1;
+        else if (burst == -1) s_fly_mode = 2;
+        int climb = (s_fly_mode == 1) ? 6 : -6;
         s_fly_alt += climb;
         if (s_fly_alt > s_fly_peak) s_fly_peak = s_fly_alt;
         if (s_fly_mode == 2 && s_fly_alt <= 0) {
             /* ---- touchdown ---- */
             s_fly_alt = 0;
             s_fly_mode = 0;
-            s_fly_arm = 0;
             lv_obj_remove_flag(s_pet_planet, LV_OBJ_FLAG_HIDDEN);
             for (int i = 0; i < s_wobj_n; i++) {
                 lv_obj_remove_flag(s_wobj[i], LV_OBJ_FLAG_HIDDEN);
@@ -4699,7 +4758,8 @@ static void build_pet_app(lv_obj_t *scr) {
     lv_obj_align(s_jet_flame, LV_ALIGN_BOTTOM_MID, 0, 16);
     lv_obj_add_flag(s_jet_flame, LV_OBJ_FLAG_HIDDEN);
     s_fly_mode = 0;
-    s_fly_alt = s_fly_peak = s_fly_arm = 0;
+    s_fly_alt = s_fly_peak = 0;
+    s_fly_burst = 0;
 
     s_bubble = lv_label_create(s_scr_pet);
     lv_obj_set_style_text_color(s_bubble, lv_color_hex(pet_col(PC_STAR)), 0);
