@@ -1,0 +1,28 @@
+main/main.c
+  s_bd4d271118eabc::t_945230461226ca 3894-3900
+  s_bd4d271118eabc::t_a10e0df66019b2 3489
+  s_bd4d271118eabc::t_e51797b2c3d1d7 3856-3864,3868-3870
+  s_bd4d271118eabc::t_324f4700b3530e 3417-3426
+  s_bd4d271118eabc::t_c73d1b4f03c4a4 3467-3472,3476-3479,3482-3483
+  s_bd4d271118eabc::t_5df6181e556899 3174-3178
+  s_bd4d271118eabc::t_f86c08541a17ee 3442-3443,3446-3466,3473-3475,3480-3481,3484-3485
+  s_bd4d271118eabc::t_512a018fcf9a6a 4761-4762
+  s_bd4d271118eabc::t_988f599f2fc4e5 3411,3428-3430
+  s_bd4d271118eabc::t_ac892a9a6bd430 3486
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.24",
+  "base_commit_sha": "72e0fe1a3e62f29eaa6571c27d1f6393a74a0d44",
+  "prompts": {},
+  "sessions": {
+    "s_bd4d271118eabc": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "d96b6df7-9f4d-4c00-8b11-0494e1b58cb8",
+        "model": "claude-fable-5"
+      },
+      "human_author": "Jainal Gosaliya <jainal09gosalia@gmail.com>"
+    }
+  }
+}
