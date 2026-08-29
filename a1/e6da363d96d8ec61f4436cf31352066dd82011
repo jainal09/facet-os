@@ -1,0 +1,30 @@
+docs/ARCHITECTURE.md
+  s_bd6bad21887258::t_ce4e6f5ea2ec33 1283-1299
+main/main.c
+  s_b4ceb853ba0cb4::t_f736b4be7d49d9 6731-6734,6744-6745,6796-6801,6811-6812,6838-6844,6852-6853,6857-6858,6860-6868,6874-6875,6884-6885,10135-10141,10145-10154,10504-10507
+  s_b4ceb853ba0cb4::t_1a47dde484d34a 6869-6871
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "a1e6da363d96d8ec61f4436cf31352066dd82011",
+  "prompts": {},
+  "sessions": {
+    "s_b4ceb853ba0cb4": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "23153558-f0b6-4c55-817b-eef32cf1bf4e",
+        "model": "claude-opus-5"
+      },
+      "human_author": "Jainal Gosaliya <jainal09gosalia@gmail.com>"
+    },
+    "s_bd6bad21887258": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "45ab9086-5f4d-4d6f-9485-3f0110d41170",
+        "model": "claude-opus-5"
+      },
+      "human_author": "Jainal Gosaliya <jainal09gosalia@gmail.com>"
+    }
+  }
+}
