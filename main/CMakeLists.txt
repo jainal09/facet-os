@@ -75,7 +75,12 @@ idf_component_register(
     # UI sounds live in flash, not on the card: ~99 KB of a 2.4 MB free app
     # slot, and no dependency on the SD card or the network to make a noise.
     # Authored by assets/sounds/render.py — see that file for why.
-    EMBED_FILES "../assets/sounds/tick.wav"
+    # The fallback wallpaper also lives in flash (~75 KB): with no card, an
+    # empty pool, or every cached PNG failing validation, the lock screen must
+    # still show something better than bare black. Palette-quantised and
+    # denoised offline — see assets/wall_default.png provenance in git log.
+    EMBED_FILES "../assets/wall_default.png"
+                "../assets/sounds/tick.wav"
                 "../assets/sounds/start.wav"
                 "../assets/sounds/pause.wav"
                 "../assets/sounds/resume.wav"

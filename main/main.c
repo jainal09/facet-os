@@ -384,9 +384,15 @@ static bool broker_fetch(const char *path, const char *xname, const char *xval,
                          uint8_t *buf, size_t cap, size_t *out_len);
 
 static lv_obj_t *s_lock_time, *s_lock_date, *s_lock_meridiem;
-static lv_obj_t *s_lock_batt, *s_lock_charge;
+static lv_obj_t *s_lock_batt, *s_lock_charge, *s_lock_eta;
 static lv_obj_t *s_lock_ring, *s_lock_inner_ring, *s_lock_batt_arc;
 static lv_obj_t *s_lock_ao_ring;      /* the desk-clock cue, amber */
+/* The wallpaper, kept as a file static only so the desk-clock dim can take it
+ * off the glass. On this panel a hidden full-screen photo is not "the photo
+ * drawn darker" — the 0x000000 screen behind it emits nothing at all, which is
+ * the half of the dim that lowering 0x51 cannot buy. NULL on every screen but
+ * the lock screen, and that is precisely what scopes the blackout to it. */
+static lv_obj_t *s_lock_wall;
 static uint8_t s_lock_charge_phase, s_lock_charge_div;
 
 /* Now-playing panel on the lock screen. Hidden unless Spotify actually has an
@@ -438,6 +444,10 @@ static bool s_stack_fallback;
  * because both the network task and the CONTROL screen are defined long before
  * it, and both need to see it. */
 #define WALL_SLOTS      12
+/* Effective on-glass brightness the lock wallpaper is dimmed toward (0-255
+ * mean). The dim keeps the clock legible over bright photos; a photo already
+ * at or below this draws at full opacity — see build_lock_screen(). */
+#define WALL_DIM_TARGET 55
 #define WALL_DIR        BSP_SD_MOUNT_POINT "/assets"
 
 static volatile bool s_req_wallpaper;
@@ -470,6 +480,11 @@ static void wall_service(void);
 static bool asset_fetch_auth(const char *url, const char *path, const char *bearer);
 static void power_set_doze(bool doze);
 static int  battery_drain_mv_h(void);
+
+/* Defined with the CONTROL card that presents it, but the charge-ETA tracker
+ * next to battery_poll() needs the same number to know what it is counting to.
+ * One definition of "the limit is 85%", not two. */
+static int  chg_mode_pct(int mode);
 
 /* The pool that actually matters, and the ONE definition of it.
  *
@@ -1975,13 +1990,21 @@ static esp_err_t axp_set_bit(uint8_t reg, uint8_t bit) {
     return axp_write(reg, (uint8_t)(v | (1u << bit)));
 }
 
-static uint8_t chg_cv_code(void) {
-    if (s_chg_once) return AXP_CV_4V20;
-    switch (s_chg_mode) {
+/* The mode -> CV mapping, split out so the percentage the UI shows can be
+ * DERIVED from the volts we actually write rather than kept as a second copy
+ * beside them. Two hand-maintained tables of the same fact is how the labels
+ * drifted four points off the hardware in the first place. */
+static uint8_t chg_mode_cv_code(int mode) {
+    switch (mode) {
         case CHG_LIFESPAN: return AXP_CV_4V00;
         case CHG_BALANCED: return AXP_CV_4V10;
         default:           return AXP_CV_4V20;
     }
+}
+
+static uint8_t chg_cv_code(void) {
+    if (s_chg_once) return AXP_CV_4V20;
+    return chg_mode_cv_code(s_chg_mode);
 }
 
 static int chg_cv_mv(uint8_t code) {
@@ -1991,6 +2014,200 @@ static int chg_cv_mv(uint8_t code) {
         case AXP_CV_4V20: return 4200;
         default:          return 0;        /* 4.35/4.4 V, or the reserved 000 */
     }
+}
+
+/* What the charger is actually aiming at, as a percentage. The one-shot beats
+ * the cap while it is armed, exactly as chg_cv_code() resolves the same
+ * question in volts. */
+static int chg_target_pct(void) {
+    return s_chg_once ? 100 : chg_mode_pct(s_chg_mode);
+}
+
+/* ---- time to the charge limit ----
+ *
+ * The AXP2101 reports no time-to-full, so it is derived from the only signal
+ * that moves: the same percentage the ring draws. Each 1-point step is one
+ * rate sample — one point per N ms — and N is smoothed rather than averaged
+ * over the whole session, because a session average cannot see the CV taper
+ * and would still be promising "6 min" half an hour after current started
+ * falling.
+ *
+ * It counts to the LIMIT, not to 100%. A cube capped at 85% stops there, so a
+ * countdown to full would name a moment that never arrives — which is the
+ * whole point of the feature.
+ *
+ * Computed here, on the main task, and published as one plain int: the UI
+ * reads it from the LVGL task, and a 64-bit timestamp shared across the two
+ * can tear on a 32-bit core and produce a garbage frame. */
+#define CHG_ETA_MIN_MS_PP   (10 * 1000)        /* faster is a gauge jump, not charge */
+#define CHG_ETA_MAX_MS_PP   (90 * 60 * 1000)   /* slower is a stall, not a rate      */
+
+/* Opt-in, default OFF. A countdown on the lock screen is a taste question —
+ * some people want the number, some want the clock and nothing else — and the
+ * screen's standing rule is sparseness, so the default has to be the sparse
+ * one. The switch gates only the two READOUTS; the estimator keeps running
+ * either way, because it costs nothing measurable and switching the feature on
+ * mid-charge should show an answer immediately rather than start a fresh
+ * two-point wait. */
+static volatile bool s_chg_eta_on;
+
+/* ---- charger speed ----
+ *
+ * Classified from the rate the estimator already learns, which is the honest
+ * place to measure it: ms-per-point is the OUTCOME, so it catches a weak
+ * adapter, a shared USB2 port and a thermally throttled cell alike, where
+ * reading the ICC register would only report what we asked the PMU for.
+ *
+ * Latched from the CC phase and never revised, which is the part that matters.
+ * Every charger slows down as the cell approaches CV — that is the taper the
+ * ETA's own open-segment term exists to model — so a rate sampled near the top
+ * would label a perfectly good supply "slow". Below CV-60 mV the charger is
+ * still in constant current and the rate means what it appears to mean.
+ *
+ * The thresholds are estimates, and honestly so: this cube measured 30-91 s
+ * per point on a healthy supply, and a charger delivering half the current
+ * lands at roughly double that. No genuinely slow charger has been measured
+ * yet, so the latch logs the value it decided on — retune from that log rather
+ * than from argument, and leave the dead band between the two: refusing to
+ * classify is better than guessing wrong in either direction. */
+#define CHG_FAST_MS_PP  (150 * 1000)   /* at or under this per point: keeping up */
+#define CHG_SLOW_MS_PP  (240 * 1000)   /* at or over this: the supply is the limit */
+
+static volatile int  s_chg_speed;   /* 0 unknown, 1 fast, -1 slow */
+static volatile bool s_chg_ilim;    /* PMU is input-current-limited (reg 0x00 b0) */
+
+static volatile int s_chg_eta_mins = -1;   /* -1 = no honest answer to give */
+static int64_t s_chg_eta_mark;             /* when the gauge last stepped up */
+static int     s_chg_eta_pct;              /* the value it stepped to */
+static int     s_chg_eta_ms_pp;            /* smoothed ms per point, 0 = not learned */
+static int     s_chg_eta_steps;            /* rate samples taken this session */
+
+static void chg_eta_track(void) {
+    int pct = s_batt_pct;
+    /* Not charging covers the two ends as well as the middle: unplugged, and
+     * sitting at "done" with the cap reached. Both mean there is nothing to
+     * count down, so the session is dropped rather than frozen. */
+    if (!s_batt_charging || pct < 0) {
+        s_chg_eta_mark = 0;
+        s_chg_eta_ms_pp = 0;
+        s_chg_eta_steps = 0;
+        s_chg_eta_mins = -1;
+        s_chg_speed = 0;      /* the next session may be a different cable */
+        return;
+    }
+
+    int64_t t = now_ms();
+    if (!s_chg_eta_mark || pct < s_chg_eta_pct) {
+        /* First sample of the session, or the gauge went backwards — a load
+         * spike, or one of battery_poll()'s voltage corrections overruling a
+         * latched coulomb counter. Re-anchor; never feed a negative interval
+         * into the rate. */
+        s_chg_eta_mark = t;
+        s_chg_eta_pct  = pct;
+    } else if (pct > s_chg_eta_pct) {
+        int step = pct - s_chg_eta_pct;
+        int ms_pp = (int)(t - s_chg_eta_mark);
+        s_chg_eta_mark = t;
+        s_chg_eta_pct  = pct;
+        /* Only a single-point step is charge. Polling is every 2 s and no real
+         * charge rate covers two points in that, so a bigger jump is the gauge
+         * correcting itself — dividing it out would fabricate a rate several
+         * times the true one. Re-anchor and keep the rate already learned.
+         *
+         * The first interval also does not count: it started wherever the cube
+         * happened to be inside a point, so it is short by an unknown amount
+         * and would seed the whole estimate optimistic. Measure from the first
+         * step to the second. */
+        if (step == 1 && ++s_chg_eta_steps > 1 &&
+            ms_pp >= CHG_ETA_MIN_MS_PP && ms_pp <= CHG_ETA_MAX_MS_PP) {
+            /* Three-quarters old: one fast point (the gauge catching up to a
+             * voltage it already reached) must not halve the estimate, while a
+             * real slowdown still lands within a few points. */
+            s_chg_eta_ms_pp = s_chg_eta_ms_pp
+                            ? (s_chg_eta_ms_pp * 3 + ms_pp) / 4 : ms_pp;
+
+            /* Latch once, and only from the constant-current phase — see the
+             * threshold note above. ILIM is logged rather than used: it is the
+             * PMU's own "this supply cannot give me what I asked for", which
+             * would be a better primary signal than a timing threshold, but
+             * the two circulating AXP2101 datasheets disagree enough (§7) that
+             * it needs corroborating on a genuinely weak charger before
+             * anything depends on it. This line is how that gets collected. */
+            int cv = chg_cv_mv(chg_cv_code());
+            if (!s_chg_speed && cv && s_batt_mv > 0 && s_batt_mv < cv - 60) {
+                if (s_chg_eta_ms_pp <= CHG_FAST_MS_PP)      s_chg_speed = 1;
+                else if (s_chg_eta_ms_pp >= CHG_SLOW_MS_PP) s_chg_speed = -1;
+                if (s_chg_speed) {
+                    ESP_LOGI(TAG, "charger looks %s — %d s/point at %d mV "
+                                  "(CV %d mV, ILIM=%d)",
+                             s_chg_speed > 0 ? "FAST" : "SLOW",
+                             s_chg_eta_ms_pp / 1000, s_batt_mv, cv,
+                             s_chg_ilim ? 1 : 0);
+                }
+            }
+        }
+    }
+
+    /* How far there is to go is measured in VOLTS, never in gauge points.
+     *
+     * The limit is a CV target in reg 0x64 — 4100 mV for the setting CONTROL
+     * calls "85%" — and the PMU terminates on that voltage and the taper
+     * current. It never reads the fuel gauge. Those two scales do not line up:
+     * on the voltage cross-check this firmware already uses (3300 mV = 0%,
+     * 4200 mV = 100%) a 4100 mV cap is really ~89%, so the gauge sails through
+     * 85, 86, 87 with the charger still working. Counting down to the LABEL
+     * therefore hit `remain <= 0` and withdrew the caption several minutes
+     * early, while the cube was visibly still charging — observed at 86% and
+     * 4077 mV against a 4100 mV cap, 23 mV short.
+     *
+     * It also made one of this feature's own tests unobservable: "the caption
+     * disappears when the charge terminates" could never be seen, because the
+     * caption was already gone by then.
+     *
+     * The RATE stays ms-per-gauge-point, which is smoothed, monotonic and
+     * already proven; only the distance changes units. 9 mV per point is the
+     * same 900 mV / 100 scale, so the two agree. */
+    int cv = chg_cv_mv(chg_cv_code());
+    int remain = (cv > 0 && s_batt_mv > 0) ? (cv - s_batt_mv + 8) / 9
+                                           : chg_target_pct() - pct;
+    int64_t open = t - s_chg_eta_mark;
+    /* A point that has taken longer than any rate we would have learned is not
+     * a slow charge, it is a charge that has stopped moving — a cell holding
+     * just under a target it will not reach, or a supply that cannot deliver.
+     * Withdraw the estimate instead of letting the taper term below inflate it
+     * into an ever-growing number nobody should plan around. */
+    if (!s_chg_eta_ms_pp || remain <= 0 || open > CHG_ETA_MAX_MS_PP) {
+        s_chg_eta_mins = -1;
+        return;
+    }
+    int64_t ms = (int64_t)remain * s_chg_eta_ms_pp;
+    /* Charge the point in progress for the time it has ALREADY taken once that
+     * exceeds the learned rate. This is the CV taper, where every remaining
+     * point costs more than the ones behind it; without it the estimate parks
+     * on its last value and visibly counts nothing down. */
+    if (open > s_chg_eta_ms_pp) ms += open - s_chg_eta_ms_pp;
+    s_chg_eta_mins = (int)((ms + 59999) / 60000);   /* round up: "0 min" is not a wait */
+}
+
+/* "1h 12m to 85%". The limit is in the string because the number is only
+ * honest with it — a bare "1h 12m" under a 62% ring reads as time to full.
+ * Rounded to five minutes past a quarter hour: the input is a 1%-granular
+ * gauge, and a minute-precise countdown from it twitches by more than it
+ * resolves. Lower case, like every other CONTROL string; the lock screen
+ * upper-cases it on the way out the same way it does the date. */
+static void chg_eta_text(char *buf, size_t n, int mins) {
+    if (mins > 15) mins = (mins + 2) / 5 * 5;
+    int target = chg_target_pct();
+    /* A word, not a glyph. A tortoise was the ask and there is no tortoise to
+     * be had: LVGL's symbol set has no animal and the hud fonts are ASCII-only,
+     * so any emoji renders as an empty box. Drawing one from arcs the way the
+     * FOCUS padlock is drawn was the alternative and it was not worth it at
+     * this size. Empty in the dead band, so a normal charge says nothing. */
+    const char *speed = s_chg_speed > 0 ? " - fast"
+                      : s_chg_speed < 0 ? " - slow" : "";
+    if (mins >= 60) snprintf(buf, n, "%dh %02dm to %d%%%s",
+                             mins / 60, mins % 60, target, speed);
+    else            snprintf(buf, n, "%dm to %d%%%s", mins, target, speed);
 }
 
 /* Write the charge cap if the PMU is not already holding it.
@@ -2064,6 +2281,7 @@ static void battery_poll(void) {
      * "not in VINDPM", which reads as unplugged whenever the supply droops —
      * exactly the case a charge cap makes more likely, not less. */
     s_vbus      = (st1 >> 5) & 0x01;
+    s_chg_ilim  = st1 & 0x01;      /* free: st1 is already in hand */
     s_chg_state = st2 & 0x07;
     s_bypass    = s_vbus && s_chg_state == AXP_CHG_DONE;
 
@@ -2074,6 +2292,7 @@ static void battery_poll(void) {
     if (!((st1 >> 3) & 0x01)) {          /* no battery on the connector */
         s_batt_pct = -1;
         s_batt_mv = 0;
+        chg_eta_track();                 /* drops the session, board runs on USB */
         return;
     }
     if (axp_read(AXP_REG_ADC_DATA_H, &hi) == ESP_OK &&
@@ -2121,6 +2340,10 @@ static void battery_poll(void) {
     } else {
         s_batt_pct = 0;
     }
+
+    /* Last, and deliberately: it estimates from the settled s_batt_pct — the
+     * one the ring draws — so the countdown and the gauge can never disagree. */
+    chg_eta_track();
 }
 
 /* bit0 = went down, bit1 = came up. Both can land in one poll on a tap
@@ -2206,6 +2429,133 @@ static volatile bool s_lock_rings = true;
  * ring. The mode itself belongs to the lock screen's right-key hold. */
 static volatile bool s_ao_ring_pref = true;
 static volatile bool s_req_lock_pref_save;
+
+/* ---- desk-clock dim ----
+ *
+ * Always-on is the only mode in this firmware that can hold the panel lit for
+ * hours, and on an AMOLED that is paid for twice: once in emission per lit
+ * pixel, and once in how MANY pixels are lit. So the dim does both. It lowers
+ * 0x51, and on the lock screen it also takes the wallpaper off the glass,
+ * leaving a black field that costs nothing at all and a clock that costs a few
+ * thousand pixels. Brightness alone would keep paying for 230,400 lit pixels.
+ *
+ * The depth is a PERCENTAGE of the user's brightness, never a flat constant and
+ * never a min() — that reasoning is written out at the FOCUS dim in pomo_poll()
+ * and it applies here unchanged. The numbers are deliberately the same pair
+ * rather than a fresh guess: 12 / 3 is what was actually checked through this
+ * cover glass, and nothing measured says a desk clock wants a different one.
+ * They are separate symbols so a future measurement can move one alone.
+ *
+ * 60 s by default because that is already this firmware's idea of "nobody is
+ * here" — it is AUTO_LOCK_MS. FOCUS waits 120 s because you are sitting in
+ * front of it doing something; a desk clock is finished with you the moment
+ * you look away.
+ *
+ * ON by default. The mode's only switch is a right-key hold on the lock screen,
+ * so the person who turns always-on on has no reason ever to open CONTROL, and
+ * a battery feature nobody finds is not a feature. One touch undoes it. */
+static volatile bool s_ao_dim_on = true;
+static volatile int  s_ao_dim_s  = 60;   /* idle seconds before the dim engages */
+static bool s_ao_dimmed;                 /* main task only, like s_pomo_dimmed  */
+#define AO_DIM_PCT   12     /* of the user's brightness, not of full        */
+#define AO_DIM_FLOOR 3      /* on a black field, still readable across a room */
+
+/* The dim FADES rather than steps, phone-style, and the reason is interaction
+ * rather than looks. A panel that drops in one frame has already happened by
+ * the time you notice it, so the only thing left to do is wonder whether the
+ * cube is broken; a fade is an announcement with a window inside it, and a
+ * touch anywhere in that window calls the whole thing off.
+ *
+ * Quantised into steps rather than run off the 20 ms loop tick, because every
+ * one of them is a 0x51 write taking the LVGL lock from the main task while the
+ * lock screen's own 16 ms timer is running — pitfall #13's contended case. A
+ * free-running ramp over the ~88 levels between full and dim would be ~88 lock
+ * acquisitions in 2.4 s; 24 is enough to look continuous and is one write per
+ * 100 ms, which is slower than the FOCUS dim already does on this same path.
+ *
+ * The ramp is linear in the panel's own units, and perception of brightness is
+ * closer to logarithmic, so the visible change front-loads — most of the drop
+ * reads in the first second. That is the right way round here: the point is to
+ * be noticed early enough to be stopped, not to be inconspicuous.
+ *
+ * Restoring is deliberately NOT faded. A fade out is the device announcing
+ * something; a fade in would be the device answering your finger slowly. */
+#define AO_DIM_FADE_MS   2400
+#define AO_DIM_FADE_STEPS 24
+
+static int     s_ao_dim_lvl  = -1;   /* level the fade has reached; -1 = idle */
+static int     s_ao_dim_from;        /* level it started from                 */
+static int64_t s_ao_dim_began;
+static bool    s_ao_wall_hidden;     /* the blackout half, taken at the bottom */
+
+/* ---- the two things that are about THIS panel rather than about power ----
+ *
+ * Burn-in is the AMOLED-specific RISK, and the blackout above made this cube's
+ * exposure to it worse rather than better. A desk clock holds the same digits
+ * in the same pixels for hours, which is the textbook OLED case; until now the
+ * wallpaper at least reshuffled everything underneath on each lock build, and
+ * hiding it leaves nothing on the glass but static elements. So the content
+ * walks a slow eight-point ring while dimmed — the standard mitigation, and it
+ * costs nothing on a screen nobody is reading closely.
+ *
+ * The shift is applied to the SCREEN, not to nine widgets. One translate moves
+ * the clock, the date, the battery text, the rings and the now-playing card
+ * together, so nothing can drift out of alignment with anything else, and no
+ * future widget has to remember to join in. Under the shift the screen's own
+ * black shows at the trailing edge, which on this panel is unlit rather than
+ * grey — the one place the drift costs literally nothing to hide.
+ *
+ * 4 px is enough: burn-in is driven by the EDGES of a static luminance step, and
+ * moving a glyph by a third of its stroke width is what stops one column of
+ * pixels carrying the whole duty cycle. Larger would be visible as a jump.
+ *
+ * The amber is the other half. 0xE8FBFF drives all three subpixels near full;
+ * AMOLED power is per-subpixel, blue is both the least efficient primary and
+ * the fastest to age, and 0xF59E0B is already what desk-clock mode means on
+ * this device (s_lock_ao_ring). Total subpixel drive falls from 738 to 414 for
+ * the same legibility. Note that is drive, not measured power — see §7b. */
+#define AO_DRIFT_MS 60000    /* one step a minute: slower than anyone watching */
+#define AO_DRIFT_PX 4
+#define AO_DIM_CLOCK 0xF59E0B
+
+static const int8_t s_ao_drift[8][2] = {
+    { 0, -1 }, { 1, -1 }, { 1, 0 }, { 1, 1 },
+    { 0,  1 }, { -1, 1 }, { -1, 0 }, { -1, -1 },
+};
+static int     s_ao_drift_i;
+static int64_t s_ao_drift_at;
+static uint32_t s_lock_time_col = 0xE8FBFF;   /* what build_lock_screen set */
+
+/* Stops, not a free-running seconds range: "dim after 37 s" is a number nobody
+ * chose, and a control that can produce one is worse than seven detents.
+ *
+ * SECONDS are what gets persisted and the slider index is derived from them at
+ * the UI boundary — the same direction chg_mode_to_slider() converts in, for
+ * the same reason. Storing the index instead would silently redefine everyone's
+ * saved setting on the day a stop is added to this table. */
+static const uint16_t s_ao_dim_stops[] = { 10, 20, 30, 60, 120, 300, 600 };
+#define AO_DIM_STOPS ((int)(sizeof s_ao_dim_stops / sizeof s_ao_dim_stops[0]))
+
+static int ao_dim_to_slider(int secs) {
+    int best = 0;
+    for (int i = 1; i < AO_DIM_STOPS; i++) {
+        if (abs((int)s_ao_dim_stops[i] - secs) <
+            abs((int)s_ao_dim_stops[best] - secs)) best = i;
+    }
+    return best;
+}
+
+/* Pocket lock: the panel stops answering touch while it is asleep, so a cube in
+ * a bag or a coat pocket cannot be woken by whatever it is pressed against.
+ * Keys still wake it — they are the way back in, and a key is not something a
+ * pocket presses for ten minutes at a time.
+ *
+ * Deliberately NOT persisted, unlike always-on beside it. The lock screen is
+ * kept sparse, so this mode has no indicator while the panel is dark and none
+ * is possible; a mode you cannot see that survived a reboot is indistinguishable
+ * from a broken touchscreen. A power cycle always gives the glass back. */
+static volatile bool s_pocket_lock;
+
 /* The orientation to hold when autorotate is off. Without persisting this, a
  * reboot lands back at native 0 with the switch still reading OFF and — since
  * the calibration button fades out in that state — no way at all to get back. */
@@ -2585,6 +2935,9 @@ static void lock_pref_save(void) {
         nvs_set_i32(h, "alwayson", s_always_on ? 1 : 0);
         nvs_set_i32(h, "lockrings", s_lock_rings ? 1 : 0);
         nvs_set_i32(h, "aoring", s_ao_ring_pref ? 1 : 0);
+        /* Seconds, not the slider index — see s_ao_dim_stops. */
+        nvs_set_i32(h, "aodim", s_ao_dim_on ? 1 : 0);
+        nvs_set_i32(h, "aodimsec", s_ao_dim_s);
         nvs_set_i32(h, "lockmid", s_lock_key_app);
         nvs_commit(h);
         nvs_close(h);
@@ -2597,6 +2950,7 @@ static void chg_save(void) {
     if (nvs_open("cfg", NVS_READWRITE, &h) == ESP_OK) {
         nvs_set_i32(h, "chgmode", s_chg_mode);
         nvs_set_i32(h, "chgonce", s_chg_once ? 1 : 0);
+        nvs_set_i32(h, "chgeta", s_chg_eta_on ? 1 : 0);
         nvs_commit(h);
         nvs_close(h);
     }
@@ -2614,6 +2968,7 @@ static void chg_load(void) {
         s_chg_mode = (int)v;
     }
     if (nvs_get_i32(h, "chgonce", &v) == ESP_OK) s_chg_once = (v != 0);
+    if (nvs_get_i32(h, "chgeta", &v) == ESP_OK) s_chg_eta_on = (v != 0);
     nvs_close(h);
 }
 
@@ -2629,6 +2984,14 @@ static void rot_off_load(void) {
     if (nvs_get_i32(h, "alwayson", &v) == ESP_OK) s_always_on = (v != 0);
     if (nvs_get_i32(h, "lockrings", &v) == ESP_OK) s_lock_rings = (v != 0);
     if (nvs_get_i32(h, "aoring", &v) == ESP_OK) s_ao_ring_pref = (v != 0);
+    if (nvs_get_i32(h, "aodim", &v) == ESP_OK) s_ao_dim_on = (v != 0);
+    /* Clamped to the ends of the stops table rather than trusted. A stored
+     * delay is a bare number, and a zero would dim the instant you stopped
+     * touching the glass — indistinguishable from a broken panel. */
+    if (nvs_get_i32(h, "aodimsec", &v) == ESP_OK) {
+        s_ao_dim_s = clampi((int)v, s_ao_dim_stops[0],
+                            s_ao_dim_stops[AO_DIM_STOPS - 1]);
+    }
     /* Range-checked, not trusted: a stored index can outlive the app it named
      * if one is compiled out, and app_request() on a hole calls a NULL build(). */
     if (nvs_get_i32(h, "lockmid", &v) == ESP_OK) {
@@ -2750,6 +3113,17 @@ static btn_ev_t btn_poll(btn_t *b, int64_t t) {
         b->change_ms = t;
         b->raw_edge = (raw == 0) ? 1 : -1;   /* active low; earliest signal there is */
         ESP_LOGI(TAG, "key gpio%d -> %d", (int)b->pin, raw);
+        /* A tap can be over in less than the 50 ms the debouncer needs: low on
+         * one 20 ms poll, high again by the next. The debounced path then never
+         * records a press, so the release completes nothing and the tap simply
+         * vanishes — reported from the glass as "an extremely quick press does
+         * nothing". The opposite raw edges ARE the tap: an up edge while the
+         * debounced state never left released is a completed short press. Real
+         * contact bounce settles in under ~10 ms, so a high sample a full poll
+         * after a low one means the finger genuinely lifted; and after
+         * btn_swallow() stable tracks the held level, so a swallowed wake press
+         * still cannot fire on its release. */
+        if (raw == 1 && b->stable == 1) return BTN_SHORT;
         return BTN_NONE;
     }
     if (raw != b->stable && (t - b->change_ms) >= 50) {   /* debounced edge */
@@ -2850,6 +3224,194 @@ static bool bright_apply(int pct) {
     bsp_display_unlock();
     s_bright_applied = pct;
     return true;
+}
+
+/* Desk-clock dim: ONE writer for both halves of it, so the panel level and the
+ * wallpaper can never end up disagreeing about which state the cube is in. Same
+ * rule as bright_apply() directly above, one level up.
+ *
+ * The ordering inside each branch looks arbitrary and is not. Hiding or showing
+ * a 480x480 image invalidates the entire viewport, which LVGL ships as fifteen
+ * sequential strips with no tear gate on this board (HARDWARE.md §5) — a sweep
+ * you can watch cross the glass. Doing that repaint while the panel is already
+ * at 3-12% is what makes it invisible, exactly as rotation_apply() repaints
+ * inside its own blackout. Raising the level first and repainting after would
+ * light the sweep instead of hiding it.
+ *
+ * lv_refr_now() rather than leaving it to the LVGL task, for the same reason
+ * rotation_apply() does: the very next statement changes the brightness, and an
+ * asynchronous repaint would land on the wrong side of it.
+ *
+ * s_lock_wall is NULL on every screen but the lock screen, and that is what
+ * scopes the blackout. A cube parked on MUSIC by always-on gets the brightness
+ * half only, because its content is the thing you asked to keep looking at. */
+/* Shift the whole lock screen by (dx, dy).
+ *
+ * On the CHILDREN, never on the screen — and this is the whole reason the
+ * helper exists rather than two setter calls at the call site. A screen is
+ * created with lv_obj_create(NULL), so its `parent` is NULL, and
+ * lv_obj_refr_pos() returns at `if(parent == NULL) { lv_obj_move_to(...);
+ * return; }` (lv_obj_pos.c:781) BEFORE it ever reads translate_x/y twenty lines
+ * later. Setting translate on a screen is therefore a silent no-op: no error,
+ * no warning, and at 4 px on a dimmed panel nothing an eye could catch either.
+ * The first version of this did exactly that.
+ *
+ * Walking the children rather than naming nine widgets keeps the property that
+ * made a whole-screen shift attractive in the first place: everything moves
+ * together so nothing can drift out of alignment with anything else, and a
+ * widget added to this screen later joins in without knowing the drift exists.
+ * That includes the wallpaper, which is hidden while this runs, and the ETA
+ * caption, which is not mine.
+ *
+ * Safe against the now-playing drag: lock_drag_apply() positions the card with
+ * lv_obj_set_x(), and translate composes with x rather than replacing it, so
+ * the two cannot overwrite each other — and the touch that begins a drag lifts
+ * the dim, which zeroes all of this, before the drag can travel. */
+static void ao_drift_apply(int dx, int dy) {
+    lv_obj_t *scr = lv_screen_active();
+    if (!scr) return;
+    uint32_t n = lv_obj_get_child_count(scr);
+    for (uint32_t i = 0; i < n; i++) {
+        lv_obj_t *ch = lv_obj_get_child(scr, i);
+        if (!ch) continue;
+        lv_obj_set_style_translate_x(ch, dx, 0);
+        lv_obj_set_style_translate_y(ch, dy, 0);
+    }
+}
+
+static void ao_dim_set(bool on) {
+    int lvl = s_bright;      /* one read: it is volatile and used three times */
+    int dim = clampi(lvl * AO_DIM_PCT / 100, AO_DIM_FLOOR, lvl);
+
+    if (on) {
+        /* Called on every 20 ms pass for as long as the cube stays idle, so
+         * this both STARTS the fade and ADVANCES it. Position comes from
+         * elapsed wall time rather than from a counter, for the reason
+         * pomo_set_running() re-stamps its tick: a pass the loop was late for
+         * must not stretch the fade, and one bright_apply() that had to be
+         * retried must not shorten it. */
+        if (!s_ao_dimmed) {
+            s_ao_dimmed     = true;
+            s_ao_dim_from   = lvl;
+            s_ao_dim_lvl    = lvl;
+            s_ao_dim_began  = now_ms();
+            s_ao_wall_hidden = false;
+            ESP_LOGI(TAG, "desk-clock dim: fading %d%% -> %d%%", lvl, dim);
+        }
+
+        if (s_ao_dim_lvl > dim) {
+            int64_t el = now_ms() - s_ao_dim_began;
+            int step = (int)(el * AO_DIM_FADE_STEPS / AO_DIM_FADE_MS);
+            if (step > AO_DIM_FADE_STEPS) step = AO_DIM_FADE_STEPS;
+            int want = s_ao_dim_from -
+                       (s_ao_dim_from - dim) * step / AO_DIM_FADE_STEPS;
+            if (want < dim) want = dim;
+            /* On a lock timeout, leave s_ao_dim_lvl where it was and come back
+             * next pass: the fade resumes at whatever the clock says by then,
+             * so a contended panel loses smoothness rather than correctness. */
+            if (want != s_ao_dim_lvl && bright_apply(want)) s_ao_dim_lvl = want;
+            return;                       /* the blackout waits for the bottom */
+        }
+
+        /* Bottom of the fade. The wallpaper goes now rather than at the top,
+         * because hiding a 480x480 image invalidates the whole viewport and
+         * LVGL ships that as fifteen sequential strips with no tear gate on
+         * this board (HARDWARE.md §5) — a sweep you can watch cross the glass.
+         * At 3-12% it is invisible, which is the same trick rotation_apply()
+         * uses; at full brightness, halfway through a fade, it would not be. */
+        if (s_lock_wall && !s_ao_wall_hidden) {
+            if (!ui_lock()) return;                    /* retried next pass */
+            lv_obj_add_flag(s_lock_wall, LV_OBJ_FLAG_HIDDEN);
+            /* Amber goes on in the same pass as the blackout and under the same
+             * lock: two writes, one repaint, one moment. Recolouring separately
+             * would be a second full-screen invalidate for nothing. */
+            if (s_lock_time)
+                lv_obj_set_style_text_color(s_lock_time,
+                                            lv_color_hex(AO_DIM_CLOCK), 0);
+            if (s_screen_on) lv_refr_now(NULL);
+            bsp_display_unlock();
+            s_ao_wall_hidden = true;
+            s_ao_drift_at = now_ms();       /* first step a full period from now */
+            ESP_LOGI(TAG, "desk-clock dim ON (panel %d%%, wallpaper off, amber)",
+                     dim);
+        }
+
+        /* The drift, once settled at the bottom. Deliberately not started until
+         * then: a shift during the fade would be one more thing moving while
+         * the panel is already changing, and the whole point is to be unnoticed.
+         *
+         * Whole-screen translate, so this is a full-viewport invalidate — the
+         * same fifteen strips the blackout costs. It is affordable for exactly
+         * the same reason and no other: it happens at 3-12% brightness, once a
+         * minute, on a screen nobody is looking at. Do not lift this to a
+         * shorter period without re-reading HARDWARE.md §5. */
+        if (s_ao_wall_hidden && now_ms() - s_ao_drift_at >= AO_DRIFT_MS) {
+            if (!ui_lock()) return;                    /* retried next pass */
+            s_ao_drift_i = (s_ao_drift_i + 1) & 7;
+            int dx = s_ao_drift[s_ao_drift_i][0] * AO_DRIFT_PX;
+            int dy = s_ao_drift[s_ao_drift_i][1] * AO_DRIFT_PX;
+            ao_drift_apply(dx, dy);
+            if (s_screen_on) lv_refr_now(NULL);
+            bsp_display_unlock();
+            s_ao_drift_at = now_ms();
+            /* Logged, once a minute and only while dimmed, because this is a
+             * feature with no observable output: 4 px on a 12% panel is not
+             * something an eye can confirm, and its first version was a silent
+             * no-op that no hardware test could have caught (pitfall #36). A
+             * line here is the only way anyone can ever tell it is alive. */
+            ESP_LOGI(TAG, "desk-clock drift: step %d (%+d,%+d)",
+                     s_ao_drift_i, dx, dy);
+        }
+        return;
+    }
+
+    if (!s_ao_dimmed) return;
+
+    /* Coming back. Instant, and it can land mid-fade — the wallpaper may never
+     * have gone, which is why the repaint is gated on having actually hidden it
+     * rather than on s_lock_wall alone. */
+    /* s_lock_wall NULL here is not "no wallpaper", it is app_open() having
+     * already nulled it one line before calling us — the screen is about to be
+     * freed. Repainting it would spend a full-viewport render, ~80 ms, on a
+     * screen nobody will ever see, right inside the switch path. Skipping is
+     * also correct rather than merely cheap: the incoming screen is a fresh
+     * object, so it carries no translate, and s_lock_time is rebuilt with its
+     * own colour. Nothing stale can survive the teardown. */
+    if (s_lock_wall && s_ao_wall_hidden) {
+        if (!ui_lock()) return;            /* flags untouched: retried next pass */
+        lv_obj_remove_flag(s_lock_wall, LV_OBJ_FLAG_HIDDEN);
+        /* All three come back under ONE lock and ONE repaint. Undoing them in
+         * separate passes would show an amber clock over a restored wallpaper,
+         * or worse, leave the screen parked 4 px off if a later pass timed out.
+         * The drift in particular must be cleared unconditionally rather than
+         * stepped back, because it is absolute, not relative. */
+        if (s_lock_time)
+            lv_obj_set_style_text_color(s_lock_time,
+                                        lv_color_hex(s_lock_time_col), 0);
+        ao_drift_apply(0, 0);
+        /* Synchronous only while the panel is lit, which is the case this
+         * ordering exists for. On the sleep path the screen is already dark and
+         * blocking the main loop ~80 ms to render a frame into it would be the
+         * opposite of §7b. */
+        if (s_screen_on) lv_refr_now(NULL);
+        bsp_display_unlock();
+    }
+    s_ao_dimmed      = false;
+    s_ao_wall_hidden = false;
+    s_ao_dim_lvl     = -1;
+
+    /* Restoring the level last, so the repaint above happened while the panel
+     * was still dim — the sweep is fifteen strips and this is where it hides.
+     *
+     * Guarded on s_screen_on because screen_toggle_power() drops the dim on its
+     * way DOWN, after it has already written 0: restoring the user's level
+     * unguarded there would relight a panel one line from dozing, and the wake
+     * path writes s_bright itself. A lock timeout hands the write to the main
+     * loop rather than losing it — the same retry channel screen_toggle_power()
+     * uses, and the reason its gate tests !s_ao_dimmed rather than assuming the
+     * panel is wherever the flag says. */
+    if (s_screen_on && !bright_apply(lvl)) s_req_bright_apply = true;
+    ESP_LOGI(TAG, "desk-clock dim OFF (panel %d%%)", lvl);
 }
 
 /* ---------------- rotation transition ----------------
@@ -2964,6 +3526,20 @@ static void screen_toggle_power(void) {
         if (!bright_apply(s_bright)) s_req_bright_apply = true;
     } else {
         bright_apply(0);          /* not backlight_off(): see bright_apply() */
+        /* Drop the desk-clock dim on the way down, and drop it HERE: after the
+         * flip, so ao_dim_set() skips its brightness write, and after the panel
+         * is already at 0, so putting the wallpaper back costs one repaint that
+         * nobody can see rather than a flash of the photo returning.
+         *
+         * It has to happen somewhere on this path. A dim that survived the
+         * sleep would wake to a black lock screen at full brightness — read
+         * from the glass as "my wallpaper disappeared" — and worse, the flag
+         * would then agree with the panel, so nothing would ever re-dim it.
+         * That is pitfall #23's shape with the wallpaper as the second output.
+         *
+         * The wake branch needs no equivalent: it can only be reached from
+         * here, so the flag is already false by the time the panel lights. */
+        ao_dim_set(false);
         power_set_doze(true);
     }
     ESP_LOGI(TAG, "screen %s", s_screen_on ? "ON" : "OFF");
@@ -4391,6 +4967,36 @@ static int s_touch_start_y = -1;
 static void touch_origin_cb(lv_event_t *e) {
     lv_indev_t *indev = lv_event_get_user_data(e);
     if (!indev) return;
+
+    /* A dark panel is not an inert one. esp_lcd_panel_disp_on_off() stops the
+     * CO5300 emitting and scanning; it does not stop the touch controller, the
+     * indev, LVGL, or a single widget. The whole UI stays live and invisible,
+     * so every button on the screen you cannot see still takes clicks — the
+     * lock screen's transport really did skip tracks from inside a pocket.
+     *
+     * This was guarded per-widget before: lock_tap_cb and lock_np_tap_cb each
+     * tested s_screen_on, which covered the screen and the cover art and
+     * nothing else. Prev, play and next were added later and inherited no such
+     * test, because there was nothing central to inherit it FROM — a gate per
+     * widget is a hole per widget anyone adds afterwards.
+     *
+     * One gate on the indev covers clicks, gestures and scrolls at once:
+     * CLICKED is sent on release, and wait_release cancels the release for this
+     * touch entirely. The wake request is raised here rather than left to the
+     * handler being cancelled, so touch-to-wake still works — and it now works
+     * from any screen rather than only from the two that happened to test for
+     * it. Pocket lock refuses the request downstream, at its single consumer.
+     *
+     * Those two handlers keep their own checks: this registration lives inside
+     * an `if (ui_lock())` at boot, so a lock timeout there would leave no gate
+     * at all, and the lock screen is the one place that must not fail open. */
+    if (!s_screen_on) {
+        s_req_wake = true;
+        s_touch_start_y = -1;          /* no gesture may be judged from it */
+        lv_indev_wait_release(indev);
+        return;
+    }
+
     lv_point_t point;
     lv_indev_get_point(indev, &point);
     s_touch_start_y = point.y;
@@ -4410,6 +5016,49 @@ static void gesture_home_cb(lv_event_t *e) {
         lv_indev_wait_release(indev);
         app_request(APP_DRAWER);
     }
+}
+
+/* ---- the snack bar ----
+ *
+ * One banner, three modes: always-on, FOCUS's rotation lock, and pocket lock.
+ * Each is a toggle with no other trace on the glass at the moment it is
+ * pressed, so all any of them has to say is which way it just went — amber for
+ * on, slate for off. This was three copies of eleven style calls before the
+ * third one, which is the point they would have started to drift.
+ *
+ * Wording is a convention, not a free field: "<MODE>  ON" / "<MODE>  OFF",
+ * double-spaced, matching the always-on banner these were all modelled on. It
+ * also keeps the widest string inside the panel — at 18 px with 3 px letter
+ * spacing, "ROTATION LOCK DISABLED" measured 373 px, which puts its edges
+ * 53 px from the glass and into the band the curved cover clips.
+ *
+ * Returned rather than merely built, because FOCUS freezes the panel and has to
+ * counter-rotate its banner before it fades; callers on a screen that
+ * autorotates normally can ignore the return.
+ *
+ * fade_out animates opacity and does NOT delete, so the delayed delete is not
+ * optional — without it every toggle leaves an invisible label on the screen.
+ * Deleting the screen first cancels the animation and the pending delete along
+ * with it, so this is safe even if the app is torn down mid-fade. */
+static lv_obj_t *toast_show(const char *text, bool on, lv_coord_t dx, lv_coord_t dy) {
+    lv_obj_t *t = lv_label_create(lv_screen_active());
+    lv_obj_set_style_text_font(t, &hud_text_18, 0);
+    lv_obj_set_style_text_letter_space(t, 3, 0);
+    lv_obj_set_style_text_color(t, lv_color_hex(on ? 0xF59E0B : 0x7C8AA5), 0);
+    lv_obj_set_style_bg_color(t, lv_color_hex(0x08131C), 0);
+    lv_obj_set_style_bg_opa(t, 235, 0);
+    lv_obj_set_style_pad_all(t, 14, 0);
+    lv_obj_set_style_radius(t, 14, 0);
+    lv_obj_set_style_border_width(t, 1, 0);
+    lv_obj_set_style_border_color(t, lv_color_hex(on ? 0xF59E0B : 0x33465C), 0);
+    lv_label_set_text(t, text);
+    /* A label is not clickable by default, but this one lands over the lock
+     * screen's tap-to-unlock area — stated rather than inherited. */
+    lv_obj_remove_flag(t, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_align(t, LV_ALIGN_CENTER, dx, dy);
+    lv_obj_fade_out(t, 900, 900);
+    lv_obj_delete_delayed(t, 1900);
+    return t;
 }
 
 /* 76 px tall with widened hit test and 20 px type — the touch-target rule
@@ -5306,9 +5955,12 @@ static lv_obj_t *s_cfg_rot_val;
 static lv_obj_t *s_cfg_rot_sw, *s_cfg_rot_btn, *s_cfg_time_sw;
 static lv_obj_t *s_cfg_lockkey_val, *s_cfg_lockkey_btn;
 static lv_obj_t *s_cfg_always_sw, *s_cfg_rings_sw;
+static lv_obj_t *s_cfg_aodim_sw, *s_cfg_aodim_sld;
+static lv_obj_t *s_cfg_aodim_val, *s_cfg_aodim_sub;
 static lv_obj_t *s_cfg_bright_val;
 static lv_obj_t *s_cfg_vol_val;
-static lv_obj_t *s_cfg_batt_bar, *s_cfg_batt_val, *s_cfg_batt_sub;
+static lv_obj_t *s_cfg_batt_bar, *s_cfg_batt_val, *s_cfg_batt_sub, *s_cfg_chgeta_sw;
+static lv_obj_t *s_cfg_chgeta_sub;
 static lv_obj_t *s_cfg_care_val, *s_cfg_care_sub, *s_cfg_care_sld, *s_cfg_care_btn;
 static lv_obj_t *s_cfg_net_val;
 static lv_obj_t *s_cfg_ble_val;
@@ -5390,7 +6042,13 @@ static lv_obj_t *s_cfg_log;
  * control means "this cannot act" (the autorotate switch with no IMU), and a
  * slider that greyed out every time the list moved would read as a fault. This
  * is invisible, and it costs no dirty area mid-scroll. */
-#define CFG_SLIDER_MAX 4
+/* Headroom on purpose. The desk-clock delay slider took this table to exactly
+ * four, and overflowing it is a SILENT downgrade rather than an error:
+ * cfg_slider() simply skips registering, and the unregistered slider then
+ * commits a value whenever a finger lands on it to arrest a scroll — the exact
+ * bug the two guards above exist to prevent, reappearing on whichever control
+ * happened to be added last. */
+#define CFG_SLIDER_MAX 6
 static lv_obj_t *s_cfg_sliders[CFG_SLIDER_MAX];
 static int32_t   s_cfg_slider_snap[CFG_SLIDER_MAX];
 static int       s_cfg_slider_n;
@@ -6048,18 +6706,69 @@ static void cfg_rings_cb(lv_event_t *e) {
     ESP_LOGI(TAG, "lock-screen rings %s", s_lock_rings ? "ON" : "OFF");
 }
 
+/* Minutes above a minute: "dim after  300 s" makes the reader do the division,
+ * and the whole point of a stops table is that every value on it is one a
+ * person would have said out loud. */
+static void ao_dim_label(char *buf, size_t n, int secs) {
+    if (secs >= 60 && secs % 60 == 0) {
+        snprintf(buf, n, "dim after  %d min", secs / 60);
+    } else {
+        snprintf(buf, n, "dim after  %d s", secs);
+    }
+}
+
+/* No brightness write here, and none is missing. This runs on the LVGL task and
+ * the panel belongs to the main loop (pitfall #13); switching the feature off
+ * simply makes the idle block's expression false on its next 20 ms pass, which
+ * restores through ao_dim_set() — the one writer. Same shape as every other
+ * setting in this app: record, raise a flag, let the loop act. */
+static void cfg_aodim_cb(lv_event_t *e) {
+    s_ao_dim_on = lv_obj_has_state(lv_event_get_target(e), LV_STATE_CHECKED);
+    s_req_lock_pref_save = true;
+    ESP_LOGI(TAG, "desk-clock dim pref %s", s_ao_dim_on ? "ON" : "OFF");
+}
+
+/* Same shape as cfg_care_cb and for the same reasons: the label is rewritten on
+ * RELEASED only, because a label that changes width inside an LV_SIZE_CONTENT
+ * card re-lays out the whole scrolling column and moves the slider out from
+ * under the finger; and NVS waits for the main loop, because committing per
+ * VALUE_CHANGED erases flash on every pixel of a drag. */
+static void cfg_aodim_delay_cb(lv_event_t *e) {
+    int i = clampi((int)lv_slider_get_value(lv_event_get_target(e)),
+                   0, AO_DIM_STOPS - 1);
+    s_ao_dim_s = s_ao_dim_stops[i];
+    if (lv_event_get_code(e) != LV_EVENT_RELEASED) return;
+
+    if (s_cfg_aodim_val) {
+        char buf[32];
+        ao_dim_label(buf, sizeof buf, s_ao_dim_s);
+        lv_label_set_text(s_cfg_aodim_val, buf);
+    }
+    s_req_lock_pref_save = true;
+    ESP_LOGI(TAG, "desk-clock dim delay -> %d s", s_ao_dim_s);
+}
+
 /* Stated as a percentage, not as volts and not as a mode name. The percentage
  * is the number printed two lines above it in this same card, and the one every
  * other device states; "balanced 4.1V" asks the reader to learn a mapping first.
- * Volts are what we actually write — the percentages are the standard Li-ion
- * curve, and they line up with what the readout shows once a capped cell
- * settles (4.10 V reads ~87%, 4.00 V ~77%). */
+ * Volts are what we actually write, so the percentage is DERIVED from them
+ * rather than written down beside them. The old table said 75/85/100 against
+ * 4.00/4.10/4.20 V while a comment two lines up admitted 4.10 V reads ~87% —
+ * the label and the hardware disagreed by four points, in writing, and the
+ * charge countdown inherited it: it counted down to "85%" while the gauge sailed
+ * through 86 and 87 with the charger still working, then withdrew its estimate
+ * early because the target had notionally been passed. One source of truth
+ * removes the whole class. */
 static int chg_mode_pct(int mode) {
-    switch (mode) {
-        case CHG_LIFESPAN: return 75;
-        case CHG_BALANCED: return 85;
-        default:           return 100;
-    }
+    int mv = chg_cv_mv(chg_mode_cv_code(mode));
+    if (mv <= 0) return 100;
+    /* The firmware's own voltage scale (HARDWARE.md §7: 3.30 V ~ 0%,
+     * 4.20 V ~ 100%). Rounded at BOTH steps — truncating the division first
+     * turns 77.8 into 77 and then into 75, which is how the old hand-written
+     * table's error survived a re-derivation that was supposed to remove it. */
+    int pct = ((mv - 3300) * 100 + 450) / 900;
+    pct = ((pct + 2) / 5) * 5;              /* to the nearest 5 */
+    return clampi(pct, 5, 100);
 }
 
 /* One line saying what the limit buys you. A bare "85%" states a number without
@@ -6100,6 +6809,16 @@ static void cfg_care_cb(lv_event_t *e) {
     if (s_cfg_care_sub) lv_label_set_text(s_cfg_care_sub, chg_mode_hint(s_chg_mode));
     s_req_chg_save = true;
     ESP_LOGI(TAG, "battery care -> charge to %d%%", chg_mode_pct(s_chg_mode));
+}
+
+/* No RELEASED guard, unlike the sliders in this card: a switch commits once on
+ * a tap rather than streaming values through a drag, so there is no label to
+ * re-lay out under a moving finger. The NVS write is still deferred to the main
+ * loop, because this callback holds the LVGL lock and flash erases must not. */
+static void cfg_chgeta_cb(lv_event_t *e) {
+    s_chg_eta_on = lv_obj_has_state(lv_event_get_target(e), LV_STATE_CHECKED);
+    s_req_chg_save = true;
+    ESP_LOGI(TAG, "charge countdown %s", s_chg_eta_on ? "ON" : "OFF");
 }
 
 /* Arms a single full charge, which reverts itself at charge-done. It is also
@@ -6292,7 +7011,16 @@ static void cfg_timer_cb(lv_timer_t *t) {
         label_set_fmt_changed(s_cfg_batt_val, "%d%%   %d mV%s", pct, s_batt_mv, power);
     }
     int drain = battery_drain_mv_h();
-    if (drain > 0) {
+    int eta = s_chg_eta_mins;
+    /* While current is flowing the drain figure is not just uninteresting, it
+     * is unmeasurable — the line said "drain measuring..." for the whole of
+     * every charge. The countdown is the number that belongs in that slot. */
+    if (eta > 0 && s_chg_eta_on) {
+        char eta_buf[32];
+        chg_eta_text(eta_buf, sizeof eta_buf, eta);
+        label_set_fmt_changed(s_cfg_batt_sub, "%s   /   %s", eta_buf,
+                              s_doze ? "dozing" : "active");
+    } else if (drain > 0) {
         label_set_fmt_changed(s_cfg_batt_sub, "drain  %d mV/h   /   %s", drain,
                               s_doze ? "dozing" : "active");
     } else {
@@ -6613,6 +7341,57 @@ static void build_control_app(lv_obj_t *scr) {
     s_cfg_time_sw = cfg_switch(c, "24-hour time", CFG_ACCENT_LOCK,
                                s_clock_24, cfg_clock_cb);
 
+    /* Grouped with the lock-screen toggles because that is where the user
+     * looks for it — this switch governs a caption on the LOCK SCREEN, and
+     * that is what someone reaching for it has in mind. It does also gate the
+     * CONTROL battery sub-line, which is the argument for putting it in
+     * BATTERY instead; that argument lost, because a setting belongs where it
+     * will be looked for rather than where its implementation reaches.
+     *
+     * "Charge countdown" was the first label and it was not one: it names an
+     * implementation, and a reader who has never seen the caption cannot tell
+     * from those two words what would appear or where. The sub-line says what
+     * it is in the words someone would use asking for it. Under ~34 characters
+     * so it stays one montserrat_20 line — cfg_text wraps, and a label that
+     * grows a second line re-lays out the card under the finger. */
+    s_cfg_chgeta_sw = cfg_switch(c, "Charge time estimate", CFG_ACCENT_LOCK,
+                                 s_chg_eta_on, cfg_chgeta_cb);
+    s_cfg_chgeta_sub = cfg_text(c, 0x64748B);
+    lv_obj_set_height(s_cfg_chgeta_sub, 26);   /* one montserrat_20 line, uncl'd */
+    lv_label_set_text(s_cfg_chgeta_sub, "show charging time estimation");
+
+    /* The desk-clock dim belongs in THIS card, not in DISPLAY, because it only
+     * ever acts while the lock screen's own mode is holding the panel awake.
+     * DISPLAY's brightness slider is the level this takes a percentage OF, not
+     * a sibling of it. */
+    s_cfg_aodim_sw = cfg_switch(c, "Dim in desk clock", CFG_ACCENT_LOCK,
+                                s_ao_dim_on, cfg_aodim_cb);
+    s_cfg_aodim_val = cfg_text(c, 0xC7D2E0);
+    lv_obj_set_height(s_cfg_aodim_val, 26);    /* one montserrat_20 line, uncl'd */
+    {
+        char buf[32];
+        ao_dim_label(buf, sizeof buf, s_ao_dim_s);
+        lv_label_set_text(s_cfg_aodim_val, buf);
+    }
+    s_cfg_aodim_sub = cfg_text(c, 0x64748B);
+    lv_obj_set_height(s_cfg_aodim_sub, 26);    /* one montserrat_20 line, uncl'd */
+    /* Says what undoes it. A control that darkens the screen on a timer needs
+     * to state its own escape hatch on the card, or the first time it fires it
+     * reads as the panel failing. Kept under ~34 characters so it stays one
+     * montserrat_20 line — cfg_text wraps, and a label that grows a second line
+     * re-lays out the card under the finger. */
+    lv_label_set_text(s_cfg_aodim_sub, "touch or a key brings it back");
+    /* Seven stops rather than a seconds range, and deliberately NOT faded while
+     * the switch above is off — unlike every other dependent control in this
+     * app. cfg_scroll_guard_cb() owns LV_OBJ_FLAG_CLICKABLE on every registered
+     * slider and re-asserts it on SCROLL_END, so cfg_button_live()'s fade would
+     * quietly come undone the first time the column moved, leaving a control
+     * that looks dead and is not. Choosing a delay before switching the feature
+     * on is harmless and it is remembered. */
+    s_cfg_aodim_sld = cfg_slider(c, 0, AO_DIM_STOPS - 1,
+                                 ao_dim_to_slider(s_ao_dim_s),
+                                 CFG_ACCENT_LOCK, 0xFDE68A, cfg_aodim_delay_cb);
+
     /* The middle key is the only one genuinely free on the lock screen: the
      * left key locks, the right key's HOLD is the desk-clock toggle, and PWR
      * falls through to nothing at all. Point it at an app.
@@ -6628,6 +7407,12 @@ static void build_control_app(lv_obj_t *scr) {
     s_cfg_lockkey_btn = cfg_button(c, "", CFG_ACCENT_LOCK, cfg_lockkey_cb);
     s_cfg_lockkey_val = lv_obj_get_child(s_cfg_lockkey_btn, 0);   /* its label */
     cfg_lockkey_label();
+    /* This button now sits under a slider, so it needs the same clearance the
+     * BATTERY card's does: cfg_slider adds CFG_EXT_CLICK (18 px) of invisible
+     * hit area below its track and cfg_button adds 6 px above itself, which is
+     * more than the card's 14 px gutter — finishing a drag near the bottom of
+     * the delay slider would otherwise fire this button. */
+    lv_obj_set_style_margin_top(s_cfg_lockkey_btn, 18, 0);
 
     /* ---- audio ---- */
     c = cfg_card(col, "AUDIO", CFG_ACCENT_SND);
@@ -6745,6 +7530,14 @@ static int64_t  s_pomo_tick_ms;
 static int64_t  s_pomo_done_at;
 static uint32_t s_pomo_sessions;
 
+/* Rotation lock: the cube stops selecting a duration, so a session survives
+ * being picked up, knocked, or carried to another desk. It is a plain toggle
+ * held only in RAM — never in the blob — so a reboot always comes back unlocked
+ * and the indicator on the glass is the only thing that has to be believed.
+ * Deliberately NOT cleared when a session ends: re-arming it for every session
+ * is the whole cost the feature exists to remove. */
+static bool     s_pomo_rot_lock;
+
 static bool     s_pomo_flat;
 static int64_t  s_pomo_flat_since;
 static int      s_pomo_last_rot = -1;
@@ -6756,6 +7549,7 @@ static int      s_acc_ref_x, s_acc_ref_y, s_acc_ref_z;
 static lv_obj_t *s_pomo_dial[POMO_SLOTS];
 static lv_obj_t *s_pomo_clock, *s_pomo_word, *s_pomo_ring, *s_pomo_arc, *s_pomo_fill;
 static lv_obj_t *s_pomo_tick, *s_pomo_hint;   /* the DONE state: green check + tap hint */
+static lv_obj_t *s_pomo_padlock;              /* rotation-lock indicator, hidden when off */
 static int s_pomo_drawn_rot = -1;
 
 typedef struct {
@@ -6833,6 +7627,16 @@ static int pomo_top_edge(void) {
     return (rot_from_base(s_base_rot) - s_rot + 4) & 3;
 }
 
+/* Which duration a start would use. Every caller that means "the duration the
+ * user chose" goes through here rather than through pomo_top_edge(), which
+ * means "which way is up" — the two are the same thing only while the cube is
+ * free to choose. Under rotation lock the pinned slot wins, so a tap on a
+ * sideways cube starts the session that is highlighted rather than the one
+ * gravity happens to point at. */
+static int pomo_pick_edge(void) {
+    return s_pomo_rot_lock ? s_pomo_sel : pomo_top_edge();
+}
+
 /* 0.1-degree units, clockwise. Edge i must be pre-rotated by -90*i so that
  * turning the cube by +90*i cancels it out and the label reads upright. */
 static int32_t pomo_edge_angle(int i) {
@@ -6868,9 +7672,14 @@ static void pomo_refresh(void) {
     int wr = pomo_top_edge();
     int32_t counter = (3600 - 900 * wr) % 3600;
 
-    /* Highlight whichever label is physically at the top. */
+    /* Highlight whichever label is physically at the top — or, under rotation
+     * lock, the slot that is actually pinned. The highlight has to track the
+     * SELECTION and not the top edge, or a locked cube turned 90 degrees lights
+     * a duration it is not going to run. Only `wr` may drive the counter-
+     * rotation below: the readout stays fixed to the reader either way. */
+    int hl = s_pomo_rot_lock ? s_pomo_sel : wr;
     for (int i = 0; i < POMO_SLOTS; i++) {
-        bool active = (i == wr);
+        bool active = (i == hl);
         lv_obj_set_style_text_color(s_pomo_dial[i],
             lv_color_hex(active ? 0xFFB454 : 0x33465C), 0);
         lv_obj_set_style_text_letter_space(s_pomo_dial[i], active ? 3 : 1, 0);
@@ -6895,17 +7704,35 @@ static void pomo_refresh(void) {
         static const lv_coord_t hx[4] = {   0,  86,   0, -86 };
         static const lv_coord_t hy[4] = {  86,   0, -86,   0 };
 
+        /* The padlock rides 95 px world-ABOVE the digits, in the band between
+         * the top dial label (its box ends at 146) and the digits (theirs
+         * starts at 27). Same sign convention as the word's table, negated:
+         * world-up is the direction world-down is not. */
+        static const lv_coord_t px[4] = {   0, -95,   0,  95 };
+        static const lv_coord_t py[4] = { -95,   0,  95,   0 };
+
         lv_obj_set_style_transform_rotation(s_pomo_clock, counter, 0);
         lv_obj_set_style_transform_rotation(s_pomo_word, counter, 0);
         lv_obj_set_style_transform_rotation(s_pomo_tick, counter, 0);
         lv_obj_set_style_transform_rotation(s_pomo_hint, counter, 0);
+        lv_obj_set_style_transform_rotation(s_pomo_padlock, counter, 0);
         lv_obj_align(s_pomo_clock, LV_ALIGN_CENTER, cx[wr], cy[wr]);
         lv_obj_align(s_pomo_word,  LV_ALIGN_CENTER, wx[wr], wy[wr]);
         lv_obj_align(s_pomo_hint,  LV_ALIGN_CENTER, hx[wr], hy[wr]);
+        lv_obj_align(s_pomo_padlock, LV_ALIGN_CENTER, px[wr], py[wr]);
 
         /* keep the depleting ring starting from world-up, not screen-up */
         lv_arc_set_rotation(s_pomo_arc,  (270 - 90 * wr + 360) % 360);
         lv_arc_set_rotation(s_pomo_fill, (270 - 90 * wr + 360) % 360);
+    }
+
+    /* The padlock is the only readout of a mode with no other trace on the
+     * glass, so it shows for as long as the mode is on rather than as a toast.
+     * Change-gated like every other flag flip in here: this runs at 4 Hz and
+     * the setters invalidate whether or not anything moved. */
+    if (lv_obj_has_flag(s_pomo_padlock, LV_OBJ_FLAG_HIDDEN) == s_pomo_rot_lock) {
+        if (s_pomo_rot_lock) lv_obj_remove_flag(s_pomo_padlock, LV_OBJ_FLAG_HIDDEN);
+        else                 lv_obj_add_flag(s_pomo_padlock, LV_OBJ_FLAG_HIDDEN);
     }
 
     int left = s_pomo_left_s < 0 ? 0 : s_pomo_left_s;
@@ -7009,12 +7836,50 @@ static void pomo_set_running(bool run, const char *why) {
     }
 }
 
+/* Rotation lock: the right key's HOLD verb in FOCUS. On BTN_LONG, so the banner
+ * is already up while the finger is still down and lifting is simply what
+ * leaves it — a tap can never reach this, by the same construction that keeps
+ * the lock screen's two right-key verbs apart.
+ *
+ * The banner counter-rotates and has its offset rotated by hand, for the reason
+ * every label in this app does (see pomo_refresh): FOCUS freezes the panel, so
+ * anything aligned in screen space reads sideways the moment the cube is
+ * turned — and a cube being turned is exactly when this gets pressed. It is the
+ * one caller of toast_show() that needs the object back. */
+static void pomo_rot_lock_toggle(void) {
+    s_pomo_rot_lock = !s_pomo_rot_lock;
+    ESP_LOGI(TAG, "pomodoro: rotation lock %s (pinned %d min)",
+             s_pomo_rot_lock ? "ON" : "OFF", s_pomo_min[s_pomo_sel]);
+    sfx_play(SFX_TICK);
+
+    if (!ui_lock()) return;
+    /* Put the padlock in or out now rather than up to 250 ms later, so the
+     * indicator and the banner arrive together instead of a beat apart. */
+    if (s_pomo_clock) pomo_refresh();
+
+    static const lv_coord_t bx[4] = {   0,  122,    0, -122 };
+    static const lv_coord_t by[4] = { 122,    0, -122,    0 };
+    int wr = pomo_top_edge();
+
+    lv_obj_t *toast = toast_show(s_pomo_rot_lock ? "ROTATION LOCK  ON"
+                                                 : "ROTATION LOCK  OFF",
+                                 s_pomo_rot_lock, bx[wr], by[wr]);
+    /* The pivot is in box coordinates and the box is LV_SIZE_CONTENT, so it is
+     * not known until layout has run. Measuring beats hardcoding a width the
+     * two strings would have to agree on. */
+    lv_obj_update_layout(toast);
+    lv_obj_set_style_transform_pivot_x(toast, lv_obj_get_width(toast) / 2, 0);
+    lv_obj_set_style_transform_pivot_y(toast, lv_obj_get_height(toast) / 2, 0);
+    lv_obj_set_style_transform_rotation(toast, (3600 - 900 * wr) % 3600, 0);
+    bsp_display_unlock();
+}
+
 static void pomo_tap_cb(lv_event_t *e) {
     /* Tap starts an idle timer and toggles a live one. DONE deliberately ignores
      * taps: the finish screen retires itself after POMO_DONE_MS, and a stray tap
      * on it would otherwise start a whole new session by accident. */
     switch (s_pomo_state) {
-    case POMO_IDLE:  pomo_begin(pomo_top_edge(), true); break;
+    case POMO_IDLE:  pomo_begin(pomo_pick_edge(), true); break;
     case POMO_RUN:   pomo_set_running(false, "tap");     break;
     case POMO_PAUSE: pomo_set_running(true,  "tap");     break;
     case POMO_DONE:
@@ -7023,7 +7888,7 @@ static void pomo_tap_cb(lv_event_t *e) {
          * grace period exists because someone tapping to pause right as the
          * timer hits zero would otherwise launch a fresh session unseen. */
         if (now_ms() - s_pomo_done_at > POMO_TAP_GRACE_MS) {
-            pomo_begin(pomo_top_edge(), true);
+            pomo_begin(pomo_pick_edge(), true);
         }
         break;
     default: break;
@@ -7126,6 +7991,50 @@ static void build_pomo_app(lv_obj_t *scr) {
     lv_obj_add_flag(s_pomo_hint, LV_OBJ_FLAG_HIDDEN);
     lv_obj_remove_flag(s_pomo_hint, LV_OBJ_FLAG_CLICKABLE);
 
+    /* The padlock is DRAWN, not set as text: LVGL's symbol set has no padlock
+     * glyph and the hud fonts are ASCII-only, so any character that looks like
+     * one renders as an empty box (CLAUDE.md). Two children under one container
+     * — an arc for the shackle, a rounded slab for the body — and the container
+     * carries the transform, which rotates the pair as a unit. It is 16x22, so
+     * the transient layer a rotated widget allocates is negligible. Amber
+     * regardless of state: the word below owns run/pause/done, this owns the
+     * mode, and colouring them alike would merge two independent readouts. */
+    s_pomo_padlock = lv_obj_create(scr);
+    lv_obj_set_size(s_pomo_padlock, 16, 22);
+    lv_obj_set_style_bg_opa(s_pomo_padlock, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(s_pomo_padlock, 0, 0);
+    lv_obj_set_style_pad_all(s_pomo_padlock, 0, 0);
+    lv_obj_set_style_transform_pivot_x(s_pomo_padlock, 8, 0);
+    lv_obj_set_style_transform_pivot_y(s_pomo_padlock, 11, 0);
+    lv_obj_remove_flag(s_pomo_padlock, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_remove_flag(s_pomo_padlock, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_align(s_pomo_padlock, LV_ALIGN_CENTER, 0, -95);
+    lv_obj_add_flag(s_pomo_padlock, LV_OBJ_FLAG_HIDDEN);
+
+    /* Shackle: the top half of a ring. LVGL angle 0 is 3 o'clock going
+     * clockwise, so 180->360 sweeps through 12 o'clock. Its lower legs run
+     * behind the body, which is what makes the two shapes read as one lock. */
+    lv_obj_t *sh = lv_arc_create(s_pomo_padlock);
+    lv_obj_set_size(sh, 12, 12);
+    lv_obj_align(sh, LV_ALIGN_TOP_MID, 0, 0);
+    lv_obj_remove_style(sh, NULL, LV_PART_KNOB);
+    lv_obj_remove_flag(sh, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_set_style_arc_width(sh, 2, LV_PART_MAIN);
+    lv_obj_set_style_arc_width(sh, 0, LV_PART_INDICATOR);
+    lv_obj_set_style_arc_color(sh, lv_color_hex(0xFFB454), LV_PART_MAIN);
+    lv_arc_set_bg_angles(sh, 180, 360);
+
+    lv_obj_t *body = lv_obj_create(s_pomo_padlock);
+    lv_obj_set_size(body, 16, 12);
+    lv_obj_align(body, LV_ALIGN_BOTTOM_MID, 0, 0);
+    lv_obj_set_style_bg_color(body, lv_color_hex(0xFFB454), 0);
+    lv_obj_set_style_bg_opa(body, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_width(body, 0, 0);
+    lv_obj_set_style_radius(body, 3, 0);
+    lv_obj_set_style_pad_all(body, 0, 0);
+    lv_obj_remove_flag(body, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_remove_flag(body, LV_OBJ_FLAG_SCROLLABLE);
+
     lv_obj_add_event_cb(scr, gesture_home_cb, LV_EVENT_GESTURE, NULL);
     lv_obj_add_flag(scr, LV_OBJ_FLAG_CLICKABLE);
     lv_obj_add_event_cb(scr, pomo_tap_cb, LV_EVENT_CLICKED, NULL);
@@ -7133,7 +8042,7 @@ static void build_pomo_app(lv_obj_t *scr) {
     s_pomo_drawn_rot = -1;
     s_pomo_active_ms = now_ms();
     if (s_pomo_state == POMO_IDLE) {
-        s_pomo_sel = pomo_top_edge();
+        s_pomo_sel = pomo_pick_edge();
         s_pomo_total_s = s_pomo_min[s_pomo_sel] * 60;
         s_pomo_left_s = s_pomo_total_s;
     }
@@ -7178,7 +8087,14 @@ static void pomo_poll(int64_t t) {
     /* --- turning the cube picks a duration and starts it --- */
     int wr = pomo_top_edge();
     if (s_pomo_last_rot < 0) s_pomo_last_rot = wr;
-    if (wr != s_pomo_last_rot && !flat) {
+    if (wr != s_pomo_last_rot && s_pomo_rot_lock) {
+        /* Locked: swallow the turn, but still bank it. Leaving s_pomo_last_rot
+         * stale would make unlocking fire the accumulated turn immediately —
+         * the release, not the press, would restart the session — which is the
+         * one thing this mode exists to prevent. No detent either: the tick
+         * would promise a change that is not coming. */
+        s_pomo_last_rot = wr;
+    } else if (wr != s_pomo_last_rot && !flat) {
         s_pomo_last_rot = wr;
         sfx_play(SFX_TICK);                       /* the detent */
         s_pomo_active_ms = t;
@@ -10064,17 +10980,92 @@ static void wall_txt(int slot, char *out, size_t n) {
     snprintf(out, n, WALL_DIR "/w%d.txt", slot);
 }
 
+/* Built-in fallback wallpaper: neon-lit palms on black (Andre Tan / Unsplash),
+ * 480x480, denoised and palette-quantised to 64 colours offline so it embeds
+ * at ~75 KB. It exists for the states where the pool has nothing to offer —
+ * no card, a fresh card, or every cached file failing validation — which used
+ * to mean a bare black lock screen. Served straight from flash as a C-array
+ * PNG: LodePNG's LV_IMAGE_SRC_VARIABLE path reads the dimensions out of the
+ * PNG bytes itself, so only data/data_size need filling, and the dsc must be
+ * a stable static because the decoded bitmap is cached keyed on its address. */
+#define WALL_DEFAULT_CREDIT "Andre Tan"
+extern const uint8_t wall_default_start[] asm("_binary_wall_default_png_start");
+extern const uint8_t wall_default_end[]   asm("_binary_wall_default_png_end");
+static lv_image_dsc_t s_wall_default_dsc;
+
+static const void *wall_default_src(void) {
+    if (!s_wall_default_dsc.data) {
+        /* EMBED_FILES emits no .align directive (verified in the generated
+         * .S — this build landed the blob at an odd address), and LodePNG
+         * reads the PNG dimensions through a uint32_t cast of the data
+         * pointer. The LX7 happens to tolerate unaligned loads, but the bytes
+         * are staged once into an aligned PSRAM copy rather than leaning on
+         * that; the raw flash pointer stays as the fallback if PSRAM is
+         * somehow exhausted. */
+        size_t n = (size_t)(wall_default_end - wall_default_start);
+        uint8_t *buf = heap_caps_malloc(n, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        if (buf) memcpy(buf, wall_default_start, n);
+        s_wall_default_dsc.header.cf = LV_COLOR_FORMAT_RAW;
+        s_wall_default_dsc.data      = buf ? buf : wall_default_start;
+        s_wall_default_dsc.data_size = (uint32_t)n;
+    }
+    return &s_wall_default_dsc;
+}
+
+/* Mean luminance (0-255) of a decodable image source, sampled on an 8 px grid.
+ * Goes through the ordinary decoder, so on a primed slot it is a cache hit
+ * costing microseconds, and on a miss it warms the exact cache entry the
+ * upcoming draw would have filled anyway — measuring is not an extra decode.
+ * Returns -1 when nothing decodes. Caller holds the LVGL lock. */
+static int wall_src_lum(const void *src) {
+    lv_image_decoder_dsc_t dsc;
+    if (lv_image_decoder_open(&dsc, src, NULL) != LV_RESULT_OK) return -1;
+    const lv_draw_buf_t *b = dsc.decoded;
+    if (!b || !b->data) { lv_image_decoder_close(&dsc); return -1; }
+    uint32_t bpp = lv_color_format_get_size(b->header.cf);
+    uint64_t sum = 0;
+    uint32_t n = 0;
+    for (uint32_t y = 0; y < b->header.h; y += 8) {
+        const uint8_t *row = b->data + (size_t)y * b->header.stride;
+        for (uint32_t x = 0; x < b->header.w; x += 8, n++) {
+            const uint8_t *p = row + (size_t)x * bpp;
+            if (bpp == 2) {                       /* RGB565, little-endian */
+                uint16_t c = (uint16_t)(p[0] | (p[1] << 8));
+                sum += (((c >> 11) & 0x1F) * 527 + 23) >> 6;
+                sum += (((c >> 5) & 0x3F) * 259 + 33) >> 6;
+                sum += ((c & 0x1F) * 527 + 23) >> 6;
+            } else {                              /* 3- or 4-byte true colour */
+                sum += p[0] + p[1] + p[2];
+            }
+        }
+    }
+    lv_image_decoder_close(&dsc);
+    return n ? (int)(sum / ((uint64_t)n * 3)) : -1;
+}
+
 /* A cached wallpaper is only usable if it really is a PNG. Earlier builds
  * saved a progressive JPEG under a .png name, and a stale bad file would
- * otherwise never be replaced — the fetch only runs when the file is missing. */
+ * otherwise never be replaced — the fetch only runs when the file is missing.
+ *
+ * Both ends are checked, and the tail matters more than the head: a download
+ * cut off mid-body has a perfect 8-byte signature and a missing tail, and with
+ * only the head checked such a file passed as usable forever — the "stale
+ * partial wallpaper" bug. Every PNG ends with the fixed 12-byte IEND chunk, so
+ * the last 8 bytes ("IEND" + its constant CRC) are as cheap to verify as the
+ * signature and prove the writer reached the end of the stream. */
 static bool wallpaper_valid(const char *path) {
-    static const uint8_t sig[8] = { 0x89, 'P', 'N', 'G', 0x0D, 0x0A, 0x1A, 0x0A };
+    static const uint8_t sig[8]  = { 0x89, 'P', 'N', 'G', 0x0D, 0x0A, 0x1A, 0x0A };
+    static const uint8_t iend[8] = { 'I', 'E', 'N', 'D', 0xAE, 0x42, 0x60, 0x82 };
     FILE *f = fopen(path, "rb");
     if (!f) return false;
-    uint8_t hdr[8] = {0};
-    size_t n = fread(hdr, 1, sizeof(hdr), f);
+    uint8_t hdr[8] = {0}, tail[8] = {0};
+    bool ok = fread(hdr, 1, sizeof(hdr), f) == sizeof(hdr) &&
+              memcmp(hdr, sig, sizeof(sig)) == 0 &&
+              fseek(f, -8, SEEK_END) == 0 && ftell(f) >= 8 &&
+              fread(tail, 1, sizeof(tail), f) == sizeof(tail) &&
+              memcmp(tail, iend, sizeof(iend)) == 0;
     fclose(f);
-    return n == sizeof(hdr) && memcmp(hdr, sig, sizeof(sig)) == 0;
+    return ok;
 }
 
 static void wall_scan(void) {
@@ -10304,7 +11295,14 @@ static bool asset_fetch_auth(const char *url, const char *path, const char *bear
             }
             esp_err_t err = esp_http_client_perform(c);
             int status = esp_http_client_get_status_code(c);
-            ok = (err == ESP_OK && status == 200);
+            /* perform() can return ESP_OK on a body that stopped short of the
+             * advertised Content-Length (a clean FIN mid-transfer). Renaming
+             * that file into place is how a partial image used to enter the
+             * pool as a permanent citizen, so the byte count is part of
+             * "success", not a nice-to-have. No length advertised = trusted,
+             * as before. */
+            ok = (err == ESP_OK && status == 200 &&
+                  (s_dl_total <= 0 || s_dl_got == s_dl_total));
             ESP_LOGI(TAG, "asset: HTTP %d, heap %u", status,
                      (unsigned)hp_free());
             esp_http_client_cleanup(c);
@@ -10428,6 +11426,16 @@ static bool unsplash_wallpaper(int slot) {
             wall_png(slot, dest, sizeof(dest));
             s_dl_state = DL_IMAGE;
             ok = asset_fetch(img, dest);
+            /* Both ends of the file, same test the boot scan applies. Catches
+             * what the length check cannot: a server that never advertised a
+             * Content-Length, or bytes that were never a PNG at all. A slot
+             * must not be marked usable on the transport's word alone. */
+            if (ok && !wallpaper_valid(dest)) {
+                ESP_LOGW(TAG, "slot %d: downloaded file failed PNG validation",
+                         slot);
+                remove(dest);
+                ok = false;
+            }
         }
         if (ok) {
             s_wall_have |= (uint16_t)(1u << slot);
@@ -10571,6 +11579,32 @@ static bool store_load(const char *id, void *data, size_t len) {
 #define TELEMETRY_PATH   BSP_SD_MOUNT_POINT "/logs/pwrlog3.csv"
 #define TELEMETRY_PERIOD 60000
 
+/* One-shot pool audit: decode every slot and log its mean luminance. "Black
+ * wallpaper" has indistinguishable causes from the glass (missing file, decoder
+ * rejection, or a genuinely dark photo under the lock screen's dim); this
+ * names which slot is which in one boot. Costs ~600 ms per slot, so it stays 0
+ * in commits — same contract as CFG_PERF_SCROLL_SELFTEST. */
+#define CFG_WALL_POOL_AUDIT 0
+
+#if CFG_WALL_POOL_AUDIT
+static void wall_pool_audit(void) {
+    for (int i = 0; i < WALL_SLOTS; i++) {
+        if (!(s_wall_have & (1u << i))) {
+            ESP_LOGW(TAG, "audit w%d: no file", i);
+            continue;
+        }
+        char lvpath[72];
+        wall_lv(i, lvpath, sizeof(lvpath));
+        if (!ui_lock()) return;
+        int lum = wall_src_lum(lvpath);
+        bsp_display_unlock();
+        if (lum < 0) ESP_LOGW(TAG, "audit w%d: DECODE FAILED", i);
+        else ESP_LOGI(TAG, "audit w%d: mean_lum=%d/255%s", i, lum,
+                      lum < 40 ? "  <- NEAR BLACK" : "");
+    }
+}
+#endif
+
 static void sd_init(void) {
     esp_err_t err = bsp_sdcard_mount();
     if (err == ESP_OK) {
@@ -10579,6 +11613,9 @@ static void sd_init(void) {
         store_init_dirs();
         remove(WALLPAPER_OLD);          /* pre-pool single wallpaper */
         wall_scan();
+#if CFG_WALL_POOL_AUDIT
+        wall_pool_audit();
+#endif
         wall_cache_prime();
     } else {
         ESP_LOGW(TAG, "no microSD (%s) — telemetry disabled", esp_err_to_name(err));
@@ -10962,6 +11999,27 @@ static void lock_refresh(void) {
         lv_obj_set_style_text_opa(s_lock_charge, 96, 0);
     }
     was_charging = s_batt_charging;
+
+    /* The countdown is hidden, not blanked, in every case the estimator has no
+     * answer for: the first minutes of a charge before a rate exists, a cube
+     * already past its limit, and a docked cube the cap has stopped. An empty
+     * label would still hold its line and open a gap under the percentage. */
+    int eta = s_chg_eta_mins;
+    if (eta > 0) {
+        char eta_buf[32];
+        chg_eta_text(eta_buf, sizeof eta_buf, eta);
+        for (char *p = eta_buf; *p; p++) *p = toupper((unsigned char)*p);
+        label_set_changed(s_lock_eta, eta_buf);
+    }
+    /* Suppressed while the now-playing panel is up, and that is a space fact
+     * rather than a preference: lock_clock_layout() raises the clock from
+     * CENTER-18 to CENTER-140 to make room for the card, which puts the
+     * hud_clock_48 digits at roughly y70..130. The percentage already occupies
+     * y42..64, so the band this caption needs no longer exists — it drew
+     * straight through the clock. The transport card wins the same way the
+     * clock yields to it, and the countdown is still on the CONTROL card. */
+    obj_set_hidden_changed(s_lock_eta, eta <= 0 || s_lock_np_up || !s_chg_eta_on);
+
     if (lv_arc_get_bg_angle_start(s_lock_batt_arc) != 0 ||
         lv_arc_get_bg_angle_end(s_lock_batt_arc) != arc_end) {
         lv_arc_set_bg_angles(s_lock_batt_arc, 0, arc_end);
@@ -11154,31 +12212,53 @@ static void lock_timer_cb(lv_timer_t *t) {
     lock_refresh();
 }
 
+/* Unlocking is a swipe up; a tap is not a verb here at all.
+ *
+ * Tap-to-unlock was in conflict with the desk-clock dim the moment that landed.
+ * A dimmed panel invites exactly one thing — touch it to see it properly — and
+ * that same touch was also the gesture that threw you into the drawer. The two
+ * cannot share an input: one is a glance, the other is a decision.
+ *
+ * So a tap now does nothing except be a touch, and that is enough. LVGL stamps
+ * `last_activity_time` on the press (lv_indev.c:268), which is one of the two
+ * terms in the main loop's `idle`, so the dim lifts on the next 20 ms pass
+ * without this function knowing the dim exists. Restating it here as an
+ * explicit un-dim call would be a second writer of a decision the idle
+ * expression already owns.
+ *
+ * The bottom-edge rule that gesture_home_cb applies everywhere else is
+ * deliberately NOT applied here. On an app screen the edge is what separates
+ * "go home" from an ordinary upward drag inside content; the lock screen has no
+ * scrollable content to be confused with, and a locked device you have to swipe
+ * from precisely the right 72 px is a device that feels stuck. */
+static void lock_gesture_cb(lv_event_t *e) {
+    lv_indev_t *indev = lv_indev_active();
+    if (!indev) return;
+    if (lv_indev_get_gesture_dir(indev) != LV_DIR_TOP) return;
+    /* Asleep, this cannot be reached: touch_origin_cb cancels the touch before
+     * a gesture can form, so a swipe on a dark panel wakes and stops there —
+     * the same rule a tap has always had. */
+    if (!s_screen_on) return;
+    /* LV_EVENT_GESTURE repeats for as long as the finger is down (pitfall #25),
+     * and app_open()'s own 250 ms debounce is not the right guard for a screen
+     * this one leaves. */
+    lv_indev_wait_release(indev);
+    ESP_LOGI(TAG, "lock: swipe up -> home");
+    app_request(APP_DRAWER);      /* always home, not "wherever you locked from" */
+}
+
 static void lock_tap_cb(lv_event_t *e) {
     /* Asleep? The first touch only wakes — it must not unlock, the same way a
-     * phone shows you the lock screen before letting you in. */
+     * phone shows you the lock screen before letting you in. Kept even though
+     * touch_origin_cb now raises the same request for every screen: that gate
+     * is registered inside an `if (ui_lock())` at boot, and the lock screen is
+     * the one place that must not fail open. */
     if (!s_screen_on) {
         s_req_wake = true;
         return;
     }
-    ESP_LOGI(TAG, "lock: screen tapped -> home");
-    if (now_ms() - s_lock_swipe_at < 500) return;   /* that was a swipe, not a tap */
-
-    /* The now-playing panel owns its own area. Its buttons consume their own
-     * clicks, but the gaps between them fell through to here and unlocked — so
-     * reaching for pause left the lock screen, and a swipe to dismiss was fighting
-     * the unlock for the same touch. The panel is 246 px tall against the bottom
-     * edge with a 42 px margin, so it starts at y192; below that the lock screen
-     * does nothing and the panel decides. Above it, tap still unlocks. */
-    if (s_lock_np_up) {
-        lv_indev_t *indev = lv_indev_active();
-        if (indev) {
-            lv_point_t pt;
-            lv_indev_get_point(indev, &pt);
-            if (pt.y >= 192) return;
-        }
-    }
-    app_request(APP_DRAWER);      /* always home, not "wherever you locked from" */
+    /* Deliberately empty otherwise. See lock_gesture_cb above: the tap's whole
+     * job is to have happened. */
 }
 
 /* The cover is a shortcut straight into MUSIC. Everywhere else on this screen
@@ -11207,10 +12287,15 @@ static void build_lock_screen(lv_obj_t *scr) {
     lv_obj_set_style_bg_color(scr, lv_color_hex(0x000000), 0);
     lv_obj_set_style_bg_grad_dir(scr, LV_GRAD_DIR_NONE, 0);
 
+    /* Test hook for the embedded fallback below: a full pool never exercises
+     * it naturally, and a decoder rejection is silent on the glass (pitfall
+     * #27), so this forces the no-usable-slot branch for one flashed run.
+     * Keep it 0 in commits, same contract as CFG_PERF_SCROLL_SELFTEST. */
+#define CFG_WALL_DEFAULT_TEST 0
     /* Consume the prepared next slot. A cache hit keeps the hidden render short,
      * while separating current from primed restores a new image on every lock. */
     int slot = -1;
-    if (s_sd_ok) {
+    if (s_sd_ok && !CFG_WALL_DEFAULT_TEST) {
         if (s_wall_primed >= 0 && (s_wall_have & (1u << s_wall_primed))) {
             slot = s_wall_primed;
         } else {
@@ -11218,11 +12303,48 @@ static void build_lock_screen(lv_obj_t *scr) {
         }
         s_wall_primed = -1;
     }
-    if (slot >= 0) {
+    /* No usable slot — no card, an empty pool, or everything failed the boot
+     * validation — falls back to the wallpaper embedded in the app image, so
+     * the lock screen is never bare black. Same widget, different source. */
+    {
         char lvpath[72];
-        wall_lv(slot, lvpath, sizeof(lvpath));
+        const void *src;
+        if (slot >= 0) {
+            wall_lv(slot, lvpath, sizeof(lvpath));
+            src = lvpath;               /* set_src copies the path string */
+        } else {
+            src = wall_default_src();
+        }
+        /* The old flat 43% dim (opa 110) kept the clock legible over bright
+         * photos — and erased dark ones. A nebula at mean luminance 29/255
+         * landed at an effective ~12/255, which from the glass is "black
+         * wallpaper, no image", indistinguishable from the missing-file bug it
+         * was reported as (an on-device audit found slots at 29, 44 and 51
+         * against the pool's space themes, all decoding perfectly). So dim
+         * toward a target effective brightness instead: a bright photo keeps
+         * the old 110 floor, one already at or below the target draws at full
+         * opacity. Measuring costs nothing extra — wall_src_lum() goes through
+         * the decoder, so it IS the cache warm-up the draw needed anyway. */
+        int lum = wall_src_lum(src);
+        uint32_t opa = 110;
+        if (lum > 0) {
+            opa = 255u * WALL_DIM_TARGET / (uint32_t)lum;
+            if (opa > 255) opa = 255;
+            if (opa < 110) opa = 110;
+        }
+        /* Names what is actually behind the clock. "Black wallpaper" has three
+         * different causes — missing file, decoder rejection, dark photo — and
+         * from the glass they are identical. One line per build separates them
+         * without a debug flash. */
+        ESP_LOGI(TAG, "lock wallpaper: %s%d, lum %d, opa %u",
+                 slot >= 0 ? "slot " : "default, slot ", slot, lum,
+                 (unsigned)opa);
         lv_obj_t *wall = lv_image_create(scr);
-        lv_image_set_src(wall, lvpath);
+        /* Also held file-scope: the desk-clock dim hides this to leave genuinely
+         * unlit black behind the clock. Its NULL row in app_open()'s teardown
+         * is part of that change, not an optional extra. */
+        s_lock_wall = wall;
+        lv_image_set_src(wall, src);
         /* Fill the panel, whatever size the file turned out to be.
          *
          * The request asks imgix for exactly 480x480, but what comes back is not
@@ -11234,20 +12356,25 @@ static void build_lock_screen(lv_obj_t *scr) {
         lv_obj_set_size(wall, BSP_LCD_H_RES, BSP_LCD_V_RES);
         lv_obj_center(wall);
         lv_image_set_inner_align(wall, LV_IMAGE_ALIGN_COVER);
-        lv_obj_set_style_image_opa(wall, 110, 0);
+        lv_obj_set_style_image_opa(wall, (lv_opa_t)opa, 0);
         lv_obj_remove_flag(wall, LV_OBJ_FLAG_CLICKABLE);
         s_wall_slot = slot;
 
         /* attribution for whatever is actually on screen, shown in STATUS */
-        char cpath[64];
-        wall_txt(slot, cpath, sizeof(cpath));
         s_wall_credit[0] = '\0';
-        FILE *cf = fopen(cpath, "r");
-        if (cf) {
-            if (fgets(s_wall_credit, sizeof(s_wall_credit), cf)) {
-                s_wall_credit[strcspn(s_wall_credit, "\r\n")] = '\0';
+        if (slot >= 0) {
+            char cpath[64];
+            wall_txt(slot, cpath, sizeof(cpath));
+            FILE *cf = fopen(cpath, "r");
+            if (cf) {
+                if (fgets(s_wall_credit, sizeof(s_wall_credit), cf)) {
+                    s_wall_credit[strcspn(s_wall_credit, "\r\n")] = '\0';
+                }
+                fclose(cf);
             }
-            fclose(cf);
+        } else {
+            snprintf(s_wall_credit, sizeof(s_wall_credit), "%s",
+                     WALL_DEFAULT_CREDIT);
         }
     }
 
@@ -11302,7 +12429,12 @@ static void build_lock_screen(lv_obj_t *scr) {
 
     s_lock_time = lv_label_create(scr);
     lv_obj_set_style_text_font(s_lock_time, &hud_clock_76, 0);
-    lv_obj_set_style_text_color(s_lock_time, lv_color_hex(0xE8FBFF), 0);
+    /* Recorded, not duplicated: the dim recolours this label to amber and has
+     * to put it back. A second copy of the constant over there would go stale
+     * the first time anyone retunes the clock's colour here, and the symptom
+     * would be a clock that comes back from a dim the wrong shade. */
+    s_lock_time_col = 0xE8FBFF;
+    lv_obj_set_style_text_color(s_lock_time, lv_color_hex(s_lock_time_col), 0);
     lv_label_set_text(s_lock_time, "--:--");
     lv_obj_align(s_lock_time, LV_ALIGN_CENTER, 0, -18);
 
@@ -11344,8 +12476,41 @@ static void build_lock_screen(lv_obj_t *scr) {
     lv_obj_align(s_lock_charge, LV_ALIGN_TOP_MID, 52, TOP_MARGIN + 13);
     lv_obj_add_flag(s_lock_charge, LV_OBJ_FLAG_HIDDEN);
 
+    /* Time to the charge limit, directly under the percentage it belongs to.
+     * The secondary cyan and not the bolt's green, on purpose: this is a
+     * caption on the number above it, not a second signal competing with the
+     * bolt for attention. It exists only while current is flowing, so the
+     * screen's resting state — clock, date, ring — is unchanged.
+     * Fixed width and centred text, like the date: the string changes length
+     * as the estimate falls and a natural-width label would shuffle sideways.
+     *
+     * Montserrat 14 rather than hud_text_18, which is a deliberate typeface
+     * break: hud_text_18 is the smallest Orbitron subset compiled in, so at
+     * 18 px the caption matched the percentage above it and the two read as
+     * one two-line block rather than a number and its note. There is no
+     * Orbitron 14 to reach for — subsetting one would be ~50 KB of flash for
+     * this one string — and montserrat_14 is already linked. Letter spacing
+     * drops to 1 with it: 2 was tuned for Orbitron's wider figures and looks
+     * gappy on Montserrat at this size. */
+    s_lock_eta = lv_label_create(scr);
+    lv_obj_set_style_text_font(s_lock_eta, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(s_lock_eta, lv_color_hex(0x5FD3EC), 0);
+    lv_obj_set_style_text_letter_space(s_lock_eta, 1, 0);
+    lv_obj_set_width(s_lock_eta, CONTENT_W);
+    lv_obj_set_style_text_align(s_lock_eta, LV_TEXT_ALIGN_CENTER, 0);
+    lv_label_set_text(s_lock_eta, "");
+    /* +44, not +34. The percentage occupies y42..60, so the old offset left a
+     * 4 px gap that read as a collision; this gives 10 px of clear space and
+     * still sits well above the clock's own band. */
+    lv_obj_align(s_lock_eta, LV_ALIGN_TOP_MID, 0, TOP_MARGIN + 44);
+    lv_obj_add_flag(s_lock_eta, LV_OBJ_FLAG_HIDDEN);
+
     lv_obj_add_flag(scr, LV_OBJ_FLAG_CLICKABLE);
     lv_obj_add_event_cb(scr, lock_tap_cb, LV_EVENT_CLICKED, NULL);
+    /* Not gesture_home_cb: that one requires the swipe to start in the bottom
+     * 72 px, which is the right rule for a screen with content to scroll and
+     * the wrong one for a locked device. See lock_gesture_cb. */
+    lv_obj_add_event_cb(scr, lock_gesture_cb, LV_EVENT_GESTURE, NULL);
 
     s_lock_slow = 0;
     s_lock_pointer_down = false;
@@ -11442,28 +12607,32 @@ static void always_on_toggle(void) {
 
     if (!ui_lock()) return;
     lock_refresh();                          /* recolours the base ring */
+    toast_show(s_always_on ? "ALWAYS ON SCREEN  ON"
+                           : "ALWAYS ON SCREEN  OFF", s_always_on, 0, 118);
+    bsp_display_unlock();
+}
 
-    lv_obj_t *toast = lv_label_create(lv_screen_active());
-    lv_obj_set_style_text_font(toast, &hud_text_18, 0);
-    lv_obj_set_style_text_letter_space(toast, 3, 0);
-    lv_obj_set_style_text_color(toast,
-        lv_color_hex(s_always_on ? 0xF59E0B : 0x7C8AA5), 0);
-    lv_obj_set_style_bg_color(toast, lv_color_hex(0x08131C), 0);
-    lv_obj_set_style_bg_opa(toast, 235, 0);
-    lv_obj_set_style_pad_all(toast, 14, 0);
-    lv_obj_set_style_radius(toast, 14, 0);
-    lv_obj_set_style_border_width(toast, 1, 0);
-    lv_obj_set_style_border_color(toast,
-        lv_color_hex(s_always_on ? 0xF59E0B : 0x33465C), 0);
-    lv_label_set_text(toast, s_always_on ? "ALWAYS ON SCREEN  ON"
-                                         : "ALWAYS ON SCREEN  OFF");
-    lv_obj_align(toast, LV_ALIGN_CENTER, 0, 118);
-    /* fade_out only animates opacity — it does NOT delete, so without the
-     * delayed delete every toggle would leave an invisible label behind.
-     * Deleting an object cancels animations bound to it, so this is still safe
-     * if the lock screen is torn down before the timer elapses. */
-    lv_obj_fade_out(toast, 900, 900);
-    lv_obj_delete_delayed(toast, 1900);
+/* Pocket lock: hold the LEFT key on the lock screen to stop touch waking the
+ * panel. For a cube going into a bag or a coat pocket, where the alternative is
+ * a screen lit against fabric for the length of a commute.
+ *
+ * Same key, two verbs, kept apart the way the right key's two are: a short
+ * press still sleeps the panel, because BTN_SHORT only fires on a release that
+ * beat LONG_PRESS_MS while BTN_LONG fires with the finger still down. So the
+ * hold can never also sleep, and a tap can never toggle this.
+ *
+ * Only touch is refused, and only while the panel is off. Keys are untouched —
+ * they are the way back in, and unlike the glass they are not what a pocket
+ * leans on. The gate itself lives at the single consumer of s_req_wake rather
+ * than in the two touch callbacks that raise it, so neither of them has to know
+ * this mode exists. */
+static void pocket_lock_toggle(void) {
+    s_pocket_lock = !s_pocket_lock;
+    ESP_LOGI(TAG, "pocket lock %s", s_pocket_lock ? "ON" : "OFF");
+
+    if (!ui_lock()) return;
+    toast_show(s_pocket_lock ? "POCKET LOCK  ON"
+                             : "POCKET LOCK  OFF", s_pocket_lock, 0, 118);
     bsp_display_unlock();
 }
 
@@ -11495,6 +12664,16 @@ static bool app_back(void) {
         }
         return false;
     }
+    if (s_app == APP_POMO) {
+        /* Consumed, and deliberately consumed to do NOTHING. The fallthrough
+         * from here is Home, and Home tore the screen out from under a running
+         * countdown on the key most likely to be brushed while the cube is
+         * being turned. FOCUS is left the two ways every app can be left — the
+         * middle key, and the swipe up this screen already carries — so the tap
+         * costs nothing by being inert, and the right key's meaning here is now
+         * entirely in its hold. */
+        return true;
+    }
     if (s_app == APP_DAYS && s_days_qr_panel &&
         !lv_obj_has_flag(s_days_qr_panel, LV_OBJ_FLAG_HIDDEN)) {
         if (ui_lock()) {
@@ -11525,13 +12704,11 @@ static void app_action(void) {
         sp_send(s_sp_playing ? SP_CMD_PLAY : SP_CMD_PAUSE);
         break;
     case APP_POMO:
-        if (s_pomo_state == POMO_RUN || s_pomo_state == POMO_PAUSE) {
-            pomo_log("cancelled");
-            s_pomo_state = POMO_IDLE;
-            s_pomo_left_s = s_pomo_total_s;
-            sfx_play(SFX_PAUSE);
-            ESP_LOGI(TAG, "pomodoro: cancelled");
-        }
+        /* Was cancel-session. Cancel had no indicator and no undo, and it sat
+         * on the one key a hand finds while turning the cube; rotation lock is
+         * what that hold is for now. Nothing else binds cancel — a session is
+         * ended by letting it finish or by leaving it paused. */
+        pomo_rot_lock_toggle();
         break;
     case APP_DAYS:
         /* Hold right = refresh now. */
@@ -11580,6 +12757,23 @@ static void app_open(int idx) {
         s_req_ble_off = true;
     }
 
+    /* Lift the desk-clock dim BEFORE nav_fade_begin(), which captures
+     * s_bright_applied as the level to ramp back to — entering it dimmed would
+     * hand the incoming screen the dim level permanently, with nothing left on
+     * the glass to explain why.
+     *
+     * The wallpaper pointer is dropped first so the lift is brightness-only.
+     * That widget is about to be deleted a few lines below, so un-hiding it
+     * would buy an ~80 ms lit full-screen repaint of an image nobody will ever
+     * see, immediately before the fade-out. (The teardown block below still
+     * nulls it too — this is the load-bearing one, that one is the rule.)
+     *
+     * This is what covers the screen changes with no finger behind them: the
+     * lock screen's middle-key shortcut, the PET rebuild driven from the main
+     * loop, and the self-test walk. */
+    s_lock_wall = NULL;
+    ao_dim_set(false);
+
     bool reveal = nav_fade_begin();
     if (!ui_lock()) {
         if (reveal) rot_fade_end();
@@ -11614,6 +12808,9 @@ static void app_open(int idx) {
     s_cfg_lockkey_val = NULL; s_cfg_lockkey_btn = NULL;
     s_cfg_pick = NULL; s_cfg_picklist = NULL; s_cfg_pickmore = NULL;
     s_cfg_always_sw = NULL; s_cfg_rings_sw = NULL;
+    s_cfg_aodim_sw = NULL; s_cfg_aodim_sld = NULL;
+    s_cfg_aodim_val = NULL; s_cfg_aodim_sub = NULL;
+    s_cfg_chgeta_sw = NULL; s_cfg_chgeta_sub = NULL;
     s_cfg_bright_val = NULL;
     s_cfg_batt_bar = NULL;
     s_cfg_batt_val = NULL; s_cfg_batt_sub = NULL;
@@ -11652,7 +12849,7 @@ static void app_open(int idx) {
     s_sp_spin = NULL; s_sp_chip = NULL;
     s_sp_scr = NULL; s_sp_bg_drawn = 0;
     s_pomo_clock = NULL; s_pomo_word = NULL;
-    s_pomo_tick = NULL; s_pomo_hint = NULL;
+    s_pomo_tick = NULL; s_pomo_hint = NULL; s_pomo_padlock = NULL;
     s_pomo_ring = NULL; s_pomo_arc = NULL; s_pomo_fill = NULL;
     for (int i = 0; i < POMO_SLOTS; i++) s_pomo_dial[i] = NULL;
     s_days_today = NULL; s_days_time = NULL; s_days_num = NULL;
@@ -11663,8 +12860,10 @@ static void app_open(int idx) {
     lock_snapshot_clear();
     s_lock_time = NULL; s_lock_date = NULL; s_lock_meridiem = NULL;
     s_lock_batt = NULL;
-    s_lock_charge = NULL; s_lock_ring = NULL; s_lock_inner_ring = NULL;
+    s_lock_charge = NULL; s_lock_eta = NULL;
+    s_lock_ring = NULL; s_lock_inner_ring = NULL;
     s_lock_batt_arc = NULL; s_lock_ao_ring = NULL;
+    s_lock_wall = NULL;     /* already dropped at the top; kept for the rule */
     s_lock_np = NULL;
     s_lock_np_art = NULL; s_lock_np_ph = NULL;
     s_lock_np_track = NULL; s_lock_np_prev = NULL; s_lock_np_play = NULL;
@@ -12221,7 +13420,15 @@ void app_main(void) {
             }
             bsp_display_unlock();
         }
-        app_open(APP_DRAWER);
+        /* Boot lands on the LOCK screen, not the drawer. A cube that has just
+         * been powered on or reflashed is in exactly the state waking from
+         * sleep leaves it in, and that path has always landed here — coming up
+         * on the drawer instead meant a reboot was the one way to find the
+         * device already unlocked, which is both inconsistent and the wrong
+         * default for something that spends its life on a desk. It also means
+         * the desk-clock dim and its wallpaper blackout are reachable from a
+         * cold boot without touching anything. */
+        app_open(APP_LOCK);
         log_mem("ui-built");
 
 
@@ -12402,6 +13609,20 @@ void app_main(void) {
 
         if (key_used) {
             /* consumed by MUSIC; the global bindings sit this one out */
+        } else if (s_app == APP_LOCK && kleft == BTN_LONG) {
+            /* Ahead of the plain LEFT branch, not inside the APP_LOCK branch
+             * below it: that branch is only reached when LEFT produced nothing,
+             * so putting it there would make this unreachable — the exact shape
+             * of the bug that once made the lock screen's right-key hold dead
+             * code. A short press still sleeps the panel; the two verbs cannot
+             * collide, because BTN_SHORT only fires on a release that beat
+             * LONG_PRESS_MS and BTN_LONG fires with the finger still down.
+             *
+             * On a cube with CFG_SNAP_CHORD on, arming a lobe screenshot
+             * (LEFT held, then MIDDLE) passes through 800 ms of held LEFT and
+             * so also toggles this. Dev-only, and visible when it happens. */
+            ESP_LOGI(TAG, "LEFT hold on lock -> pocket lock toggle");
+            pocket_lock_toggle();
         } else if (kleft == BTN_SHORT || kleft == BTN_LONG) {
             ESP_LOGI(TAG, "LEFT -> lock");
             lock_engage();
@@ -12414,6 +13635,30 @@ void app_main(void) {
             if (kright == BTN_LONG) {
                 ESP_LOGI(TAG, "RIGHT hold on lock -> desk clock toggle");
                 app_action();
+            }
+            /* Same key, other verb: a quick press shuffles the wallpaper. No
+             * clash with the hold is possible by construction — BTN_SHORT only
+             * fires on a release that beat LONG_PRESS_MS, and BTN_LONG fires
+             * while the finger is still down, so lifting quickly can never
+             * toggle desk clock and holding through 800 ms can never shuffle.
+             * Rebuilding the lock screen is the existing change-the-picture
+             * path: it consumes the primed slot (a cache hit, so the hidden
+             * render stays short), re-arms the primer for the next press, and
+             * the nav fade hides the full-frame repaint no TE pin can make
+             * coherent. app_open()'s 250 ms debounce absorbs key mashing. */
+            if (kright == BTN_SHORT) {
+                /* Only when there is a different picture to show: two-plus in
+                 * the pool, or one that arrived while the embedded default was
+                 * up. Otherwise the rebuild would fade out and back in on the
+                 * same image, which reads as a glitch rather than a shuffle. */
+                int have = __builtin_popcount(s_wall_have);
+                if (have > 1 || (have == 1 && s_wall_slot < 0)) {
+                    ESP_LOGI(TAG, "RIGHT tap on lock -> next wallpaper");
+                    app_open(APP_LOCK);
+                } else {
+                    ESP_LOGI(TAG, "RIGHT tap on lock ignored: %d wallpaper(s)",
+                             have);
+                }
             }
             /* Second exception, and an opt-in the rule above did not anticipate
              * rather than a hole in it: the middle key does nothing at all here
@@ -12467,14 +13712,52 @@ void app_main(void) {
                 s_last_btn = t;               /* reset the clock, don't re-fire */
                 lock_engage();
             }
+
+            /* Desk-clock dim. Its own branch, deliberately outside the if/else
+             * above: those two decide whether to CHANGE state (lock, sleep) and
+             * are mutually exclusive, while this one describes the panel during
+             * the state that always-on exists to hold still. It is one
+             * expression re-evaluated every pass rather than a pair of
+             * enter/exit rules, because that makes "every exit path restores"
+             * structural instead of a list somebody has to keep complete —
+             * always-on switched off, the panel asleep, FOCUS opened, a finger
+             * on the glass, the feature switched off in CONTROL: each of them
+             * just makes this false on the next 20 ms pass.
+             *
+             * s_app != APP_POMO because FOCUS already owns a dim and two owners
+             * of one output fight (pitfall #23's shape, applied to brightness).
+             * It is NOT enough that FOCUS pins activity while a session runs:
+             * POMO_IDLE does not, so on a cube parked on an unstarted FOCUS
+             * both timers run down on the same screen and every pass would
+             * write the other's level to 0x51, forever. FOCUS wins there
+             * because its dim is the one that knows the cube has been picked
+             * up — it watches the accelerometer, this only watches idle.
+             *
+             * Runs before pomo_poll() and before the s_req_bright_apply write
+             * further down this loop, so a touch restores in the same pass that
+             * observed it rather than one pass later. */
+            ao_dim_set(s_ao_dim_on && s_always_on && s_screen_on &&
+                       s_app != APP_POMO &&
+                       idle > (int64_t)s_ao_dim_s * 1000);
         }
 
         if (s_req_wake) {                 /* touch-to-wake, still locked */
             s_req_wake = false;
-            s_last_btn = t;
-            if (!s_screen_on) {
-                ESP_LOGI(TAG, "touch wake (stays locked)");
-                screen_toggle_power();
+            /* Pocket lock refuses the wake AND the idle stamp. Stamping anyway
+             * would be the quiet half of the bug: a cube riding against fabric
+             * raises this flag continuously, so s_last_btn would be pinned to
+             * now forever and the sleep timer could never run down again if the
+             * mode were switched off with the panel lit. The flag is still
+             * consumed rather than left set — it is a request that was answered
+             * with no, not one still waiting. */
+            if (s_pocket_lock) {
+                if (!s_screen_on) ESP_LOGD(TAG, "touch ignored (pocket lock)");
+            } else {
+                s_last_btn = t;
+                if (!s_screen_on) {
+                    ESP_LOGI(TAG, "touch wake (stays locked)");
+                    screen_toggle_power();
+                }
             }
         }
 
@@ -12534,7 +13817,7 @@ void app_main(void) {
          * touch sample. The flag is cleared only when the write actually lands —
          * clearing it up front would drop the request on a lock timeout, or
          * whenever it arrived while the panel was off or dimmed. */
-        if (s_req_bright_apply && s_screen_on && !s_pomo_dimmed) {
+        if (s_req_bright_apply && s_screen_on && !s_pomo_dimmed && !s_ao_dimmed) {
             if (bright_apply(s_bright)) s_req_bright_apply = false;
         }
 
@@ -12864,9 +14147,19 @@ void app_main(void) {
                     strftime(clock, sizeof(clock), "%H:%M:%S", &tinfo);
                 }
             }
-            ESP_LOGI(TAG, "uptime=%llds clock=%s scr=%d idle=%lu/%llds wifi=%s%d screen=%s batt=%d%% %dmV%s%s cap=%dmV%s fps=%u.%u "
+            /* Pocket lock earns a place here because its whole symptom is an
+             * absence — "the touchscreen stopped working" — with nothing on the
+             * glass to contradict that. One token turns a debug session into a
+             * grep. It prints only when on, so a healthy line is unchanged.
+             *
+             * The desk-clock dim is here for exactly the same reason: from the
+             * glass "the screen went dim on its own" is indistinguishable from
+             * a brightness bug, and this token separates them without a flash. */
+            ESP_LOGI(TAG, "uptime=%llds clock=%s scr=%d%s%s idle=%lu/%llds wifi=%s%d screen=%s batt=%d%% %dmV%s%s cap=%dmV%s fps=%u.%u "
                           "rot=%d sd=%lu pet[%s f%d %d/%d m%d]%s",
                      (long long)(t / 1000), clock, (int)s_app,
+                     s_pocket_lock ? " POCKET" : "",
+                     s_ao_dimmed ? " AODIM" : "",
                      (unsigned long)lv_display_get_inactive_time(NULL),
                      (long long)((t - s_last_btn) / 1000),
                      s_wifi_up ? "up" : "down", wifi_rssi(),
