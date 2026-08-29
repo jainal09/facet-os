@@ -78,7 +78,12 @@ the pitfalls index compiled perfectly.
 - The three side keys have one global contract (see ARCHITECTURE.md). Do not
   give a key an app-specific meaning outside `app_action()` / `app_back()`.
 - The lock screen is deliberately sparse: clock, date, battery ring. No status
-  text, no photo credit. Attribution goes in the CONTROL app.
+  text, no photo credit. Attribution goes in the CONTROL app. The one text
+  exception is the charge countdown under the percentage, and it earns the seat
+  by being **transient** — it exists only while current is actually flowing and
+  vanishes the moment the cap terminates the charge, so the resting screen is
+  unchanged. Anything proposed for this screen has to clear that bar, not merely
+  cite this exception.
 - **On-screen strings must be pure ASCII.** `lv_font_montserrat_14` carries ASCII
   plus LVGL's own `LV_SYMBOL_*` glyphs and nothing else, so a typographic
   character renders as an empty box — `·` and `—` are the easy mistakes, and

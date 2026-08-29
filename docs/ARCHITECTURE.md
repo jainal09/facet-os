@@ -120,7 +120,23 @@ loop runs at 120 ms while dozing and cannot see two consistent samples of a
 The lock screen is a deliberate partial exception, and the shape of it is worth
 copying rather than re-deriving. Home and tap-back are disabled there — the
 touchscreen is how you unlock, and a key must not bypass that — but the **hold**
-still reaches `app_action()`, where `case APP_LOCK` toggles desk-clock mode.
+still reaches `app_action()`, where `case APP_LOCK` toggles desk-clock mode, and
+a **quick press** of the same right key shuffles the wallpaper. The two verbs
+cannot collide by construction: `BTN_SHORT` only fires on a release that beat
+`LONG_PRESS_MS`, and `BTN_LONG` fires while the finger is still down, so lifting
+quickly can never toggle desk clock and holding through 800 ms can never
+shuffle. The shuffle is a plain lock-screen rebuild — it consumes the primed
+next slot, re-arms the primer, and rides the nav fade that hides any full-frame
+repaint — and it is skipped when the pool has nothing different to show, because
+a fade-out-and-back to the same image reads as a glitch rather than a shuffle.
+
+A tap can also be **faster than the debouncer**: down on one 20 ms poll, up by
+the next, so no debounced "pressed" sample ever exists and the release completes
+nothing. `btn_poll()` treats the pair of opposite raw edges as a completed
+`BTN_SHORT` — real contact bounce settles in under ~10 ms, so a high sample a
+full poll after a low one means the finger genuinely lifted. Without that, the
+fastest taps (exactly the ones a wallpaper-shuffle key invites) silently did
+nothing.
 
 Getting that wrong is easy: the dispatch was originally one
 `else if (s_app != APP_LOCK)` around the whole key block, which silently made
@@ -128,6 +144,16 @@ the `APP_LOCK` branch of `app_action()` unreachable. The handler existed, the
 enum matched, it compiled clean, and nothing happened when the key was pressed.
 If a key action does nothing, check that the dispatcher can *reach* the handler
 before debugging the handler.
+
+**FOCUS consumes the right key's tap and spends its hold on rotation lock.**
+Both go through the sanctioned hooks rather than through a special case in the
+dispatcher — `app_back()` returns true for `APP_POMO` and does nothing, and
+`app_action()` toggles the lock — so the contract above still describes the
+dispatch exactly. The tap is consumed *to be inert*: its fallthrough was Home,
+which tore the screen out from under a running countdown on the key a hand
+finds while turning the cube. FOCUS is still left by the middle key or the
+swipe up it already carries. The hold used to cancel the session; nothing binds
+cancel now, and a session is ended by letting it finish or by leaving it paused.
 
 **MUSIC is the one app that rebinds the keys**, and it takes all three: left
 raises the volume, right lowers it, middle mutes. A remote whose volume lives in
@@ -169,10 +195,20 @@ different times, one of which learned about a later flag.
 | any app | left key | lock screen |
 | lock screen | left key | panel off + doze |
 | panel off | any key **or** touch | panel on, still locked — the press is swallowed |
-| lock screen, screen on | tap | drawer (home), never back to the previous app |
+| lock screen, screen on | **swipe up, from anywhere** | drawer (home), never back to the previous app |
+| lock screen, screen on | tap | nothing but reset idle — which is what lifts the dim |
 | lock screen | right hold | toggle always-on (desk clock) |
+| lock screen | right quick press | next wallpaper (skipped when nothing different to show) |
+| FOCUS | right hold | toggle rotation lock (the cube stops picking a duration) |
+| FOCUS | right tap | nothing — consumed so it cannot fall through to Home |
 | FOCUS, session running | `lv_display_trigger_activity()` each tick | never idles out; dims via brightness instead |
 | FOCUS, session finished | — | stays put: DONE holds the screen on (always-on or not) until a tap starts the next session or the user navigates away |
+| lock screen, always-on holding it lit | idle > the CONTROL delay, dim enabled | panel to 12% of the user's level **and** the wallpaper hidden |
+| any other screen, always-on holding it lit (not FOCUS) | idle > the CONTROL delay, dim enabled | panel to 12% of the user's level; content untouched |
+| always-on, dimmed | touch, any key, or anything that resets idle | full level, wallpaper back — same pass, not the next one |
+| always-on, dimmed | always-on switched off, FOCUS opened, feature switched off in CONTROL | full level, wallpaper back |
+| always-on, dimmed | left key (sleep) | panel off + doze; the dim is dropped on the way down, so the next wake is not black-with-no-wallpaper |
+| FOCUS, always-on | — | FOCUS's own dim owns the panel there; the desk-clock dim never runs on `APP_POMO` |
 
 **The invariant everything rests on: the panel only ever sleeps from the lock
 screen.** Nothing enforces it. It holds because auto-lock always moves to
@@ -217,12 +253,46 @@ The wallpaper pipeline, which is the template for any future asset:
 2. Parse that JSON from **PSRAM**, so a ~10 KB response never competes for
    internal heap.
 3. Request the image at exactly 480×480 and stream it through the HTTP event
-   callback into `<name>.part`, renaming on success. A failed download therefore
-   cannot leave a corrupt file behind.
-4. Verify the PNG signature before using a cached file — a fetch that only runs
-   "if the file is missing" would otherwise keep a bad file forever.
+   callback into `<name>.part`, renaming on success. "Success" includes the byte
+   count: `perform()` can return `ESP_OK` on a body that stopped short of the
+   advertised Content-Length (a clean FIN mid-transfer), and renaming that file
+   into place was how a partial image entered the pool as a permanent citizen.
+4. Verify the PNG at **both ends** before using it — the 8-byte signature and
+   the trailing IEND chunk. A fetch that only runs "if the file is missing"
+   would otherwise keep a bad file forever, and a truncated download has a
+   perfect signature and a missing tail, so the head alone proves nothing. The
+   same test runs on every downloaded file before its slot is marked usable,
+   and on every cached file at boot, which also purges partials left by older
+   firmware.
 5. Call `lv_image_cache_drop()` after replacing a file at a path LVGL has
    already decoded, or it keeps serving the old bitmap.
+
+**The lock screen dims the wallpaper adaptively, not by a flat opacity.** The
+original flat opa 110 (~43%) kept the clock legible over bright photos — and
+erased dark ones: with themes like "deep space nebula" in `UNSPLASH_QUERY`, an
+on-device audit found slots at mean luminance 29, 44 and 51 out of 255, all
+decoding perfectly, all rendering as "black wallpaper, no image" under the flat
+dim. That report is indistinguishable from a missing-file bug from the glass,
+which is what it was mistaken for. `build_lock_screen()` now measures the mean
+luminance of the chosen image (`wall_src_lum()` — it goes through the ordinary
+decoder, so on a primed slot it is a cache hit and on a miss it IS the draw's
+cache warm-up, never an extra decode) and dims toward `WALL_DIM_TARGET`
+effective brightness: bright photos keep the old 110 floor, photos already at
+or below the target draw at full opacity. One log line per lock build names the
+slot, luminance and opacity so the next "black wallpaper" report is a grep, not
+a debug flash. `CFG_WALL_POOL_AUDIT` in `main.c` (keep 0 in commits) decodes
+and measures every slot at boot when the whole pool needs naming at once.
+
+When the pool has nothing usable at all — no card, a fresh card, or everything
+failing validation — the lock screen falls back to a wallpaper **embedded in
+the app image** (`assets/wall_default.png`, neon-lit palms by Andre Tan /
+Unsplash, ~75 KB) instead of bare black. It is palette-quantised to 64 colours
+and denoised offline to embed small, and served as a C-array PNG through
+LodePNG's `LV_IMAGE_SRC_VARIABLE` path — staged once into an aligned PSRAM copy,
+because `EMBED_FILES` guarantees no alignment and the decoder reads the PNG
+header through a `uint32_t` cast. `CFG_WALL_DEFAULT_TEST` in `main.c` forces
+that branch for one flashed run (keep it 0 in commits), since a full pool never
+exercises it naturally.
 
 ### The wallpaper pool
 
@@ -317,6 +387,49 @@ The helper is guarded on current state, so a transition that does not apply is a
 no-op. That is what lets the two triggers coexist: a session paused by tap is not
 disturbed by the cube then being set down.
 
+**Rotation lock turns the input off without turning the app off.** Hold the
+right key and the cube stops selecting a duration: the session survives being
+picked up, knocked, or carried to another desk. It is the exception that proves
+the app's own rule — orientation is input here, and this is the switch for that
+input, so it is not a mode the rest of the firmware has any equivalent of.
+
+Four things it does *not* do, each a decision rather than an omission:
+
+- **It does not pin the panel.** The readout still counter-rotates, because it
+  is fixed to the reader and always was. Only the *selection* is frozen. Two
+  things read `pomo_top_edge()` for two different questions, and separating
+  them is the whole implementation: `wr` still means "which way is up" and
+  drives every rotation, while `pomo_pick_edge()` means "which duration the
+  user chose" and is what a tap starts from. The dial highlight moves to the
+  second, or a locked cube turned 90° lights a duration it will not run.
+- **It does not stop flat-means-pause.** That is a different gesture with a
+  different verb, and pausing costs nothing — it is the *restart* that loses a
+  session. The name the feature was asked for settles it: laying a cube down is
+  not rotating it.
+- **It does not clear itself.** Not at DONE, not on cancel, not on leaving the
+  app. Re-arming it for every session is the cost the feature exists to remove.
+  It lives only in RAM and never in the blob, so a reboot always comes back
+  unlocked and the padlock on the glass is the only thing to believe.
+- **It does not let a swallowed turn accumulate.** `s_pomo_last_rot` is banked
+  even while locked. Leaving it stale would fire every turn made during the
+  lock the instant it came off — the release, rather than any press, restarting
+  the session, which is precisely what the mode exists to prevent.
+
+The indicator is **drawn, not typed**: LVGL's symbol set carries no padlock and
+the hud fonts are ASCII-only, so any character that looks like one renders as an
+empty box. It is an `lv_arc` shackle over a rounded slab in a 16×22 container
+that carries the transform, which rotates the pair as a unit for a transient
+layer small enough not to matter. It sits 95 px world-*above* the digits, in the
+band between the top dial label and the readout, and it is amber in every state
+— the word below owns run/pause/done, this owns the mode, and colouring them
+alike would merge two independent readouts into one.
+
+The banner confirming the toggle counter-rotates like everything else here, and
+measures itself with `lv_obj_update_layout()` before setting its pivot: the
+pivot is in box coordinates, the box is `LV_SIZE_CONTENT`, and hardcoding a
+width both strings would have to agree on is the kind of constant that goes
+stale silently.
+
 **The finish screen is persistent.** It used to retire to the lock screen after
 7 s, which meant the glance that mattered — "did it finish?" — usually found a
 clock. Now DONE shows a green check where the digits were, and after a short
@@ -361,6 +474,63 @@ transitions. Progress runs from the date the countdown was saved to the target;
 its bar and headline interpolate from cyan through violet and amber to coral as
 the target approaches. Today, local time, the target, and the saved message all
 remain useful when the broker is unavailable.
+
+## PET: a life the cube simulates and the phone dresses
+
+The pet is two things with a hard boundary between them: an **engine** — file-
+scope state ticked ~1 Hz from the main loop, alive on every screen — and a
+**view** (`build_pet_app`), which renders whatever the engine says and never
+owns truth. The FOCUS pattern taken further: the session there outlives the
+screen; the pet outlives *power*, because every duration in it is anchored to
+wall-clock time the RTC makes trustworthy from early boot.
+
+**Authority is split by who is good at what.** The broker owns what the owner
+DESIGNS — name, species, world, theme, hat, sleep window, birthday, weather
+city — behind a `cfg_ver` the cube uses as its whole re-apply gate. The cube
+owns the life actually LIVED — stage, meters, care mistakes, stardust — and
+reports it up (`POST /pet/st`, hourly, on app close, and on events) so the
+phone page shows a live pet. The report's response carries the current
+`cfg_ver`, so a state push doubles as a drift check and a design saved on the
+phone is noticed in minutes, not on the 2 h fetch cycle. All of it rides the
+DAYS keep-alive handle on the net task; the net task never touches the blob —
+it publishes a parsed config into a staging struct the engine consumes on its
+own tick (the same publish/snapshot discipline DAYS uses, and the same
+main-loop-only store_save rule the DAYS PSRAM-stack crash taught).
+
+**Care is the Tamagotchi Uni model with the pressure where it is fair.** Two
+coupled meters (hunger, happiness) decay per stage; a need raises a cue, a cue
+ignored for 15 minutes becomes one care mistake, and mistakes pick the adult
+form while childhood happiness (an EWMA) picks the teen. The window only
+counts down while the pet is awake AND the screen is on — mistakes never
+accrue where nobody could have seen the ask, which is both the no-guilt rule
+from the research and what makes offline time safe to credit. Crediting is
+capped at 4 days of decay (a cube found in a drawer resumes hungry-but-alive)
+but promotion uses wall time uncapped, so a pet hatches and grows while away
+exactly like the 1996 toy. Sustained adult neglect is departure, not death;
+the way home is a coax-back ritual on the designer page, and the apology text
+deliberately never leaves the phone — only the completed gesture travels.
+
+**The cube is the joystick.** Tilt walks the pet downhill — the gravity
+component along the screen edge, read through `rot_from_base()` so all eight
+mounting calibrations work, analog so steeper is faster; shake hops it; the
+panel rotation pins while PET is open (FOCUS gates the same commit) so the
+ground cannot rotate out from under a walk. The IMU polls at 50 Hz only
+inside PET; see HARDWARE.md pitfalls #32 and #33 for the two ways this went
+wrong first.
+
+**The designer QR lives under the pet's name.** Same single-use-code flow as
+DAYS (`/pet/link` → `/pet/session`); the page shows every option as a picture
+— species, worlds, themes and hats are drawn, not named — because a dropdown
+reading "WORLD 2" asks the user to already know the answer. Closing the QR on
+the cube forces the fetch, and the panel says so, because a sync with no
+visible acknowledgement reads as a design that was lost.
+
+The blob is v2 (~100 B, natural alignment, no packing — int64s at odd offsets
+are not worth a smaller file); v1 blobs migrate in place, mapping age onto the
+stage table so the original astronaut kept its life. Species can be vector
+(parameterised builders) or pixel sprites the broker renders from character
+grids into LVGL RGB565 `.bin` sheets — frames stacked vertically, each frame
+sized under the one-flush budget by construction.
 
 ## MUSIC: a remote for whatever is already playing
 
@@ -817,6 +987,24 @@ LVGL's indev does honour it, but local styles beat the theme's grey, so the fade
 has to be explicit. `IMU_FORCE_ABSENT` exists to make that branch testable in one
 build cycle rather than never.
 
+**That fade must not be applied to a slider, and the desk-clock delay slider is
+where that surfaced.** It would have been the obvious treatment for a control
+whose feature switch is off, but `cfg_scroll_guard_cb()` owns
+`LV_OBJ_FLAG_CLICKABLE` on every *registered* slider and re-asserts it on
+`SCROLL_END` — so `cfg_button_live()`'s fade comes undone the first time the
+column moves, leaving a control that looks dead and is not. The delay slider
+therefore stays live whatever its switch says; choosing a delay before enabling
+the feature is harmless and it is remembered.
+
+Two smaller traps that the same card re-found: any button placed **under** a
+slider needs an extra `margin_top` (`cfg_slider` adds 18 px of invisible hit
+area below its track, `cfg_button` 6 px above itself, and the card's gutter is
+14) — the lock-screen middle-key button needed it once the delay slider landed
+above it. And `CFG_SLIDER_MAX` overflowing is a **silent** downgrade rather than
+an error: `cfg_slider()` just skips registering, and the unregistered slider
+then commits a value whenever a finger lands on it to arrest a scroll. It is
+kept at 6 against four sliders for that reason.
+
 ## The bezel pop-out
 
 Press a side key and the black bezel beside it swells into the screen, the way
@@ -904,6 +1092,120 @@ Two states.
 
 Desk-clock mode suppresses the auto-sleep entirely, so the panel stays lit.
 
+### The desk-clock dim: fewer lit pixels, not just dimmer ones
+
+**It fades, and the reason is interaction rather than looks.** A panel that
+drops in one frame has already happened by the time you notice it, so the only
+thing left to do is wonder whether the cube is broken. A 2.4 s ramp is an
+announcement with a window inside it, and a touch anywhere in that window calls
+the whole thing off. The ramp is quantised to 24 steps rather than run off the
+20 ms loop tick because every step is a `0x51` write taking the LVGL lock from
+the main task while the lock screen's own 16 ms timer runs — pitfall #13's
+contended case. Free-running would be ~88 lock acquisitions in 2.4 s. Restoring
+is deliberately *not* faded: a fade out is the device announcing something, a
+fade in would be the device answering your finger slowly.
+
+**Tap-to-unlock had to go, and the dim is what killed it.** A dimmed panel
+invites exactly one thing — touch it to see it properly — and that same touch
+was also the gesture that threw you into the drawer. One is a glance, the other
+is a decision, and they cannot share an input. Unlocking is now a **swipe up
+from anywhere**; a tap does nothing but be a touch, which is enough, because
+LVGL stamps `last_activity_time` on the press and that is one of the two terms
+in the main loop's `idle`. The dim lifts on the next 20 ms pass without
+`lock_tap_cb` knowing the dim exists. The bottom-edge rule `gesture_home_cb`
+applies everywhere else is deliberately not applied here: on an app screen the
+edge separates "go home" from a drag inside content, and the lock screen has no
+content to confuse it with.
+
+**Burn-in is the AMOLED-specific risk, and the blackout made it worse before it
+made it better.** A desk clock holds the same digits in the same pixels for
+hours, which is the textbook OLED case; the wallpaper at least used to reshuffle
+everything underneath on each lock build, and hiding it leaves nothing but
+static elements. So while dimmed the content walks a slow eight-point ring at
+±4 px, one step a minute. 4 px because burn-in is driven by the *edges* of a
+static luminance step, and moving a glyph by a third of its stroke width is what
+stops one column of pixels carrying the whole duty cycle.
+
+That drift is applied to the screen's **children, never to the screen** — see
+[HARDWARE.md pitfall #36](HARDWARE.md#10-pitfalls-index). A screen has no
+parent, and `lv_obj_refr_pos()` returns before it ever reads `translate_x/y`, so
+the obvious one-line version is a silent no-op that no hardware test could have
+caught. Walking the children keeps what made a whole-screen shift attractive:
+everything moves together so nothing drifts out of alignment, and a widget added
+later joins in without knowing.
+
+**The clock also goes amber while dimmed** (`0xE8FBFF` → `0xF59E0B`). AMOLED
+power is per-subpixel; blue is both the least efficient primary and the fastest
+to age, and near-white drives all three near full. Total subpixel drive falls
+738 → 414 for the same legibility. It is also already what desk-clock mode means
+on this device — `s_lock_ao_ring` is the same amber. The normal colour is
+recorded into `s_lock_time_col` at build time rather than duplicated as a
+constant, so retuning the clock cannot leave it coming back the wrong shade.
+
+**None of this is measured.** The saving is argued from how the panel works, not
+from evidence, and HARDWARE.md §7b is deliberately untouched because it opens
+"All measured on hardware". The number that would settle it is mV/hour from
+`pwrlog3.csv`: one hour always-on dimmed against one hour always-on bright.
+
+
+
+Always-on is the only mode that can hold this panel lit for hours, and on an
+AMOLED that bill has two lines on it: emission per lit pixel, and how many
+pixels are lit. Dimming alone only pays the first. So after a configurable idle
+delay the dim does both — it drops `0x51` to **12% of the user's brightness**,
+and on the lock screen it **hides the wallpaper**, leaving the screen's own
+`0x000000` background. Those pixels are then genuinely off, not "a photo drawn
+darker", and what is left emitting is the clock, the date, the battery text and
+four hairline arcs. Dropping 230,400 photo pixels to a few thousand glyph pixels
+is the larger of the two savings and it is the one only this panel technology
+offers.
+
+The blackout is lock-screen-only, and it is scoped by construction rather than
+by an `if`: `s_lock_wall` is NULL on every other screen, so a cube parked on
+MUSIC by always-on gets the brightness half only. That is the right answer
+anyway — its content is the thing you asked to keep looking at. The now-playing
+card is likewise left alone: the wallpaper is decoration, the card is
+information, and a desk clock that hides what is playing is a different feature.
+
+Four things about it are worth not re-deriving:
+
+- **The depth is a percentage of the user's level**, not a flat constant and not
+  a `min()`, for the reasons written out at the FOCUS dim. The constants are the
+  same pair (12 / 3) because that is what was actually checked through this
+  cover glass, not because the two features were assumed identical.
+- **The delay is a stops table** — 10, 20, 30, 60 s, 2, 5, 10 min — persisted as
+  **seconds**, with the slider index derived at the UI boundary. A seconds
+  slider that can read "37" is worse than seven detents, and storing the index
+  would silently redefine every saved setting the day a stop is added.
+  Default 60 s, which is `AUTO_LOCK_MS` — the threshold this firmware already
+  treats as "nobody is here". FOCUS waits 120 s because you are sitting in front
+  of it; a desk clock is finished with you the moment you look away.
+- **Default ON.** The mode's only switch is a right-key hold on the lock screen,
+  so the person who turns always-on on has no reason to open CONTROL, and a
+  battery feature nobody finds is not a feature.
+- **The restore is one expression, not a set of exit rules.** The main loop
+  re-evaluates `dim enabled && always-on && screen on && not FOCUS && idle >
+  delay` every 20 ms pass, so "every exit path restores" is structural instead
+  of a list somebody has to keep complete. `screen_toggle_power()` and
+  `app_open()` clear it explicitly on top of that, because both destroy
+  something the dim was holding.
+
+**FOCUS wins on `APP_POMO`, and the exclusion is explicit.** It is not enough
+that a running session pins activity: `POMO_IDLE` does not, so on a cube parked
+on an unstarted FOCUS both timers run down on the same screen and each pass
+would write the other's level to `0x51` forever — pitfall #23's shape with
+brightness as the contended output. FOCUS keeps that screen because its dim is
+the one watching the accelerometer; this one only watches idle.
+
+Ordering inside the transition is load-bearing and looks wrong: brightness goes
+**down first, then** the wallpaper is hidden, and on the way back the wallpaper
+is repainted **while still dim** and only then is the level raised. Hiding or
+showing a full-screen image invalidates the whole viewport, which lands as
+fifteen sequential strips with no tear gate (HARDWARE.md §5); doing it under a
+3-12% panel is what makes the sweep invisible. It is the same trick
+`rotation_apply()` uses, and it calls `lv_refr_now()` for the same reason —
+an asynchronous repaint would land on the wrong side of the brightness write.
+
 Telemetry lands in `/sdcard/logs/pwrlog3.csv` once a minute and on every state
 change — the device cannot log to USB while on battery, which is exactly when
 the numbers matter. Track **mV per hour**; percentage moves far too coarsely to
@@ -913,16 +1215,34 @@ show an improvement over an hour.
 
 A cube on a desk is a cell held at 4.2 V forever, which is the fastest way to
 wear one out — roughly 300-500 cycles there against 1200-2000 at 4.0 V. CONTROL
-offers three charge targets, stated to the user as **100%**, **85%** (the
-default) and **75%** — internally 4.2 V, 4.1 V and 4.0 V.
+offers three charge targets, stated to the user as **100%**, **90%** (the
+default) and **80%** — internally 4.2 V, 4.1 V and 4.0 V.
 
-The control reads **"charge limit  85%"** with a one-line reason under it
+**Those percentages are derived from the volts, not written down beside them.**
+`chg_mode_pct()` computes them from the mode's own CV target on the firmware's
+voltage scale (HARDWARE.md §7: 3.30 V ~ 0%, 4.20 V ~ 100%), rounded to the
+nearest five. They used to be a hand-written table reading 75/85/100 while a
+comment two lines above it admitted 4.10 V reads ~87% — the label disagreed with
+the hardware by four points, in writing, and nobody noticed until a user asked
+how a cube capped at "85%" could be showing 86%.
+
+That error was not cosmetic; the charge countdown inherited it. Counting down to
+the *label* meant `remain = 85 - gauge` went negative while the charger was
+still working, so the caption withdrew several minutes early — and made one of
+its own tests unobservable, since "the caption disappears when charging
+terminates" could never be seen when the caption was already gone. The countdown
+now measures the distance in **millivolts against the CV target** and converts
+at 9 mV/point, which is what the PMU actually terminates on. Two independent
+fixes for one root cause: a percentage that was a second copy of a fact the
+volts already carried.
+
+The control reads **"charge limit  90%"** with a one-line reason under it
 ("stops early, less battery wear"). Three labelling attempts got there, and the
 failures are the useful part:
 
 - **"balanced 4.1V"** — asks the reader to learn a mapping before the setting
   means anything. Volts are an implementation detail; keep them in the log line.
-- **"charge to 85%"** — states a number without saying it is a *ceiling* or why
+- **"charge to 90%"** — states a number without saying it is a *ceiling* or why
   anyone would want one. A setting that needs a manual is mislabelled.
 - The slider originally ran Full→Lifespan, so **dragging right lowered the
   target**. Right-means-more is not negotiable on a control sitting under a
@@ -958,6 +1278,58 @@ Three consequences worth knowing:
 "CHARGE TO 100% ONCE" arms a single 4.2 V cycle that reverts itself at charge-done
 and survives a reboot. It is also the only way to re-calibrate the fuel gauge,
 which needs a complete cycle it otherwise never gets.
+
+**The charge countdown counts to the limit, and that is the whole feature.** The
+AXP2101 reports no time-to-full, so `chg_eta_track()` builds one from two
+different measurements, and keeping them straight is the thing to understand
+here. **Rate** comes from the gauge: milliseconds per `s_batt_pct` point,
+smoothed, because that is the signal that moves in usable steps. **Distance**
+comes from the ADC: millivolts to the CV target, at the 9 mV per point the
+firmware's own voltage scale implies. Rate is a gauge quantity, distance is a
+voltage one, and they are deliberately not the same number.
+
+That split is why the caption and the ring **can** disagree — an earlier version
+of this paragraph claimed they never could, which was true only while distance
+was also measured in gauge points. Counting in gauge points made the countdown
+vanish when the gauge crossed the label rather than when charging actually
+stopped, because the two cross at different moments; counting in millivolts ends
+it where the charger ends. The visible cost is that a cell can read 87% under a
+caption saying "TO 90%", which is the gauge and the voltage scale disagreeing by
+a couple of points near the top of the curve, not a bug in either. It reads
+"1H 05M TO 90%" on the lock screen and takes
+over the CONTROL drain line while charging, where the drain figure was not merely
+uninteresting but unmeasurable and read "measuring..." for the whole of every
+charge.
+
+Naming the target in the string is not decoration. A capped cube stops at 90%,
+so a bare "1h 05m" under a 62% ring reads as time to *full* — a moment that never
+arrives, which is precisely what the cap exists to prevent. The target comes from
+`chg_target_pct()`, one definition shared with the CONTROL card, and the one-shot
+overrides it exactly as `chg_cv_code()` resolves the same question in volts.
+
+Four properties keep it honest, and each answers a way the naive version lies:
+
+- **Each 1-point step is one rate sample, smoothed rather than averaged over the
+  session.** A session average cannot see the CV taper and would still promise
+  "6 min" half an hour after the current started falling.
+- **Only a single-point step counts as charge.** Polling is every 2 s and no real
+  rate covers two points in that, so a bigger jump is the gauge correcting itself
+  — dividing it out would fabricate a rate several times the true one. The
+  correction re-anchors and keeps the rate already learned.
+- **The first interval is discarded.** It starts wherever the cube happened to be
+  inside a point, so it is short by an unknown amount and would seed the whole
+  estimate optimistic. Nothing is shown until a second step lands, which is why a
+  fresh charge displays nothing for the first couple of points.
+- **A point in progress is charged for the time it has already taken**, and once
+  that exceeds any rate we would have learned the estimate is *withdrawn* rather
+  than inflated. Without the first half the number parks and counts nothing down;
+  without the second, a stalled charge grows an ever-larger figure nobody should
+  plan around.
+
+It is computed on the main task and published as one plain `int`
+(`s_chg_eta_mins`, -1 = no honest answer). The UI reads it from the LVGL task,
+and a 64-bit timestamp shared across the two can tear on a 32-bit core and paint
+a garbage frame.
 
 ## Layout
 

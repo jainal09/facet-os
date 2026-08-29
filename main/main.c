@@ -78,7 +78,6 @@ static const char *TAG = "funnel";
 #define PERF_PERIOD_MS    (3 * 1000)
 #define BATTERY_PERIOD_MS (2 * 1000)
 #define HTTPS_PERIOD_MS   (45 * 1000)
-#define PET_TICK_MS       (180 * 1000)  /* one stat point of decay (~5 h to empty) */
 
 /* Physical layout, per the label on the back of the board:
  *   leftmost  = BOOT / minus   GPIO0    (the strap; an ordinary pulled-up
@@ -240,10 +239,71 @@ static volatile bool    s_vbus;
 static volatile bool    s_bypass;           /* on USB, charge finished, cell idle */
 static volatile uint8_t s_chg_state;        /* reg 0x01[2:0] */
 
-/* pet state (persisted) */
-static int s_food = 80, s_fun = 75, s_nrg = 90;
-static uint32_t s_pet_age_min;
+/* ---- pet: persisted life (the engine lives near pet_load, below) ----
+ *
+ * The pet follows the FOCUS pattern taken further: the ENGINE is file-scope
+ * state ticked from the main loop on every screen, and survives power-off by
+ * being anchored to wall-clock time; the pet APP is only a view onto it. The
+ * broker is authoritative for what the owner DESIGNS (species, world, theme,
+ * name, sleep window — s_pet.cfg_ver tracks what has been applied); the cube
+ * is authoritative for the life actually lived (stage, meters, mistakes).
+ *
+ * Field order is largest-first so natural alignment needs no packing — a
+ * packed struct would put int64s at odd offsets, and this blob is accessed as
+ * ordinary struct members, not memcpy'd fields. */
+typedef struct {
+    int64_t  hatched_utc;        /* epoch seconds; RTC makes these trustworthy */
+    int64_t  stage_utc;          /* when the current stage began */
+    int64_t  tick_utc;           /* last minute credited — the offline anchor */
+    int64_t  seen_utc;           /* last owner interaction — departure timer */
+    int64_t  wx_utc;             /* weather fetch time; stale > 6 h = not drawn */
+    uint32_t seed;               /* personality, rolled once at egg creation */
+    uint32_t cfg_ver;            /* last broker config version applied */
+    uint32_t stardust;           /* step/mini-game currency */
+    uint32_t steps_today;
+    uint32_t day_stamp;          /* civil day steps_today belongs to */
+    uint16_t ver;                /* PET_BLOB_VER */
+    uint16_t cue_left_s;         /* awake-seconds before the cue is a mistake */
+    uint16_t mistakes;           /* lifetime care mistakes — pick the adult */
+    uint16_t sleep_start;        /* minutes from local midnight */
+    uint16_t sleep_end;
+    uint16_t bday;               /* month<<8|day, 0 = unset */
+    uint8_t  stage;              /* pet_stage_t */
+    uint8_t  form;               /* branch within the stage */
+    uint8_t  species, world, theme, hat;
+    uint8_t  hunger, happy;      /* the two coupled meters, 0..100 */
+    uint8_t  sick, poop;
+    uint8_t  cue;                /* active attention cue, PET_CUE_NONE = 0 */
+    uint8_t  snack_run;          /* consecutive snacks — the meal tradeoff */
+    uint8_t  happy_hist;         /* EWMA of happy, 0..100 — picks the teen */
+    uint8_t  wx;                 /* cached weather kind */
+    uint8_t  flags;
+    int8_t   wx_temp;
+    char     name[12];           /* ASCII, broker-set, default "PIP" */
+    /* v3 appends — append-only from here on, so a version bump is a prefix
+     * read plus zeroed tail, never a field-by-field migration. The spare
+     * bytes are the down payment on v4. */
+    uint32_t odo_m;              /* lifetime metres walked (10 px = 1 m) */
+    uint16_t laps;               /* full trips around the world */
+    uint16_t best_alt;           /* highest jetpack flight, metres */
+    uint8_t  spare[8];
+} pet_blob2_t;
+
+/* The v2 file is the struct without the appended tail: 100 payload bytes
+ * padded to 104. Frozen by assert so an innocent field reorder cannot
+ * silently orphan every saved pet. */
+#define PET_BLOB_V2_SIZE 104
+_Static_assert(offsetof(pet_blob2_t, odo_m) == 100, "v2 prefix moved");
+_Static_assert(sizeof(pet_blob2_t) == 120, "blob layout changed — bump the version");
+
+enum { PET_EGG = 0, PET_BABY, PET_CHILD, PET_TEEN, PET_ADULT, PET_AWAY };
+enum { PET_CUE_NONE = 0, PET_CUE_HUNGRY, PET_CUE_LONELY };
+
+static pet_blob2_t s_pet;
 static volatile bool s_pet_dirty;
+/* Sleep pressure, presentation-only: recomputable from the clock, so it is
+ * deliberately not part of the persisted blob. Resets mid-range on boot. */
+static int s_nrg = 75;
 
 /* Wi-Fi credentials in use, and a pending change from the setup screen */
 static char s_ssid[33];
@@ -324,8 +384,15 @@ static bool broker_fetch(const char *path, const char *xname, const char *xval,
                          uint8_t *buf, size_t cap, size_t *out_len);
 
 static lv_obj_t *s_lock_time, *s_lock_date, *s_lock_meridiem;
-static lv_obj_t *s_lock_batt, *s_lock_charge;
+static lv_obj_t *s_lock_batt, *s_lock_charge, *s_lock_eta;
 static lv_obj_t *s_lock_ring, *s_lock_inner_ring, *s_lock_batt_arc;
+static lv_obj_t *s_lock_ao_ring;      /* the desk-clock cue, amber */
+/* The wallpaper, kept as a file static only so the desk-clock dim can take it
+ * off the glass. On this panel a hidden full-screen photo is not "the photo
+ * drawn darker" — the 0x000000 screen behind it emits nothing at all, which is
+ * the half of the dim that lowering 0x51 cannot buy. NULL on every screen but
+ * the lock screen, and that is precisely what scopes the blackout to it. */
+static lv_obj_t *s_lock_wall;
 static uint8_t s_lock_charge_phase, s_lock_charge_div;
 
 /* Now-playing panel on the lock screen. Hidden unless Spotify actually has an
@@ -377,6 +444,10 @@ static bool s_stack_fallback;
  * because both the network task and the CONTROL screen are defined long before
  * it, and both need to see it. */
 #define WALL_SLOTS      12
+/* Effective on-glass brightness the lock wallpaper is dimmed toward (0-255
+ * mean). The dim keeps the clock legible over bright photos; a photo already
+ * at or below this draws at full opacity — see build_lock_screen(). */
+#define WALL_DIM_TARGET 55
 #define WALL_DIR        BSP_SD_MOUNT_POINT "/assets"
 
 static volatile bool s_req_wallpaper;
@@ -409,6 +480,11 @@ static void wall_service(void);
 static bool asset_fetch_auth(const char *url, const char *path, const char *bearer);
 static void power_set_doze(bool doze);
 static int  battery_drain_mv_h(void);
+
+/* Defined with the CONTROL card that presents it, but the charge-ETA tracker
+ * next to battery_poll() needs the same number to know what it is counting to.
+ * One definition of "the limit is 85%", not two. */
+static int  chg_mode_pct(int mode);
 
 /* The pool that actually matters, and the ONE definition of it.
  *
@@ -549,34 +625,382 @@ static void creds_save(const char *ssid, const char *pass) {
     nvs_close(h);
 }
 
-typedef struct {
+typedef struct {                     /* legacy v1 blob, read once to migrate */
     uint16_t ver;
     int16_t  food, fun, nrg;
     uint32_t age_min;
-} pet_blob_t;
-#define PET_BLOB_VER 1
+} pet_blob_v1_t;
+
+#define PET_BLOB_VER 3
+
+/* 1 for real life. 60 compresses the egg-to-adult arc into ~3.5 hours for a
+ * bench soak: durations divide by it, decay rates multiply by it. Keep it 1
+ * in commits, like the self-test defines. */
+#define PET_TIME_SCALE 1
+
+/* Nothing below trusts the clock until it reads as real. The RTC seeds it in
+ * early boot, so this only bites on a cold board with a drained RTC cell —
+ * where the honest answer is that no time passed that we can vouch for. */
+#define PET_EPOCH_MIN 1750000000LL
+
+typedef struct { uint32_t dur_min; uint8_t hunger_per_h, happy_per_h; } pet_stage_row_t;
+static const pet_stage_row_t s_pet_stages[] = {
+    [PET_EGG]   = { 30,          0, 0 },
+    [PET_BABY]  = { 24 * 60,     6, 5 },
+    [PET_CHILD] = { 2 * 24 * 60, 4, 4 },
+    [PET_TEEN]  = { 3 * 24 * 60, 4, 3 },
+    [PET_ADULT] = { 0,           3, 3 },   /* dur 0 = terminal */
+    [PET_AWAY]  = { 0,           0, 0 },
+};
+
+#define PET_CUE_WINDOW_S   (900 / PET_TIME_SCALE)     /* 15 awake-visible min */
+#define PET_CUE_COOLDOWN_S (1800 / PET_TIME_SCALE)
+#define PET_AWAY_AFTER_S   (3 * 86400 / PET_TIME_SCALE)
+
+/* Consumed by the main loop: an engine event (evolution, departure) wants the
+ * scene rebuilt if PET is on screen. The engine cannot call app_request()
+ * directly — it is defined much later in the file. */
+static volatile bool s_req_pet_rebuild;
+
+static const char *pet_stage_word(void) {
+    static const char *w[] = { "EGG", "BABY", "CHILD", "TEEN", "GROWN", "AWAY" };
+    return w[s_pet.stage <= PET_AWAY ? s_pet.stage : PET_ADULT];
+}
+
+static void pet_save(void);
+
+static void pet_fresh_egg(void) {
+    memset(&s_pet, 0, sizeof(s_pet));
+    s_pet.ver = PET_BLOB_VER;
+    s_pet.stage = PET_EGG;
+    s_pet.hunger = s_pet.happy = 70;
+    s_pet.happy_hist = 70;
+    s_pet.seed = esp_random();          /* personality, decided in the shell */
+    s_pet.sleep_start = 22 * 60;
+    s_pet.sleep_end = 7 * 60;
+    snprintf(s_pet.name, sizeof(s_pet.name), "PIP");
+    /* Timestamps stay 0 until the clock is real; pet_credit() stamps them. */
+}
 
 static void pet_load(void) {
-    pet_blob_t b;
-    if (store_load("pet", &b, sizeof(b)) && b.ver == PET_BLOB_VER) {
-        s_food = clampi(b.food, 0, 100);
-        s_fun  = clampi(b.fun,  0, 100);
-        s_nrg  = clampi(b.nrg,  0, 100);
-        s_pet_age_min = b.age_min;
+    pet_blob2_t b;
+    memset(&b, 0, sizeof(b));
+    bool have = store_load("pet", &b, sizeof(b)) && b.ver == PET_BLOB_VER;
+    if (!have && store_load("pet", &b, PET_BLOB_V2_SIZE) && b.ver == 2) {
+        /* v3 is v2 plus appended fields: prefix-read the old file, zero the
+         * tail, stamp the version. This is what append-only buys. */
+        memset((uint8_t *)&b + PET_BLOB_V2_SIZE, 0,
+               sizeof(b) - PET_BLOB_V2_SIZE);
+        b.ver = PET_BLOB_VER;
+        have = true;
     }
-    if (s_food + s_fun + s_nrg == 0) {
-        s_food = s_fun = s_nrg = 70;
-        ESP_LOGI(TAG, "pet had run flat — starting it fresh");
+    if (have) {
+        s_pet = b;
+        s_pet.name[sizeof(s_pet.name) - 1] = '\0';
+        ESP_LOGI(TAG, "pet restored: %s %s hunger=%d happy=%d mistakes=%d odo=%lum",
+                 s_pet.name, pet_stage_word(), s_pet.hunger, s_pet.happy,
+                 (int)s_pet.mistakes, (unsigned long)s_pet.odo_m);
+        return;
     }
-    ESP_LOGI(TAG, "pet restored: food=%d fun=%d nrg=%d age=%lumin",
-             s_food, s_fun, s_nrg, (unsigned long)s_pet_age_min);
+    pet_blob_v1_t v1;
+    if (store_load("pet", &v1, sizeof(v1)) && v1.ver == 1) {
+        /* The old astronaut lived through v1; keep the life, not just the
+         * numbers. Age places it on the stage table, three meters fold into
+         * two, and the stamps are back-dated so growth continues mid-arc. */
+        pet_fresh_egg();
+        s_pet.hunger = clampi(v1.food, 0, 100);
+        s_pet.happy  = clampi((v1.fun + v1.nrg) / 2, 0, 100);
+        s_pet.happy_hist = s_pet.happy;
+        uint32_t acc = 0, into = v1.age_min;
+        s_pet.stage = PET_ADULT;
+        for (int st = PET_EGG; st < PET_ADULT; st++) {
+            if (v1.age_min < acc + s_pet_stages[st].dur_min) {
+                s_pet.stage = st;
+                into = v1.age_min - acc;
+                break;
+            }
+            acc += s_pet_stages[st].dur_min;
+        }
+        time_t now = time(NULL);
+        if (now >= PET_EPOCH_MIN) {
+            s_pet.hatched_utc = now - (int64_t)v1.age_min * 60;
+            s_pet.stage_utc   = now - (int64_t)into * 60;
+            s_pet.tick_utc    = now;
+            s_pet.seen_utc    = now;
+        }
+        ESP_LOGI(TAG, "pet migrated from v1: %lumin old -> %s",
+                 (unsigned long)v1.age_min, pet_stage_word());
+        /* Persist v2 NOW: the card is mounted (load order guarantees it),
+         * and a migration that waits for the 60 s flush re-runs on any
+         * power cut in between. */
+        pet_save();
+        return;
+    }
+    pet_fresh_egg();
+    s_pet_dirty = true;
+    ESP_LOGI(TAG, "pet: a new egg appears");
 }
 
 static void pet_save(void) {
-    pet_blob_t b = { .ver = PET_BLOB_VER, .food = s_food, .fun = s_fun,
-                     .nrg = s_nrg, .age_min = s_pet_age_min };
-    store_save("pet", &b, sizeof(b));
+    store_save("pet", &s_pet, sizeof(s_pet));
     s_pet_dirty = false;
+}
+
+/* ---- broker handoff ----
+ *
+ * The net task and the engine never touch each other's state directly: the
+ * net task publishes a parsed config into a staging struct the engine
+ * consumes on its own tick, and the engine publishes a report snapshot the
+ * net task serialises — the DAYS publish/snapshot discipline, because both
+ * of tonight's owners live on different tasks. */
+typedef struct {
+    uint32_t ver;
+    uint16_t ss, se, bday;
+    uint8_t  species, world, theme, hat;
+    uint8_t  wx, coax, has_wx;
+    int8_t   wx_temp;
+    char     name[12];
+    char     sheet[8];
+} pet_cfg_msg_t;
+
+typedef struct {
+    uint32_t stardust, steps, seed;
+    int64_t  hatched;
+    uint16_t mistakes;
+    uint8_t  stage, form, hunger, happy, sick, poop, away;
+} pet_report_t;
+
+static pet_cfg_msg_t s_pet_cfg_in;
+static volatile bool s_pet_cfg_ready;
+static pet_report_t  s_pet_report;
+static volatile bool s_req_pet_push;
+static volatile bool s_req_pet_cfg = true;   /* first fetch rides the boot */
+/* Outcome of the most recent config fetch, for the QR panel's sync button:
+ * 0 none/pending, 1 landed, 2 failed. Written by the net task, consumed by
+ * the view; a single byte, so no lock. */
+static volatile uint8_t s_pet_cfg_result;
+static portMUX_TYPE  s_pet_net_lock = portMUX_INITIALIZER_UNLOCKED;
+
+static void pet_report_publish(void) {
+    pet_report_t r = {
+        .stardust = s_pet.stardust, .steps = s_pet.steps_today,
+        .seed = s_pet.seed, .hatched = s_pet.hatched_utc,
+        .mistakes = s_pet.mistakes, .stage = s_pet.stage, .form = s_pet.form,
+        .hunger = s_pet.hunger, .happy = s_pet.happy,
+        .sick = s_pet.sick, .poop = s_pet.poop,
+        .away = s_pet.stage == PET_AWAY,
+    };
+    portENTER_CRITICAL(&s_pet_net_lock);
+    s_pet_report = r;
+    portEXIT_CRITICAL(&s_pet_net_lock);
+    __atomic_store_n(&s_req_pet_push, true, __ATOMIC_RELEASE);
+}
+
+/* Runs on the engine's tick. Weather applies on every response (it changes
+ * under a constant version); the design applies only when the version moved,
+ * because applying it rebuilds the scene and cfg_ver is the whole gate. */
+static void pet_cfg_consume(void) {
+    if (!__atomic_load_n(&s_pet_cfg_ready, __ATOMIC_ACQUIRE)) return;
+    pet_cfg_msg_t m;
+    portENTER_CRITICAL(&s_pet_net_lock);
+    m = s_pet_cfg_in;
+    portEXIT_CRITICAL(&s_pet_net_lock);
+    __atomic_store_n(&s_pet_cfg_ready, false, __ATOMIC_RELEASE);
+
+    time_t now = time(NULL);
+    if (m.has_wx && now >= PET_EPOCH_MIN) {
+        s_pet.wx = m.wx;
+        s_pet.wx_temp = m.wx_temp;
+        s_pet.wx_utc = now;
+        s_pet_dirty = true;
+    }
+    if (m.coax && s_pet.stage == PET_AWAY) {
+        /* The doorstep meal worked. Meters restart mid-range: a returning
+         * pet is glad to be home, not fixed. */
+        s_pet.stage = PET_ADULT;
+        s_pet.hunger = s_pet.happy = 60;
+        if (now >= PET_EPOCH_MIN) { s_pet.seen_utc = now; s_pet.stage_utc = now; }
+        log_event("pet came home");
+        ESP_LOGI(TAG, "pet %s came home", s_pet.name);
+        s_pet_dirty = true;
+        s_req_pet_rebuild = true;
+        pet_report_publish();      /* the broker clears its coax flag on this */
+    }
+    if (m.ver == s_pet.cfg_ver) return;
+
+    if (m.name[0]) {
+        snprintf(s_pet.name, sizeof(s_pet.name), "%s", m.name);
+        /* The broker folds to ASCII; keep a hostile or stale deployment from
+         * feeding boxes to the subset fonts anyway. */
+        for (char *p = s_pet.name; *p; p++)
+            if ((unsigned char)*p < 0x20 || (unsigned char)*p > 0x7E) *p = '?';
+    }
+    s_pet.species     = m.species;
+    s_pet.world       = m.world;
+    s_pet.theme       = m.theme;
+    s_pet.hat         = m.hat;
+    s_pet.sleep_start = m.ss;
+    s_pet.sleep_end   = m.se;
+    s_pet.bday        = m.bday;
+    s_pet.cfg_ver     = m.ver;
+    s_pet_dirty = true;
+    s_req_pet_rebuild = true;
+    ESP_LOGI(TAG, "pet cfg v%lu applied: %s species=%d world=%d theme=%d hat=%d",
+             (unsigned long)m.ver, s_pet.name, s_pet.species, s_pet.world,
+             s_pet.theme, s_pet.hat);
+}
+
+/* ---- the life itself ---- */
+
+static int pet_minute_of_day(time_t t) {
+    struct tm ti;
+    localtime_r(&t, &ti);
+    return ti.tm_hour * 60 + ti.tm_min;
+}
+
+static bool pet_asleep_at(int mod) {
+    int ss = s_pet.sleep_start, se = s_pet.sleep_end;
+    if (ss == se) return false;
+    return ss < se ? (mod >= ss && mod < se) : (mod >= ss || mod < se);
+}
+
+static void pet_seen(void) {
+    time_t now = time(NULL);
+    if (now >= PET_EPOCH_MIN) s_pet.seen_utc = now;
+}
+
+/* Promotion runs on wall time, so a pet hatches, grows and evolves while the
+ * cube sits in a drawer — exactly like the 1996 toy. The teen is picked by
+ * how happy the childhood was; the adult by how few cues went unanswered. */
+static void pet_promote_check(time_t now) {
+    while (s_pet.stage < PET_ADULT) {
+        uint32_t dur = s_pet_stages[s_pet.stage].dur_min;
+        if (!dur || !s_pet.stage_utc) break;
+        int64_t dur_s = (int64_t)dur * 60 / PET_TIME_SCALE;
+        if (now - s_pet.stage_utc < dur_s) break;
+        s_pet.stage_utc += dur_s;
+        s_pet.stage++;
+        if (s_pet.stage == PET_TEEN)
+            s_pet.form = s_pet.happy_hist >= 67 ? 0 : (s_pet.happy_hist >= 34 ? 1 : 2);
+        else if (s_pet.stage == PET_ADULT)
+            s_pet.form = s_pet.mistakes <= 2 ? 0 : (s_pet.mistakes <= 6 ? 1 : 2);
+        else
+            s_pet.form = 0;
+        log_event(s_pet.stage == PET_BABY ? "pet hatched" : "pet evolved");
+        ESP_LOGI(TAG, "pet %s is now %s (form %d, happy_hist=%d, mistakes=%d)",
+                 s_pet.name, pet_stage_word(), s_pet.form,
+                 s_pet.happy_hist, (int)s_pet.mistakes);
+        s_pet_dirty = true;
+        s_req_pet_rebuild = true;
+        pet_report_publish();          /* evolutions reach the dashboard */
+    }
+}
+
+static void pet_credit(time_t now) {
+    if (s_pet.tick_utc == 0 || s_pet.tick_utc > now) {
+        /* First sighting of a real clock, or the clock moved backwards.
+         * Either way, credit nothing we cannot vouch for. */
+        s_pet.tick_utc = now;
+        if (!s_pet.hatched_utc) {
+            s_pet.hatched_utc = now;
+            s_pet.stage_utc   = now;
+            s_pet.seen_utc    = now;
+        }
+        s_pet_dirty = true;
+        return;
+    }
+    int64_t mins = (int64_t)(now - s_pet.tick_utc) / 60;
+    if (mins <= 0) return;
+
+    /* Decay is capped at 4 days of it: a cube found in a drawer resumes
+     * hungry-but-alive rather than instantly departed. Promotion and the
+     * departure check use wall time directly, so the cap never delays
+     * growing up — only starving. Decay pauses through the sleep window:
+     * the pet sleeps, it does not starve overnight. */
+    int64_t decay_mins = mins > 4 * 1440 ? 4 * 1440 : mins;
+    if (s_pet.stage >= PET_BABY && s_pet.stage <= PET_ADULT) {
+        static uint32_t hunger_acc, happy_acc, nrg_acc;
+        int mod = pet_minute_of_day(now - decay_mins * 60);
+        const pet_stage_row_t *row = &s_pet_stages[s_pet.stage];
+        for (int64_t i = 0; i < decay_mins; i++, mod = (mod + 1) % 1440) {
+            if (pet_asleep_at(mod)) {
+                if (++nrg_acc >= 3) { nrg_acc = 0; s_nrg = clampi(s_nrg + 1, 5, 100); }
+                continue;
+            }
+            hunger_acc += (uint32_t)row->hunger_per_h * PET_TIME_SCALE;
+            happy_acc  += (uint32_t)row->happy_per_h * PET_TIME_SCALE;
+            while (hunger_acc >= 60) { hunger_acc -= 60; s_pet.hunger = clampi(s_pet.hunger - 1, 0, 100); }
+            while (happy_acc >= 60)  { happy_acc -= 60;  s_pet.happy  = clampi(s_pet.happy - 1, 0, 100); }
+            if (++nrg_acc >= 8) { nrg_acc = 0; s_nrg = clampi(s_nrg - 1, 5, 100); }
+            s_pet.happy_hist = (uint8_t)((s_pet.happy_hist * 15 + s_pet.happy + 8) / 16);
+        }
+        s_pet_dirty = true;
+    }
+    s_pet.tick_utc = now;
+    pet_promote_check(now);
+
+    if (s_pet.stage == PET_ADULT && s_pet.hunger == 0 && s_pet.happy == 0 &&
+        s_pet.seen_utc && now - s_pet.seen_utc > PET_AWAY_AFTER_S) {
+        s_pet.stage = PET_AWAY;
+        log_event("pet left");
+        ESP_LOGW(TAG, "pet %s packed a tiny suitcase and left "
+                      "(unseen %llds, both meters empty)",
+                 s_pet.name, (long long)(now - s_pet.seen_utc));
+        s_pet_dirty = true;
+        s_req_pet_rebuild = true;
+        pet_report_publish();          /* the dashboard offers the coax-back */
+    }
+}
+
+/* The Uni-style care loop: a need raises a cue; a cue answered in time is
+ * bonding, a cue ignored for its whole window is one care mistake, and the
+ * mistakes pick which adult arrives. The window only counts down while the
+ * pet is awake AND the screen is on — mistakes never accrue where nobody
+ * could have seen the ask. That asymmetry is the no-guilt rule from the
+ * research, and it is also what makes offline time safe to credit. */
+static void pet_cue_service(time_t now) {
+    static time_t s_next_cue;
+    if (s_pet.stage < PET_BABY || s_pet.stage > PET_ADULT) return;
+    if (!s_screen_on || s_doze || pet_asleep_at(pet_minute_of_day(now))) return;
+
+    if (s_pet.cue == PET_CUE_NONE) {
+        if (now < s_next_cue) return;
+        if (s_pet.hunger < 25)     s_pet.cue = PET_CUE_HUNGRY;
+        else if (s_pet.happy < 25) s_pet.cue = PET_CUE_LONELY;
+        else return;
+        s_pet.cue_left_s = PET_CUE_WINDOW_S;
+        s_pet_dirty = true;
+        return;
+    }
+    /* Met by any route — feeding, playing, or decay reversing — it resolves
+     * silently; there is no wrong way to answer a need. */
+    if ((s_pet.cue == PET_CUE_HUNGRY && s_pet.hunger >= 40) ||
+        (s_pet.cue == PET_CUE_LONELY && s_pet.happy >= 40)) {
+        s_pet.cue = PET_CUE_NONE;
+        s_pet_dirty = true;
+        return;
+    }
+    if (s_pet.cue_left_s > 0) { s_pet.cue_left_s--; return; }
+    s_pet.mistakes++;
+    s_pet.cue = PET_CUE_NONE;
+    s_next_cue = now + PET_CUE_COOLDOWN_S;
+    s_pet_dirty = true;
+    ESP_LOGI(TAG, "pet: care mistake #%d", (int)s_pet.mistakes);
+}
+
+/* ~1 Hz from the main loop, on every screen, awake or dozing. */
+static void pet_engine_service(void) {
+    static int64_t s_last_ms;
+    int64_t t = now_ms();
+    if (t - s_last_ms < 1000) return;
+    s_last_ms = t;
+    /* Config applies even before the clock is trusted — a renamed pet does
+     * not need to know what time it is. */
+    pet_cfg_consume();
+    time_t now = time(NULL);
+    if (now < PET_EPOCH_MIN) return;
+    pet_credit(now);
+    pet_cue_service(now);
 }
 
 /* ---------------- Wi-Fi ---------------- */
@@ -1206,6 +1630,10 @@ static bool days_http_get(const char *path) {
     snprintf(auth, sizeof(auth), "Bearer %.72s", BROKER_TOKEN);
     esp_http_client_set_header(s_days_http, "Authorization", auth);
     esp_http_client_set_method(s_days_http, HTTP_METHOD_GET);
+    /* The pet sync POSTs on this same handle, and esp_http_client resends a
+     * stale body silently — post_data is never cleared automatically
+     * (HARDWARE.md 7f). Clear it before every GET. */
+    esp_http_client_set_post_field(s_days_http, NULL, 0);
 
     esp_err_t err = esp_http_client_perform(s_days_http);
     int status = esp_http_client_get_status_code(s_days_http);
@@ -1313,6 +1741,198 @@ static void days_service(void) {
     if (ok) s_days_last_ok_ms = t;
 }
 
+/* ---------------- PET broker sync ----------------
+ *
+ * Rides the DAYS client: same broker host, same task, same keep-alive handle,
+ * so a pet fetch after a countdown fetch costs 6 ms instead of a 390 ms
+ * handshake. The engine's side of this lives beside the pet blob
+ * (pet_cfg_consume / pet_report_publish). */
+
+#define PET_CFG_FETCH_MS (2 * 60 * 60 * 1000LL)
+#define PET_CFG_RETRY_MS (15 * 60 * 1000LL)
+#define PET_LINK_URL_MAX 256
+
+static bool s_req_pet_link;
+static bool s_pet_cfg_fetching, s_pet_link_fetching;
+static int64_t s_pet_cfg_ok_ms, s_pet_cfg_attempt_ms;
+static char s_pet_link_url[PET_LINK_URL_MAX];
+static uint32_t s_pet_link_version;
+
+static void pet_link_publish(const char *url) {
+    portENTER_CRITICAL(&s_pet_net_lock);
+    snprintf(s_pet_link_url, sizeof(s_pet_link_url), "%s", url ? url : "");
+    s_pet_link_version++;
+    portEXIT_CRITICAL(&s_pet_net_lock);
+}
+
+static void pet_link_snapshot(char *out, size_t cap, uint32_t *version) {
+    portENTER_CRITICAL(&s_pet_net_lock);
+    snprintf(out, cap, "%s", s_pet_link_url);
+    if (version) *version = s_pet_link_version;
+    portEXIT_CRITICAL(&s_pet_net_lock);
+}
+
+static bool days_http_post_json(const char *path, const char *body) {
+    /* Prime the handle exactly like days_http_get, then flip it to POST. */
+    if (!s_days_http) {
+        if (!days_http_get("/healthz")) return false;    /* builds the handle */
+    }
+    s_days_rx.len = 0;
+    s_days_rx.overflow = false;
+    s_days_rx.data[0] = '\0';
+    esp_http_client_set_url(s_days_http, path);
+    char auth[96];
+    snprintf(auth, sizeof(auth), "Bearer %.72s", BROKER_TOKEN);
+    esp_http_client_set_header(s_days_http, "Authorization", auth);
+    esp_http_client_set_header(s_days_http, "Content-Type", "application/json");
+    esp_http_client_set_method(s_days_http, HTTP_METHOD_POST);
+    esp_http_client_set_post_field(s_days_http, body, (int)strlen(body));
+
+    esp_err_t err = esp_http_client_perform(s_days_http);
+    int status = esp_http_client_get_status_code(s_days_http);
+    esp_http_client_set_post_field(s_days_http, NULL, 0);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "pet %.24s: %s (HTTP %d) - redial next time",
+                 path, esp_err_to_name(err), status);
+        esp_http_client_close(s_days_http);
+        return false;
+    }
+    if (status != 200 || s_days_rx.overflow) {
+        ESP_LOGW(TAG, "pet %.24s: HTTP %d", path, status);
+        return false;
+    }
+    return true;
+}
+
+static bool pet_cfg_fetch(void) {
+    if (!days_http_get("/pet/cfg")) return false;
+
+    cJSON *root = cJSON_Parse(s_days_rx.data);
+    cJSON *v  = root ? cJSON_GetObjectItem(root, "v") : NULL;
+    cJSON *n  = root ? cJSON_GetObjectItem(root, "n") : NULL;
+    if (!root || !cJSON_IsNumber(v) || !cJSON_IsString(n)) {
+        ESP_LOGW(TAG, "pet: malformed cfg response");
+        if (root) cJSON_Delete(root);
+        return false;
+    }
+    pet_cfg_msg_t m = { .ver = (uint32_t)v->valuedouble };
+    snprintf(m.name, sizeof(m.name), "%.11s", n->valuestring);
+    cJSON *it;
+    if (cJSON_IsNumber(it = cJSON_GetObjectItem(root, "s")))  m.species = (uint8_t)clampi(it->valueint, 0, 8);
+    if (cJSON_IsNumber(it = cJSON_GetObjectItem(root, "w")))  m.world   = (uint8_t)clampi(it->valueint, 0, 8);
+    if (cJSON_IsNumber(it = cJSON_GetObjectItem(root, "t")))  m.theme   = (uint8_t)clampi(it->valueint, 0, 8);
+    if (cJSON_IsNumber(it = cJSON_GetObjectItem(root, "h")))  m.hat     = (uint8_t)clampi(it->valueint, 0, 8);
+    if (cJSON_IsNumber(it = cJSON_GetObjectItem(root, "ss"))) m.ss      = (uint16_t)clampi(it->valueint, 0, 1439);
+    if (cJSON_IsNumber(it = cJSON_GetObjectItem(root, "se"))) m.se      = (uint16_t)clampi(it->valueint, 0, 1439);
+    if (cJSON_IsNumber(it = cJSON_GetObjectItem(root, "cb"))) m.coax    = it->valueint ? 1 : 0;
+    if (cJSON_IsString(it = cJSON_GetObjectItem(root, "b")) && strlen(it->valuestring) == 5) {
+        int mo = (it->valuestring[0] - '0') * 10 + (it->valuestring[1] - '0');
+        int dy = (it->valuestring[3] - '0') * 10 + (it->valuestring[4] - '0');
+        if (mo >= 1 && mo <= 12 && dy >= 1 && dy <= 31) m.bday = (uint16_t)(mo << 8 | dy);
+    }
+    if (cJSON_IsNumber(it = cJSON_GetObjectItem(root, "wx"))) {
+        m.wx = (uint8_t)clampi(it->valueint, 0, 7);
+        m.has_wx = 1;
+        cJSON *wt = cJSON_GetObjectItem(root, "wt");
+        if (cJSON_IsNumber(wt)) m.wx_temp = (int8_t)clampi(wt->valueint, -99, 99);
+    }
+    if (cJSON_IsString(it = cJSON_GetObjectItem(root, "sn")))
+        snprintf(m.sheet, sizeof(m.sheet), "%.7s", it->valuestring);
+    cJSON_Delete(root);
+
+    portENTER_CRITICAL(&s_pet_net_lock);
+    s_pet_cfg_in = m;
+    portEXIT_CRITICAL(&s_pet_net_lock);
+    __atomic_store_n(&s_pet_cfg_ready, true, __ATOMIC_RELEASE);
+    ESP_LOGI(TAG, "pet: cfg v%lu fetched, %u B", (unsigned long)m.ver,
+             (unsigned)s_days_rx.len);
+    return true;
+}
+
+static bool pet_link_fetch(void) {
+    if (!days_http_get("/pet/link")) return false;
+
+    cJSON *root = cJSON_Parse(s_days_rx.data);
+    cJSON *url = root ? cJSON_GetObjectItem(root, "authorization_url") : NULL;
+    const char *value = cJSON_IsString(url) ? url->valuestring : NULL;
+    size_t n = value ? strlen(value) : 0;
+    bool valid = value && strncmp(value, "https://", 8) == 0 &&
+                 n > 8 && n < PET_LINK_URL_MAX;
+    if (valid) {
+        for (size_t i = 0; i < n; i++) {
+            unsigned char c = (unsigned char)value[i];
+            if (c < 0x21 || c > 0x7E) { valid = false; break; }
+        }
+    }
+    if (!valid) {
+        ESP_LOGW(TAG, "pet: malformed designer-link response");
+        if (root) cJSON_Delete(root);
+        return false;
+    }
+    pet_link_publish(value);
+    cJSON_Delete(root);
+    ESP_LOGI(TAG, "pet: designer QR ready (%u B)", (unsigned)n);
+    return true;
+}
+
+static bool pet_push(void) {
+    pet_report_t r;
+    portENTER_CRITICAL(&s_pet_net_lock);
+    r = s_pet_report;
+    portEXIT_CRITICAL(&s_pet_net_lock);
+    char body[224];
+    snprintf(body, sizeof(body),
+             "{\"g\":%u,\"f\":%u,\"hu\":%u,\"ha\":%u,\"m\":%u,\"sd\":%lu,"
+             "\"st\":%lu,\"sk\":%u,\"pp\":%u,\"aw\":%u,\"hz\":%lld,\"e\":%lu}",
+             r.stage, r.form, r.hunger, r.happy, (unsigned)r.mistakes,
+             (unsigned long)r.stardust, (unsigned long)r.steps,
+             r.sick, r.poop, r.away, (long long)r.hatched,
+             (unsigned long)r.seed);
+    if (!days_http_post_json("/pet/st", body)) return false;
+    /* The response carries the current config version, so a state push
+     * doubles as a drift check — a design saved on the phone minutes ago is
+     * noticed here instead of waiting out the 2 h cycle. */
+    cJSON *root = cJSON_Parse(s_days_rx.data);
+    cJSON *v = root ? cJSON_GetObjectItem(root, "v") : NULL;
+    if (cJSON_IsNumber(v) && (uint32_t)v->valuedouble != s_pet.cfg_ver)
+        __atomic_store_n(&s_req_pet_cfg, true, __ATOMIC_RELEASE);
+    if (root) cJSON_Delete(root);
+    ESP_LOGI(TAG, "pet: state reported (%s)", body);
+    return true;
+}
+
+static void pet_net_service(void) {
+    if (!s_wifi_up || ble_prov_active() || BROKER_URL[0] == '\0' ||
+        BROKER_TOKEN[0] == '\0') return;
+
+    if (__atomic_exchange_n(&s_req_pet_link, false, __ATOMIC_ACQ_REL)) {
+        __atomic_store_n(&s_pet_link_fetching, true, __ATOMIC_RELEASE);
+        if (!pet_link_fetch()) pet_link_publish("");
+        __atomic_store_n(&s_pet_link_fetching, false, __ATOMIC_RELEASE);
+    }
+
+    if (__atomic_exchange_n(&s_req_pet_push, false, __ATOMIC_ACQ_REL)) {
+        if (!pet_push()) {
+            /* keep the report; retry rides the next service pass */
+            __atomic_store_n(&s_req_pet_push, true, __ATOMIC_RELEASE);
+        }
+    }
+
+    int64_t t = now_ms();
+    bool forced = __atomic_exchange_n(&s_req_pet_cfg, false, __ATOMIC_ACQ_REL);
+    bool due = !s_pet_cfg_ok_ms || t - s_pet_cfg_ok_ms >= PET_CFG_FETCH_MS;
+    if (!forced && !due) return;
+    if (!forced && s_pet_cfg_attempt_ms &&
+        t - s_pet_cfg_attempt_ms < PET_CFG_RETRY_MS) return;
+
+    s_pet_cfg_attempt_ms = t;
+    __atomic_store_n(&s_pet_cfg_fetching, true, __ATOMIC_RELEASE);
+    bool ok = pet_cfg_fetch();
+    __atomic_store_n(&s_pet_cfg_fetching, false, __ATOMIC_RELEASE);
+    s_pet_cfg_result = ok ? 1 : 2;
+    if (ok) s_pet_cfg_ok_ms = t;
+}
+
 /* The network task.
  *
  * Once polled a stand-in "speech to text" endpoint every 45 s to characterise
@@ -1335,6 +1955,7 @@ static void net_task(void *arg) {
          * several-hundred-KB wallpaper. Both stay off the main loop, so a slow
          * request cannot stall button handling or the app switcher. */
         days_service();
+        pet_net_service();
         wall_service();
 
         /* A wallpaper request breaks the wait, so pressing Fetch acts now
@@ -1342,7 +1963,10 @@ static void net_task(void *arg) {
         int period = s_doze ? (10 * 60 * 1000) : HTTPS_PERIOD_MS;
         for (int w = 0; w < period / 100 && !s_req_wallpaper &&
                         !__atomic_load_n(&s_req_days_fetch, __ATOMIC_ACQUIRE) &&
-                        !__atomic_load_n(&s_req_days_link, __ATOMIC_ACQUIRE); w++) {
+                        !__atomic_load_n(&s_req_days_link, __ATOMIC_ACQUIRE) &&
+                        !__atomic_load_n(&s_req_pet_link, __ATOMIC_ACQUIRE) &&
+                        !__atomic_load_n(&s_req_pet_cfg, __ATOMIC_ACQUIRE) &&
+                        !__atomic_load_n(&s_req_pet_push, __ATOMIC_ACQUIRE); w++) {
             vTaskDelay(pdMS_TO_TICKS(100));
         }
     }
@@ -1366,13 +1990,21 @@ static esp_err_t axp_set_bit(uint8_t reg, uint8_t bit) {
     return axp_write(reg, (uint8_t)(v | (1u << bit)));
 }
 
-static uint8_t chg_cv_code(void) {
-    if (s_chg_once) return AXP_CV_4V20;
-    switch (s_chg_mode) {
+/* The mode -> CV mapping, split out so the percentage the UI shows can be
+ * DERIVED from the volts we actually write rather than kept as a second copy
+ * beside them. Two hand-maintained tables of the same fact is how the labels
+ * drifted four points off the hardware in the first place. */
+static uint8_t chg_mode_cv_code(int mode) {
+    switch (mode) {
         case CHG_LIFESPAN: return AXP_CV_4V00;
         case CHG_BALANCED: return AXP_CV_4V10;
         default:           return AXP_CV_4V20;
     }
+}
+
+static uint8_t chg_cv_code(void) {
+    if (s_chg_once) return AXP_CV_4V20;
+    return chg_mode_cv_code(s_chg_mode);
 }
 
 static int chg_cv_mv(uint8_t code) {
@@ -1382,6 +2014,200 @@ static int chg_cv_mv(uint8_t code) {
         case AXP_CV_4V20: return 4200;
         default:          return 0;        /* 4.35/4.4 V, or the reserved 000 */
     }
+}
+
+/* What the charger is actually aiming at, as a percentage. The one-shot beats
+ * the cap while it is armed, exactly as chg_cv_code() resolves the same
+ * question in volts. */
+static int chg_target_pct(void) {
+    return s_chg_once ? 100 : chg_mode_pct(s_chg_mode);
+}
+
+/* ---- time to the charge limit ----
+ *
+ * The AXP2101 reports no time-to-full, so it is derived from the only signal
+ * that moves: the same percentage the ring draws. Each 1-point step is one
+ * rate sample — one point per N ms — and N is smoothed rather than averaged
+ * over the whole session, because a session average cannot see the CV taper
+ * and would still be promising "6 min" half an hour after current started
+ * falling.
+ *
+ * It counts to the LIMIT, not to 100%. A cube capped at 85% stops there, so a
+ * countdown to full would name a moment that never arrives — which is the
+ * whole point of the feature.
+ *
+ * Computed here, on the main task, and published as one plain int: the UI
+ * reads it from the LVGL task, and a 64-bit timestamp shared across the two
+ * can tear on a 32-bit core and produce a garbage frame. */
+#define CHG_ETA_MIN_MS_PP   (10 * 1000)        /* faster is a gauge jump, not charge */
+#define CHG_ETA_MAX_MS_PP   (90 * 60 * 1000)   /* slower is a stall, not a rate      */
+
+/* Opt-in, default OFF. A countdown on the lock screen is a taste question —
+ * some people want the number, some want the clock and nothing else — and the
+ * screen's standing rule is sparseness, so the default has to be the sparse
+ * one. The switch gates only the two READOUTS; the estimator keeps running
+ * either way, because it costs nothing measurable and switching the feature on
+ * mid-charge should show an answer immediately rather than start a fresh
+ * two-point wait. */
+static volatile bool s_chg_eta_on;
+
+/* ---- charger speed ----
+ *
+ * Classified from the rate the estimator already learns, which is the honest
+ * place to measure it: ms-per-point is the OUTCOME, so it catches a weak
+ * adapter, a shared USB2 port and a thermally throttled cell alike, where
+ * reading the ICC register would only report what we asked the PMU for.
+ *
+ * Latched from the CC phase and never revised, which is the part that matters.
+ * Every charger slows down as the cell approaches CV — that is the taper the
+ * ETA's own open-segment term exists to model — so a rate sampled near the top
+ * would label a perfectly good supply "slow". Below CV-60 mV the charger is
+ * still in constant current and the rate means what it appears to mean.
+ *
+ * The thresholds are estimates, and honestly so: this cube measured 30-91 s
+ * per point on a healthy supply, and a charger delivering half the current
+ * lands at roughly double that. No genuinely slow charger has been measured
+ * yet, so the latch logs the value it decided on — retune from that log rather
+ * than from argument, and leave the dead band between the two: refusing to
+ * classify is better than guessing wrong in either direction. */
+#define CHG_FAST_MS_PP  (150 * 1000)   /* at or under this per point: keeping up */
+#define CHG_SLOW_MS_PP  (240 * 1000)   /* at or over this: the supply is the limit */
+
+static volatile int  s_chg_speed;   /* 0 unknown, 1 fast, -1 slow */
+static volatile bool s_chg_ilim;    /* PMU is input-current-limited (reg 0x00 b0) */
+
+static volatile int s_chg_eta_mins = -1;   /* -1 = no honest answer to give */
+static int64_t s_chg_eta_mark;             /* when the gauge last stepped up */
+static int     s_chg_eta_pct;              /* the value it stepped to */
+static int     s_chg_eta_ms_pp;            /* smoothed ms per point, 0 = not learned */
+static int     s_chg_eta_steps;            /* rate samples taken this session */
+
+static void chg_eta_track(void) {
+    int pct = s_batt_pct;
+    /* Not charging covers the two ends as well as the middle: unplugged, and
+     * sitting at "done" with the cap reached. Both mean there is nothing to
+     * count down, so the session is dropped rather than frozen. */
+    if (!s_batt_charging || pct < 0) {
+        s_chg_eta_mark = 0;
+        s_chg_eta_ms_pp = 0;
+        s_chg_eta_steps = 0;
+        s_chg_eta_mins = -1;
+        s_chg_speed = 0;      /* the next session may be a different cable */
+        return;
+    }
+
+    int64_t t = now_ms();
+    if (!s_chg_eta_mark || pct < s_chg_eta_pct) {
+        /* First sample of the session, or the gauge went backwards — a load
+         * spike, or one of battery_poll()'s voltage corrections overruling a
+         * latched coulomb counter. Re-anchor; never feed a negative interval
+         * into the rate. */
+        s_chg_eta_mark = t;
+        s_chg_eta_pct  = pct;
+    } else if (pct > s_chg_eta_pct) {
+        int step = pct - s_chg_eta_pct;
+        int ms_pp = (int)(t - s_chg_eta_mark);
+        s_chg_eta_mark = t;
+        s_chg_eta_pct  = pct;
+        /* Only a single-point step is charge. Polling is every 2 s and no real
+         * charge rate covers two points in that, so a bigger jump is the gauge
+         * correcting itself — dividing it out would fabricate a rate several
+         * times the true one. Re-anchor and keep the rate already learned.
+         *
+         * The first interval also does not count: it started wherever the cube
+         * happened to be inside a point, so it is short by an unknown amount
+         * and would seed the whole estimate optimistic. Measure from the first
+         * step to the second. */
+        if (step == 1 && ++s_chg_eta_steps > 1 &&
+            ms_pp >= CHG_ETA_MIN_MS_PP && ms_pp <= CHG_ETA_MAX_MS_PP) {
+            /* Three-quarters old: one fast point (the gauge catching up to a
+             * voltage it already reached) must not halve the estimate, while a
+             * real slowdown still lands within a few points. */
+            s_chg_eta_ms_pp = s_chg_eta_ms_pp
+                            ? (s_chg_eta_ms_pp * 3 + ms_pp) / 4 : ms_pp;
+
+            /* Latch once, and only from the constant-current phase — see the
+             * threshold note above. ILIM is logged rather than used: it is the
+             * PMU's own "this supply cannot give me what I asked for", which
+             * would be a better primary signal than a timing threshold, but
+             * the two circulating AXP2101 datasheets disagree enough (§7) that
+             * it needs corroborating on a genuinely weak charger before
+             * anything depends on it. This line is how that gets collected. */
+            int cv = chg_cv_mv(chg_cv_code());
+            if (!s_chg_speed && cv && s_batt_mv > 0 && s_batt_mv < cv - 60) {
+                if (s_chg_eta_ms_pp <= CHG_FAST_MS_PP)      s_chg_speed = 1;
+                else if (s_chg_eta_ms_pp >= CHG_SLOW_MS_PP) s_chg_speed = -1;
+                if (s_chg_speed) {
+                    ESP_LOGI(TAG, "charger looks %s — %d s/point at %d mV "
+                                  "(CV %d mV, ILIM=%d)",
+                             s_chg_speed > 0 ? "FAST" : "SLOW",
+                             s_chg_eta_ms_pp / 1000, s_batt_mv, cv,
+                             s_chg_ilim ? 1 : 0);
+                }
+            }
+        }
+    }
+
+    /* How far there is to go is measured in VOLTS, never in gauge points.
+     *
+     * The limit is a CV target in reg 0x64 — 4100 mV for the setting CONTROL
+     * calls "85%" — and the PMU terminates on that voltage and the taper
+     * current. It never reads the fuel gauge. Those two scales do not line up:
+     * on the voltage cross-check this firmware already uses (3300 mV = 0%,
+     * 4200 mV = 100%) a 4100 mV cap is really ~89%, so the gauge sails through
+     * 85, 86, 87 with the charger still working. Counting down to the LABEL
+     * therefore hit `remain <= 0` and withdrew the caption several minutes
+     * early, while the cube was visibly still charging — observed at 86% and
+     * 4077 mV against a 4100 mV cap, 23 mV short.
+     *
+     * It also made one of this feature's own tests unobservable: "the caption
+     * disappears when the charge terminates" could never be seen, because the
+     * caption was already gone by then.
+     *
+     * The RATE stays ms-per-gauge-point, which is smoothed, monotonic and
+     * already proven; only the distance changes units. 9 mV per point is the
+     * same 900 mV / 100 scale, so the two agree. */
+    int cv = chg_cv_mv(chg_cv_code());
+    int remain = (cv > 0 && s_batt_mv > 0) ? (cv - s_batt_mv + 8) / 9
+                                           : chg_target_pct() - pct;
+    int64_t open = t - s_chg_eta_mark;
+    /* A point that has taken longer than any rate we would have learned is not
+     * a slow charge, it is a charge that has stopped moving — a cell holding
+     * just under a target it will not reach, or a supply that cannot deliver.
+     * Withdraw the estimate instead of letting the taper term below inflate it
+     * into an ever-growing number nobody should plan around. */
+    if (!s_chg_eta_ms_pp || remain <= 0 || open > CHG_ETA_MAX_MS_PP) {
+        s_chg_eta_mins = -1;
+        return;
+    }
+    int64_t ms = (int64_t)remain * s_chg_eta_ms_pp;
+    /* Charge the point in progress for the time it has ALREADY taken once that
+     * exceeds the learned rate. This is the CV taper, where every remaining
+     * point costs more than the ones behind it; without it the estimate parks
+     * on its last value and visibly counts nothing down. */
+    if (open > s_chg_eta_ms_pp) ms += open - s_chg_eta_ms_pp;
+    s_chg_eta_mins = (int)((ms + 59999) / 60000);   /* round up: "0 min" is not a wait */
+}
+
+/* "1h 12m to 85%". The limit is in the string because the number is only
+ * honest with it — a bare "1h 12m" under a 62% ring reads as time to full.
+ * Rounded to five minutes past a quarter hour: the input is a 1%-granular
+ * gauge, and a minute-precise countdown from it twitches by more than it
+ * resolves. Lower case, like every other CONTROL string; the lock screen
+ * upper-cases it on the way out the same way it does the date. */
+static void chg_eta_text(char *buf, size_t n, int mins) {
+    if (mins > 15) mins = (mins + 2) / 5 * 5;
+    int target = chg_target_pct();
+    /* A word, not a glyph. A tortoise was the ask and there is no tortoise to
+     * be had: LVGL's symbol set has no animal and the hud fonts are ASCII-only,
+     * so any emoji renders as an empty box. Drawing one from arcs the way the
+     * FOCUS padlock is drawn was the alternative and it was not worth it at
+     * this size. Empty in the dead band, so a normal charge says nothing. */
+    const char *speed = s_chg_speed > 0 ? " - fast"
+                      : s_chg_speed < 0 ? " - slow" : "";
+    if (mins >= 60) snprintf(buf, n, "%dh %02dm to %d%%%s",
+                             mins / 60, mins % 60, target, speed);
+    else            snprintf(buf, n, "%dm to %d%%%s", mins, target, speed);
 }
 
 /* Write the charge cap if the PMU is not already holding it.
@@ -1455,6 +2281,7 @@ static void battery_poll(void) {
      * "not in VINDPM", which reads as unplugged whenever the supply droops —
      * exactly the case a charge cap makes more likely, not less. */
     s_vbus      = (st1 >> 5) & 0x01;
+    s_chg_ilim  = st1 & 0x01;      /* free: st1 is already in hand */
     s_chg_state = st2 & 0x07;
     s_bypass    = s_vbus && s_chg_state == AXP_CHG_DONE;
 
@@ -1465,6 +2292,7 @@ static void battery_poll(void) {
     if (!((st1 >> 3) & 0x01)) {          /* no battery on the connector */
         s_batt_pct = -1;
         s_batt_mv = 0;
+        chg_eta_track();                 /* drops the session, board runs on USB */
         return;
     }
     if (axp_read(AXP_REG_ADC_DATA_H, &hi) == ESP_OK &&
@@ -1512,6 +2340,10 @@ static void battery_poll(void) {
     } else {
         s_batt_pct = 0;
     }
+
+    /* Last, and deliberately: it estimates from the settled s_batt_pct — the
+     * one the ring draws — so the countdown and the gauge can never disagree. */
+    chg_eta_track();
 }
 
 /* bit0 = went down, bit1 = came up. Both can land in one poll on a tap
@@ -1593,7 +2425,137 @@ static volatile int s_lock_key_app = LOCK_KEY_OFF;
 
 static volatile bool s_always_on;
 static volatile bool s_lock_rings = true;
+/* Cosmetic only: whether desk-clock mode announces itself with the amber
+ * ring. The mode itself belongs to the lock screen's right-key hold. */
+static volatile bool s_ao_ring_pref = true;
 static volatile bool s_req_lock_pref_save;
+
+/* ---- desk-clock dim ----
+ *
+ * Always-on is the only mode in this firmware that can hold the panel lit for
+ * hours, and on an AMOLED that is paid for twice: once in emission per lit
+ * pixel, and once in how MANY pixels are lit. So the dim does both. It lowers
+ * 0x51, and on the lock screen it also takes the wallpaper off the glass,
+ * leaving a black field that costs nothing at all and a clock that costs a few
+ * thousand pixels. Brightness alone would keep paying for 230,400 lit pixels.
+ *
+ * The depth is a PERCENTAGE of the user's brightness, never a flat constant and
+ * never a min() — that reasoning is written out at the FOCUS dim in pomo_poll()
+ * and it applies here unchanged. The numbers are deliberately the same pair
+ * rather than a fresh guess: 12 / 3 is what was actually checked through this
+ * cover glass, and nothing measured says a desk clock wants a different one.
+ * They are separate symbols so a future measurement can move one alone.
+ *
+ * 60 s by default because that is already this firmware's idea of "nobody is
+ * here" — it is AUTO_LOCK_MS. FOCUS waits 120 s because you are sitting in
+ * front of it doing something; a desk clock is finished with you the moment
+ * you look away.
+ *
+ * ON by default. The mode's only switch is a right-key hold on the lock screen,
+ * so the person who turns always-on on has no reason ever to open CONTROL, and
+ * a battery feature nobody finds is not a feature. One touch undoes it. */
+static volatile bool s_ao_dim_on = true;
+static volatile int  s_ao_dim_s  = 60;   /* idle seconds before the dim engages */
+static bool s_ao_dimmed;                 /* main task only, like s_pomo_dimmed  */
+#define AO_DIM_PCT   12     /* of the user's brightness, not of full        */
+#define AO_DIM_FLOOR 3      /* on a black field, still readable across a room */
+
+/* The dim FADES rather than steps, phone-style, and the reason is interaction
+ * rather than looks. A panel that drops in one frame has already happened by
+ * the time you notice it, so the only thing left to do is wonder whether the
+ * cube is broken; a fade is an announcement with a window inside it, and a
+ * touch anywhere in that window calls the whole thing off.
+ *
+ * Quantised into steps rather than run off the 20 ms loop tick, because every
+ * one of them is a 0x51 write taking the LVGL lock from the main task while the
+ * lock screen's own 16 ms timer is running — pitfall #13's contended case. A
+ * free-running ramp over the ~88 levels between full and dim would be ~88 lock
+ * acquisitions in 2.4 s; 24 is enough to look continuous and is one write per
+ * 100 ms, which is slower than the FOCUS dim already does on this same path.
+ *
+ * The ramp is linear in the panel's own units, and perception of brightness is
+ * closer to logarithmic, so the visible change front-loads — most of the drop
+ * reads in the first second. That is the right way round here: the point is to
+ * be noticed early enough to be stopped, not to be inconspicuous.
+ *
+ * Restoring is deliberately NOT faded. A fade out is the device announcing
+ * something; a fade in would be the device answering your finger slowly. */
+#define AO_DIM_FADE_MS   2400
+#define AO_DIM_FADE_STEPS 24
+
+static int     s_ao_dim_lvl  = -1;   /* level the fade has reached; -1 = idle */
+static int     s_ao_dim_from;        /* level it started from                 */
+static int64_t s_ao_dim_began;
+static bool    s_ao_wall_hidden;     /* the blackout half, taken at the bottom */
+
+/* ---- the two things that are about THIS panel rather than about power ----
+ *
+ * Burn-in is the AMOLED-specific RISK, and the blackout above made this cube's
+ * exposure to it worse rather than better. A desk clock holds the same digits
+ * in the same pixels for hours, which is the textbook OLED case; until now the
+ * wallpaper at least reshuffled everything underneath on each lock build, and
+ * hiding it leaves nothing on the glass but static elements. So the content
+ * walks a slow eight-point ring while dimmed — the standard mitigation, and it
+ * costs nothing on a screen nobody is reading closely.
+ *
+ * The shift is applied to the SCREEN, not to nine widgets. One translate moves
+ * the clock, the date, the battery text, the rings and the now-playing card
+ * together, so nothing can drift out of alignment with anything else, and no
+ * future widget has to remember to join in. Under the shift the screen's own
+ * black shows at the trailing edge, which on this panel is unlit rather than
+ * grey — the one place the drift costs literally nothing to hide.
+ *
+ * 4 px is enough: burn-in is driven by the EDGES of a static luminance step, and
+ * moving a glyph by a third of its stroke width is what stops one column of
+ * pixels carrying the whole duty cycle. Larger would be visible as a jump.
+ *
+ * The amber is the other half. 0xE8FBFF drives all three subpixels near full;
+ * AMOLED power is per-subpixel, blue is both the least efficient primary and
+ * the fastest to age, and 0xF59E0B is already what desk-clock mode means on
+ * this device (s_lock_ao_ring). Total subpixel drive falls from 738 to 414 for
+ * the same legibility. Note that is drive, not measured power — see §7b. */
+#define AO_DRIFT_MS 60000    /* one step a minute: slower than anyone watching */
+#define AO_DRIFT_PX 4
+#define AO_DIM_CLOCK 0xF59E0B
+
+static const int8_t s_ao_drift[8][2] = {
+    { 0, -1 }, { 1, -1 }, { 1, 0 }, { 1, 1 },
+    { 0,  1 }, { -1, 1 }, { -1, 0 }, { -1, -1 },
+};
+static int     s_ao_drift_i;
+static int64_t s_ao_drift_at;
+static uint32_t s_lock_time_col = 0xE8FBFF;   /* what build_lock_screen set */
+
+/* Stops, not a free-running seconds range: "dim after 37 s" is a number nobody
+ * chose, and a control that can produce one is worse than seven detents.
+ *
+ * SECONDS are what gets persisted and the slider index is derived from them at
+ * the UI boundary — the same direction chg_mode_to_slider() converts in, for
+ * the same reason. Storing the index instead would silently redefine everyone's
+ * saved setting on the day a stop is added to this table. */
+static const uint16_t s_ao_dim_stops[] = { 10, 20, 30, 60, 120, 300, 600 };
+#define AO_DIM_STOPS ((int)(sizeof s_ao_dim_stops / sizeof s_ao_dim_stops[0]))
+
+static int ao_dim_to_slider(int secs) {
+    int best = 0;
+    for (int i = 1; i < AO_DIM_STOPS; i++) {
+        if (abs((int)s_ao_dim_stops[i] - secs) <
+            abs((int)s_ao_dim_stops[best] - secs)) best = i;
+    }
+    return best;
+}
+
+/* Pocket lock: the panel stops answering touch while it is asleep, so a cube in
+ * a bag or a coat pocket cannot be woken by whatever it is pressed against.
+ * Keys still wake it — they are the way back in, and a key is not something a
+ * pocket presses for ten minutes at a time.
+ *
+ * Deliberately NOT persisted, unlike always-on beside it. The lock screen is
+ * kept sparse, so this mode has no indicator while the panel is dark and none
+ * is possible; a mode you cannot see that survived a reboot is indistinguishable
+ * from a broken touchscreen. A power cycle always gives the glass back. */
+static volatile bool s_pocket_lock;
+
 /* The orientation to hold when autorotate is off. Without persisting this, a
  * reboot lands back at native 0 with the switch still reading OFF and — since
  * the calibration button fades out in that state — no way at all to get back. */
@@ -1972,6 +2934,10 @@ static void lock_pref_save(void) {
     if (nvs_open("cfg", NVS_READWRITE, &h) == ESP_OK) {
         nvs_set_i32(h, "alwayson", s_always_on ? 1 : 0);
         nvs_set_i32(h, "lockrings", s_lock_rings ? 1 : 0);
+        nvs_set_i32(h, "aoring", s_ao_ring_pref ? 1 : 0);
+        /* Seconds, not the slider index — see s_ao_dim_stops. */
+        nvs_set_i32(h, "aodim", s_ao_dim_on ? 1 : 0);
+        nvs_set_i32(h, "aodimsec", s_ao_dim_s);
         nvs_set_i32(h, "lockmid", s_lock_key_app);
         nvs_commit(h);
         nvs_close(h);
@@ -1984,6 +2950,7 @@ static void chg_save(void) {
     if (nvs_open("cfg", NVS_READWRITE, &h) == ESP_OK) {
         nvs_set_i32(h, "chgmode", s_chg_mode);
         nvs_set_i32(h, "chgonce", s_chg_once ? 1 : 0);
+        nvs_set_i32(h, "chgeta", s_chg_eta_on ? 1 : 0);
         nvs_commit(h);
         nvs_close(h);
     }
@@ -2001,6 +2968,7 @@ static void chg_load(void) {
         s_chg_mode = (int)v;
     }
     if (nvs_get_i32(h, "chgonce", &v) == ESP_OK) s_chg_once = (v != 0);
+    if (nvs_get_i32(h, "chgeta", &v) == ESP_OK) s_chg_eta_on = (v != 0);
     nvs_close(h);
 }
 
@@ -2015,6 +2983,15 @@ static void rot_off_load(void) {
     if (nvs_get_i32(h, "clock24", &v) == ESP_OK) s_clock_24 = (v != 0);
     if (nvs_get_i32(h, "alwayson", &v) == ESP_OK) s_always_on = (v != 0);
     if (nvs_get_i32(h, "lockrings", &v) == ESP_OK) s_lock_rings = (v != 0);
+    if (nvs_get_i32(h, "aoring", &v) == ESP_OK) s_ao_ring_pref = (v != 0);
+    if (nvs_get_i32(h, "aodim", &v) == ESP_OK) s_ao_dim_on = (v != 0);
+    /* Clamped to the ends of the stops table rather than trusted. A stored
+     * delay is a bare number, and a zero would dim the instant you stopped
+     * touching the glass — indistinguishable from a broken panel. */
+    if (nvs_get_i32(h, "aodimsec", &v) == ESP_OK) {
+        s_ao_dim_s = clampi((int)v, s_ao_dim_stops[0],
+                            s_ao_dim_stops[AO_DIM_STOPS - 1]);
+    }
     /* Range-checked, not trusted: a stored index can outlive the app it named
      * if one is compiled out, and app_request() on a hole calls a NULL build(). */
     if (nvs_get_i32(h, "lockmid", &v) == ESP_OK) {
@@ -2076,7 +3053,12 @@ static void imu_poll(void) {
      * running while it was off, so an already-settled orientation commits on the
      * next poll rather than 800 ms later. */
     if (s_autorot && s_rot_votes >= QMI_VOTES_NEEDED && s_rot_cand != s_rot &&
-        s_app != APP_POMO) {
+        s_app != APP_POMO && s_app != APP_PET) {
+        /* PET is pinned like FOCUS, but for the opposite reason: FOCUS reads
+         * orientation as its dial; PET reads TILT as its joystick, and a
+         * panel that counter-rotated under the tilt would move the ground
+         * out from under the pet mid-walk. Whatever orientation the app is
+         * entered with holds until the user goes home. */
         rotation_apply(s_rot_cand);
     }
 }
@@ -2131,6 +3113,17 @@ static btn_ev_t btn_poll(btn_t *b, int64_t t) {
         b->change_ms = t;
         b->raw_edge = (raw == 0) ? 1 : -1;   /* active low; earliest signal there is */
         ESP_LOGI(TAG, "key gpio%d -> %d", (int)b->pin, raw);
+        /* A tap can be over in less than the 50 ms the debouncer needs: low on
+         * one 20 ms poll, high again by the next. The debounced path then never
+         * records a press, so the release completes nothing and the tap simply
+         * vanishes — reported from the glass as "an extremely quick press does
+         * nothing". The opposite raw edges ARE the tap: an up edge while the
+         * debounced state never left released is a completed short press. Real
+         * contact bounce settles in under ~10 ms, so a high sample a full poll
+         * after a low one means the finger genuinely lifted; and after
+         * btn_swallow() stable tracks the held level, so a swallowed wake press
+         * still cannot fire on its release. */
+        if (raw == 1 && b->stable == 1) return BTN_SHORT;
         return BTN_NONE;
     }
     if (raw != b->stable && (t - b->change_ms) >= 50) {   /* debounced edge */
@@ -2231,6 +3224,194 @@ static bool bright_apply(int pct) {
     bsp_display_unlock();
     s_bright_applied = pct;
     return true;
+}
+
+/* Desk-clock dim: ONE writer for both halves of it, so the panel level and the
+ * wallpaper can never end up disagreeing about which state the cube is in. Same
+ * rule as bright_apply() directly above, one level up.
+ *
+ * The ordering inside each branch looks arbitrary and is not. Hiding or showing
+ * a 480x480 image invalidates the entire viewport, which LVGL ships as fifteen
+ * sequential strips with no tear gate on this board (HARDWARE.md §5) — a sweep
+ * you can watch cross the glass. Doing that repaint while the panel is already
+ * at 3-12% is what makes it invisible, exactly as rotation_apply() repaints
+ * inside its own blackout. Raising the level first and repainting after would
+ * light the sweep instead of hiding it.
+ *
+ * lv_refr_now() rather than leaving it to the LVGL task, for the same reason
+ * rotation_apply() does: the very next statement changes the brightness, and an
+ * asynchronous repaint would land on the wrong side of it.
+ *
+ * s_lock_wall is NULL on every screen but the lock screen, and that is what
+ * scopes the blackout. A cube parked on MUSIC by always-on gets the brightness
+ * half only, because its content is the thing you asked to keep looking at. */
+/* Shift the whole lock screen by (dx, dy).
+ *
+ * On the CHILDREN, never on the screen — and this is the whole reason the
+ * helper exists rather than two setter calls at the call site. A screen is
+ * created with lv_obj_create(NULL), so its `parent` is NULL, and
+ * lv_obj_refr_pos() returns at `if(parent == NULL) { lv_obj_move_to(...);
+ * return; }` (lv_obj_pos.c:781) BEFORE it ever reads translate_x/y twenty lines
+ * later. Setting translate on a screen is therefore a silent no-op: no error,
+ * no warning, and at 4 px on a dimmed panel nothing an eye could catch either.
+ * The first version of this did exactly that.
+ *
+ * Walking the children rather than naming nine widgets keeps the property that
+ * made a whole-screen shift attractive in the first place: everything moves
+ * together so nothing can drift out of alignment with anything else, and a
+ * widget added to this screen later joins in without knowing the drift exists.
+ * That includes the wallpaper, which is hidden while this runs, and the ETA
+ * caption, which is not mine.
+ *
+ * Safe against the now-playing drag: lock_drag_apply() positions the card with
+ * lv_obj_set_x(), and translate composes with x rather than replacing it, so
+ * the two cannot overwrite each other — and the touch that begins a drag lifts
+ * the dim, which zeroes all of this, before the drag can travel. */
+static void ao_drift_apply(int dx, int dy) {
+    lv_obj_t *scr = lv_screen_active();
+    if (!scr) return;
+    uint32_t n = lv_obj_get_child_count(scr);
+    for (uint32_t i = 0; i < n; i++) {
+        lv_obj_t *ch = lv_obj_get_child(scr, i);
+        if (!ch) continue;
+        lv_obj_set_style_translate_x(ch, dx, 0);
+        lv_obj_set_style_translate_y(ch, dy, 0);
+    }
+}
+
+static void ao_dim_set(bool on) {
+    int lvl = s_bright;      /* one read: it is volatile and used three times */
+    int dim = clampi(lvl * AO_DIM_PCT / 100, AO_DIM_FLOOR, lvl);
+
+    if (on) {
+        /* Called on every 20 ms pass for as long as the cube stays idle, so
+         * this both STARTS the fade and ADVANCES it. Position comes from
+         * elapsed wall time rather than from a counter, for the reason
+         * pomo_set_running() re-stamps its tick: a pass the loop was late for
+         * must not stretch the fade, and one bright_apply() that had to be
+         * retried must not shorten it. */
+        if (!s_ao_dimmed) {
+            s_ao_dimmed     = true;
+            s_ao_dim_from   = lvl;
+            s_ao_dim_lvl    = lvl;
+            s_ao_dim_began  = now_ms();
+            s_ao_wall_hidden = false;
+            ESP_LOGI(TAG, "desk-clock dim: fading %d%% -> %d%%", lvl, dim);
+        }
+
+        if (s_ao_dim_lvl > dim) {
+            int64_t el = now_ms() - s_ao_dim_began;
+            int step = (int)(el * AO_DIM_FADE_STEPS / AO_DIM_FADE_MS);
+            if (step > AO_DIM_FADE_STEPS) step = AO_DIM_FADE_STEPS;
+            int want = s_ao_dim_from -
+                       (s_ao_dim_from - dim) * step / AO_DIM_FADE_STEPS;
+            if (want < dim) want = dim;
+            /* On a lock timeout, leave s_ao_dim_lvl where it was and come back
+             * next pass: the fade resumes at whatever the clock says by then,
+             * so a contended panel loses smoothness rather than correctness. */
+            if (want != s_ao_dim_lvl && bright_apply(want)) s_ao_dim_lvl = want;
+            return;                       /* the blackout waits for the bottom */
+        }
+
+        /* Bottom of the fade. The wallpaper goes now rather than at the top,
+         * because hiding a 480x480 image invalidates the whole viewport and
+         * LVGL ships that as fifteen sequential strips with no tear gate on
+         * this board (HARDWARE.md §5) — a sweep you can watch cross the glass.
+         * At 3-12% it is invisible, which is the same trick rotation_apply()
+         * uses; at full brightness, halfway through a fade, it would not be. */
+        if (s_lock_wall && !s_ao_wall_hidden) {
+            if (!ui_lock()) return;                    /* retried next pass */
+            lv_obj_add_flag(s_lock_wall, LV_OBJ_FLAG_HIDDEN);
+            /* Amber goes on in the same pass as the blackout and under the same
+             * lock: two writes, one repaint, one moment. Recolouring separately
+             * would be a second full-screen invalidate for nothing. */
+            if (s_lock_time)
+                lv_obj_set_style_text_color(s_lock_time,
+                                            lv_color_hex(AO_DIM_CLOCK), 0);
+            if (s_screen_on) lv_refr_now(NULL);
+            bsp_display_unlock();
+            s_ao_wall_hidden = true;
+            s_ao_drift_at = now_ms();       /* first step a full period from now */
+            ESP_LOGI(TAG, "desk-clock dim ON (panel %d%%, wallpaper off, amber)",
+                     dim);
+        }
+
+        /* The drift, once settled at the bottom. Deliberately not started until
+         * then: a shift during the fade would be one more thing moving while
+         * the panel is already changing, and the whole point is to be unnoticed.
+         *
+         * Whole-screen translate, so this is a full-viewport invalidate — the
+         * same fifteen strips the blackout costs. It is affordable for exactly
+         * the same reason and no other: it happens at 3-12% brightness, once a
+         * minute, on a screen nobody is looking at. Do not lift this to a
+         * shorter period without re-reading HARDWARE.md §5. */
+        if (s_ao_wall_hidden && now_ms() - s_ao_drift_at >= AO_DRIFT_MS) {
+            if (!ui_lock()) return;                    /* retried next pass */
+            s_ao_drift_i = (s_ao_drift_i + 1) & 7;
+            int dx = s_ao_drift[s_ao_drift_i][0] * AO_DRIFT_PX;
+            int dy = s_ao_drift[s_ao_drift_i][1] * AO_DRIFT_PX;
+            ao_drift_apply(dx, dy);
+            if (s_screen_on) lv_refr_now(NULL);
+            bsp_display_unlock();
+            s_ao_drift_at = now_ms();
+            /* Logged, once a minute and only while dimmed, because this is a
+             * feature with no observable output: 4 px on a 12% panel is not
+             * something an eye can confirm, and its first version was a silent
+             * no-op that no hardware test could have caught (pitfall #36). A
+             * line here is the only way anyone can ever tell it is alive. */
+            ESP_LOGI(TAG, "desk-clock drift: step %d (%+d,%+d)",
+                     s_ao_drift_i, dx, dy);
+        }
+        return;
+    }
+
+    if (!s_ao_dimmed) return;
+
+    /* Coming back. Instant, and it can land mid-fade — the wallpaper may never
+     * have gone, which is why the repaint is gated on having actually hidden it
+     * rather than on s_lock_wall alone. */
+    /* s_lock_wall NULL here is not "no wallpaper", it is app_open() having
+     * already nulled it one line before calling us — the screen is about to be
+     * freed. Repainting it would spend a full-viewport render, ~80 ms, on a
+     * screen nobody will ever see, right inside the switch path. Skipping is
+     * also correct rather than merely cheap: the incoming screen is a fresh
+     * object, so it carries no translate, and s_lock_time is rebuilt with its
+     * own colour. Nothing stale can survive the teardown. */
+    if (s_lock_wall && s_ao_wall_hidden) {
+        if (!ui_lock()) return;            /* flags untouched: retried next pass */
+        lv_obj_remove_flag(s_lock_wall, LV_OBJ_FLAG_HIDDEN);
+        /* All three come back under ONE lock and ONE repaint. Undoing them in
+         * separate passes would show an amber clock over a restored wallpaper,
+         * or worse, leave the screen parked 4 px off if a later pass timed out.
+         * The drift in particular must be cleared unconditionally rather than
+         * stepped back, because it is absolute, not relative. */
+        if (s_lock_time)
+            lv_obj_set_style_text_color(s_lock_time,
+                                        lv_color_hex(s_lock_time_col), 0);
+        ao_drift_apply(0, 0);
+        /* Synchronous only while the panel is lit, which is the case this
+         * ordering exists for. On the sleep path the screen is already dark and
+         * blocking the main loop ~80 ms to render a frame into it would be the
+         * opposite of §7b. */
+        if (s_screen_on) lv_refr_now(NULL);
+        bsp_display_unlock();
+    }
+    s_ao_dimmed      = false;
+    s_ao_wall_hidden = false;
+    s_ao_dim_lvl     = -1;
+
+    /* Restoring the level last, so the repaint above happened while the panel
+     * was still dim — the sweep is fifteen strips and this is where it hides.
+     *
+     * Guarded on s_screen_on because screen_toggle_power() drops the dim on its
+     * way DOWN, after it has already written 0: restoring the user's level
+     * unguarded there would relight a panel one line from dozing, and the wake
+     * path writes s_bright itself. A lock timeout hands the write to the main
+     * loop rather than losing it — the same retry channel screen_toggle_power()
+     * uses, and the reason its gate tests !s_ao_dimmed rather than assuming the
+     * panel is wherever the flag says. */
+    if (s_screen_on && !bright_apply(lvl)) s_req_bright_apply = true;
+    ESP_LOGI(TAG, "desk-clock dim OFF (panel %d%%)", lvl);
 }
 
 /* ---------------- rotation transition ----------------
@@ -2345,6 +3526,20 @@ static void screen_toggle_power(void) {
         if (!bright_apply(s_bright)) s_req_bright_apply = true;
     } else {
         bright_apply(0);          /* not backlight_off(): see bright_apply() */
+        /* Drop the desk-clock dim on the way down, and drop it HERE: after the
+         * flip, so ao_dim_set() skips its brightness write, and after the panel
+         * is already at 0, so putting the wallpaper back costs one repaint that
+         * nobody can see rather than a flash of the photo returning.
+         *
+         * It has to happen somewhere on this path. A dim that survived the
+         * sleep would wake to a black lock screen at full brightness — read
+         * from the glass as "my wallpaper disappeared" — and worse, the flag
+         * would then agree with the panel, so nothing would ever re-dim it.
+         * That is pitfall #23's shape with the wallpaper as the second output.
+         *
+         * The wake branch needs no equivalent: it can only be reached from
+         * here, so the flag is already false by the time the panel lights. */
+        ao_dim_set(false);
         power_set_doze(true);
     }
     ESP_LOGI(TAG, "screen %s", s_screen_on ? "ON" : "OFF");
@@ -2368,12 +3563,94 @@ static void screen_toggle_power(void) {
 
 #define PET_FPS_MS   25
 
-/* the planet is a big circle whose top cap forms the horizon */
+/* ---- themes and worlds: the design the phone chose, drawn ----
+ *
+ * A world contributes the stage (sky, ground, props); a theme contributes the
+ * character and UI. The two mono themes (retro LCD, ink) override everything
+ * with a two-tone ramp — that IS the aesthetic — so every color in the scene
+ * routes through pet_col() and nothing hardcodes a hex. */
+enum {
+    PC_SKY = 0, PC_SKY2, PC_GROUND, PC_GROUND_HI, PC_SPOT, PC_STAR,
+    PC_BODY, PC_BODY_DARK, PC_EYE, PC_ACCENT, PC_TEXT, PC_DIM, PC_PROP,
+};
+
+typedef struct {
+    uint32_t sky, sky2, ground, ground_hi, spot, star, prop;
+    bool moon;                          /* some skies have one, some do not */
+} pet_world_pal_t;
+static const pet_world_pal_t s_pet_world_pal[4] = {
+    /* tiny planet  */ { 0x0A0F22, 0x241B3A, 0x2A9D8F, 0x6FD8C8, 0x21857A, 0xFFF3D6, 0xB8C4D9, true  },
+    /* ocean floor  */ { 0x041830, 0x0A2E4E, 0xC2B280, 0xE0D2A0, 0xA89868, 0x8DE0D2, 0xFF8C69, false },
+    /* forest glade */ { 0x0F1A2E, 0x16283A, 0x2E7D32, 0x66BB6A, 0x1B5E20, 0xE8F6B8, 0xC9A227, true  },
+    /* city rooftop */ { 0x0B1020, 0x1B1430, 0x37474F, 0x546E7A, 0x263238, 0xE9C46A, 0xB0BEC5, true  },
+};
+
+typedef struct {
+    uint32_t body, body_dark, eye, accent, text, dim;
+    bool mono;
+    uint32_t mono_bg, mono_fg, mono_mid;
+} pet_theme_pal_t;
+static const pet_theme_pal_t s_pet_theme_pal[4] = {
+    /* modern    */ { 0xF4F1DE, 0x264653, 0x8DE0D2, 0xE76F51, 0xF4F1DE, 0x9AA7B8, false, 0, 0, 0 },
+    /* retro lcd */ { 0, 0, 0, 0, 0, 0, true,  0x9BBC0F, 0x0F380F, 0x306230 },
+    /* ink       */ { 0, 0, 0, 0, 0, 0, true,  0xF2F2F2, 0x141414, 0x6E6E6E },
+    /* neon      */ { 0x00E5FF, 0x0077AA, 0x001018, 0xFF2D95, 0x00E5FF, 0x557788, false, 0x000000, 0, 0 },
+};
+
+static uint32_t pet_col(int role) {
+    const pet_world_pal_t *w = &s_pet_world_pal[s_pet.world & 3];
+    const pet_theme_pal_t *t = &s_pet_theme_pal[s_pet.theme & 3];
+    if (t->mono) {
+        switch (role) {
+        case PC_SKY: case PC_SKY2: case PC_EYE:      return t->mono_bg;
+        case PC_GROUND: case PC_BODY: case PC_TEXT:  return t->mono_fg;
+        default:                                     return t->mono_mid;
+        }
+    }
+    switch (role) {
+    case PC_SKY:       return (s_pet.theme == 3) ? 0x000000 : w->sky;
+    case PC_SKY2:      return (s_pet.theme == 3) ? 0x0A0018 : w->sky2;
+    case PC_GROUND:    return w->ground;
+    case PC_GROUND_HI: return w->ground_hi;
+    case PC_SPOT:      return w->spot;
+    case PC_STAR:      return w->star;
+    case PC_PROP:      return w->prop;
+    case PC_BODY:      return t->body;
+    case PC_BODY_DARK: return t->body_dark;
+    case PC_EYE:       return t->eye;
+    case PC_ACCENT:    return t->accent;
+    case PC_TEXT:      return t->text;
+    default:           return t->dim;
+    }
+}
+
+/* the ground and sky props the quake rattles; the planet stays put because
+ * translating a 540 px circle invalidates a full-width band per frame */
+static int s_pet_quake;             /* frames of world-shake left */
+static int s_pet_quake_amp;
+
+/* The ground is a circle whose top cap forms the horizon — and the RADIUS is
+ * what makes a world a world. The pocket planet curves hard; the seabed and
+ * the rooftop are so large they read as flat with sky to spare. Same math,
+ * four geographies, which is what "the worlds all look the same" was missing:
+ * under the mono themes palette differences vanish, so the ground SHAPE has
+ * to carry the difference. */
 #define PLANET_CX    240
-#define PLANET_CY    510
-#define PLANET_R     270
 #define WALK_MIN_X   120
 #define WALK_MAX_X   360
+
+typedef struct { int16_t horizon; int16_t r; } pet_geo_t;
+static const pet_geo_t s_world_geo[4] = {
+    /* tiny planet  */ { 240, 270 },     /* the classic high curvature */
+    /* ocean floor  */ { 300, 1500 },    /* long low seabed, water above */
+    /* forest glade */ { 276, 700 },     /* one rolling hill */
+    /* city rooftop */ { 312, 2400 },    /* a slab; the sky is the view */
+};
+static int pet_geo_r(void)  { return s_world_geo[s_pet.world & 3].r; }
+static int pet_geo_cy(void) {
+    const pet_geo_t *g = &s_world_geo[s_pet.world & 3];
+    return g->horizon + g->r;
+}
 
 #define CH_W         54
 #define CH_H         62
@@ -2410,6 +3687,79 @@ static lv_obj_t *s_food_item;
 static int s_food_x, s_food_fall;
 static bool s_food_ready;
 
+/* the egg (stage PET_EGG) sits where the astronaut will stand */
+static lv_obj_t *s_pet_egg;
+
+/* ---- infinite travel ----
+ *
+ * Hold a tilt and the WORLD moves, not the walker: ground details and props
+ * ride a 640 px virtual track around the planet (the stretch beyond the
+ * panel maps below the horizon via ground_y, so things genuinely disappear
+ * around the back), stars parallax at quarter speed, the moon at an eighth.
+ * The walker eases to centre stage and just walks. Velocity ramps toward
+ * the tilt instead of snapping — momentum is most of the fidget. */
+#define WOBJ_N     12
+#define WOBJ_WRAP  640
+static lv_obj_t *s_wobj[WOBJ_N];
+static int16_t   s_wobj_x[WOBJ_N];     /* virtual track x of the centre */
+static int16_t   s_wobj_dy[WOBJ_N];    /* y offset from the surface line */
+static uint8_t   s_wobj_n;
+static int s_tilt_vel, s_tilt_vel_tgt; /* world-scroll velocity, -6..6 */
+static int s_sky_par;                  /* sky parallax accumulator */
+
+static void wobj_add(lv_obj_t *o, int track_x, int dy) {
+    if (s_wobj_n >= WOBJ_N) return;
+    s_wobj[s_wobj_n] = o;
+    s_wobj_x[s_wobj_n] = (int16_t)track_x;
+    s_wobj_dy[s_wobj_n] = (int16_t)dy;
+    s_wobj_n++;
+}
+
+/* ---- the encounter reel: what the road serves up ----
+ * Variable-ratio payouts on the infinite walk: crystals to walk through,
+ * a stranger now and then, a golden flyby that drops a little treasure,
+ * and every full lap a small ceremony. The road must keep paying, or the
+ * walk is a treadmill. */
+#define PET_LAP_M 500
+static lv_obj_t *s_gem[2];
+static int16_t   s_gem_x[2];
+static bool      s_gem_on[2];
+static uint32_t  s_gem_next_m;
+static lv_obj_t *s_walker;             /* the stranger */
+static int16_t   s_walker_x;
+static int8_t    s_walker_dir;
+static bool      s_walker_on, s_walker_waved;
+static uint32_t  s_walker_next_m;
+static int       s_travel_acc;         /* px toward the next metre */
+static bool      s_ufo_gold, s_ufo_dropped;
+static bool      s_was_traveling;
+static char      s_trav_hud[40];
+static lv_obj_t *s_pet_planet;         /* the ground, for tinting and liftoff */
+static lv_obj_t *s_sign, *s_sign_label;   /* the distance signpost */
+static int16_t   s_sign_x;
+static bool      s_sign_on;
+
+/* ---- jetpack: pitch the cube back and the sky opens ----
+ * Ground hides, stars stream downward, altitude climbs with the pitch;
+ * level out and you parachute home. The one number that persists is the
+ * altitude record — a reason to try again tomorrow. */
+static lv_obj_t *s_jet_flame;
+static int  s_fly_mode;                /* 0 ground, 1 climbing, 2 descending */
+static int  s_fly_alt, s_fly_peak;
+static int  s_fly_pitch;               /* signed z-delta, written at 50 Hz */
+static int  s_lean_mag;                /* current L/R lean, for the level gate */
+/* Lift-burst events from the 50 Hz vertical-velocity sense: +1 the cube was
+ * raised sharply, -1 lowered sharply. Written by the motion poll, consumed
+ * by the view's flight machine. */
+static volatile int8_t s_fly_burst;
+static int64_t s_shake_ms;             /* last shake, file-scope so the fly
+                                        * trigger can ignore shake spikes */
+static int16_t s_gem_y[2];             /* sky-gem drop height while flying */
+static bool    s_gem_sky[2];
+/* star home rows, shared by the build and the flight streamer */
+static const uint16_t s_star_by[STAR_N] = { 96, 52, 112, 40, 78, 34,
+                                            96, 130, 168, 150, 168, 74 };
+
 /* character parts */
 static lv_obj_t *s_ch_wrap, *s_ch_body, *s_ch_pack, *s_ch_visor;
 static lv_obj_t *s_ch_eye_l, *s_ch_eye_r, *s_ch_leg_l, *s_ch_leg_r;
@@ -2420,6 +3770,22 @@ static int s_bubble_life;
 /* HUD */
 static lv_obj_t *s_pet_name, *s_pet_mood;
 static lv_obj_t *s_bar_food, *s_bar_fun, *s_bar_nrg;
+/* Change-gate memory for the HUD labels; cleared on every scene build so a
+ * fresh label is never left showing its placeholder by a stale gate. */
+static char s_pet_prev_mood[48], s_pet_prev_name[24];
+
+/* The designer QR overlay — tap the pet's name to open it. Same machinery as
+ * the DAYS edit QR: the link is minted by the broker, single-use, and the
+ * phone lands on /pet already holding a session code. */
+static lv_obj_t *s_pet_qr_panel, *s_pet_qr, *s_pet_qr_note;
+static lv_obj_t *s_pet_qr_btn, *s_pet_qr_btn_l, *s_pet_qr_tick;
+static char s_pet_link_drawn[256];
+static uint32_t s_pet_link_seen_ver = UINT32_MAX;
+/* The panel's little ceremony: show the code, sync on demand with a visible
+ * wait, then a green tick or a red cross — never a white screen that just
+ * disappears and leaves the user guessing whether anything happened. */
+enum { PET_QR_SHOWING = 0, PET_QR_SYNCING, PET_QR_DONE, PET_QR_FAIL };
+static uint8_t s_pet_qr_state;
 
 static int isin(int deg, int amp) {
     while (deg < 0) deg += 360;
@@ -2431,20 +3797,24 @@ static int rnd(int n) { return (int)(esp_random() % (uint32_t)n); }
 /* surface height under a given x */
 static int ground_y(int x) {
     int dx = x - PLANET_CX;
-    int r2 = PLANET_R * PLANET_R - dx * dx;
+    int r = pet_geo_r();
+    int r2 = r * r - dx * dx;
     if (r2 < 0) r2 = 0;
-    return PLANET_CY - (int)sqrtf((float)r2);
+    return pet_geo_cy() - (int)sqrtf((float)r2);
 }
 
 static const char *pet_mood_text(int *worst) {
-    int m = s_food;
+    int m = s_pet.hunger;
     const char *s = "hungry";
-    if (s_fun < m) { m = s_fun; s = "bored"; }
+    if (s_pet.happy < m) { m = s_pet.happy; s = "bored"; }
     if (s_nrg < m) { m = s_nrg; s = "sleepy"; }
     *worst = m;
+    /* An unanswered cue overrides everything: it is the ask on the clock. */
+    if (s_pet.cue == PET_CUE_HUNGRY) return "feed me?";
+    if (s_pet.cue == PET_CUE_LONELY) return "play with me?";
     if (m > 60) return "having a good day";
     if (m > 30) return s;
-    return (m == s_food) ? "starving!" : (m == s_fun ? "lonely!" : "exhausted!");
+    return (m == s_pet.hunger) ? "starving!" : (m == s_pet.happy ? "lonely!" : "exhausted!");
 }
 
 static void say(const char *txt) {
@@ -2499,38 +3869,258 @@ static void pick_activity(void) {
 }
 
 /* ---- actions from the keys / touch buttons ---- */
+/* Nothing to feed, play with, or tuck in before hatching or after leaving —
+ * these also arrive via the long-press key path, not just the hidden buttons. */
+static bool pet_absent(void) {
+    return s_pet.stage == PET_EGG || s_pet.stage == PET_AWAY;
+}
+
+/* ---- motion controls: the cube itself is the joystick ----
+ *
+ * Tilt the cube and the pet walks downhill toward the dipped edge, faster
+ * the steeper the lean; shake it and the pet is knocked into a hop. Runs at
+ * the main loop's PET-mode 50 Hz IMU cadence, only while PET is the active
+ * app with the screen awake.
+ *
+ * The first version read the lean from s_base_rot and was dead on arrival:
+ * the base detector only flips once an axis DOMINATES (45 degrees plus the
+ * anti-ambiguity margin), so the pet ignored every tilt short of tipping the
+ * cube onto its edge. This one reads the gravity COMPONENT along the screen
+ * edge directly — the direction-to-axis mapping still goes through
+ * rot_from_base(), the same calibrated table autorotate trusts, so all
+ * eight mounting states work. A tilt whose dipped edge would autorotate the
+ * panel to (s_rot + 3) & 3 is one dipping the screen's left edge; PET pins
+ * the panel rotation (see imu_poll) precisely so that mapping cannot change
+ * under the tilt mid-walk. */
+#define PET_LEAN_TH      4200   /* ~0.26 g: a deliberate ~15 degree tip */
+#define PET_LEAN_RELEASE 3000   /* hysteresis so a wobble does not stutter */
+
+static int pet_base_accel(int b) {  /* accel component toward base edge b */
+    switch (b & 3) {
+    case 1:  return s_acc_x;
+    case 3:  return -s_acc_x;
+    case 2:  return s_acc_y;
+    default: return -s_acc_y;       /* base 0 */
+    }
+}
+
+/* Gravity along the screen edge that autorotate would call rotation
+ * (s_rot + rot_delta): +1 is the screen's left edge, +3 its right. Derived
+ * as +3/+1 from the bezel's edge arithmetic and shipped inverted — the
+ * mapping has exactly one free handedness bit, and the user's hands settled
+ * it in one test where four orientations of derivation kept lying. */
+static int pet_lean_signal(int rot_delta) {
+    int want = (s_rot + rot_delta) & 3;
+    for (int b = 0; b < 4; b++)
+        if (rot_from_base(b) == want) return pet_base_accel(b);
+    return 0;
+}
+
+static void pet_motion_poll(void) {
+    static int16_t px, py, pz;
+    static bool primed;
+    static int8_t logged_dir;
+
+    if (pet_absent() || !s_screen_on || s_doze || !s_ch_wrap) {
+        primed = false;
+        logged_dir = 0;
+        s_tilt_vel_tgt = 0;
+        return;
+    }
+
+    int64_t t = now_ms();
+    int jerk = 0;
+    if (primed)
+        jerk = abs(s_acc_x - px) + abs(s_acc_y - py) + abs(s_acc_z - pz);
+    px = s_acc_x; py = s_acc_y; pz = s_acc_z;
+    primed = true;
+
+    /* A hop needs a genuine shake, not a brisk tilt. A tilt gesture crosses
+     * any single-sample threshold for a poll or two on its way over, and on
+     * the glass that read as "tilting makes it jump". A real shake is
+     * violence SUSTAINED: the hot counter charges +2 per high-jerk poll and
+     * drains -1 per calm one, so it only reaches the trigger after ~80 ms of
+     * continuous thrash, and the peak requirement demands the thrash was
+     * actually hard. Both gates were tuned from the user's own play capture:
+     * deliberate shakes peaked 7-36k, tilt transients under 10k briefly. */
+    static int shake_hot, shake_peak;
+    if (jerk > 5500) {
+        if (shake_hot < 20) shake_hot += 2;
+        if (jerk > shake_peak) shake_peak = jerk;
+    } else if (shake_hot > 0) {
+        if (--shake_hot == 0) shake_peak = 0;
+    }
+    if (shake_hot >= 8 && shake_peak > 12000 && t - s_shake_ms > 1200) {
+        s_shake_ms = t;
+        lv_display_trigger_activity(NULL);
+        set_act(ACT_JUMP, 34);
+        /* the world gets it too: harder shake, bigger rattle */
+        s_pet_quake = 24;
+        s_pet_quake_amp = clampi(shake_peak / 2200, 5, 16);
+        say(shake_peak > 22000 ? "earthquake!!" : "wobble!");
+        s_pet.happy = clampi(s_pet.happy + 2, 0, 100);
+        s_pet_dirty = true;
+        pet_seen();
+        ESP_LOGI(TAG, "pet imu: shake peak=%d", shake_peak);
+        shake_hot = 0;
+        shake_peak = 0;
+    }
+
+    /* While the hand is accelerating the cube, the accelerometer measures
+     * the hand, not gravity — a forward tilt with a bit of right in it read
+     * as whatever the motion happened to look like. Steer only from quiet
+     * samples; a held tilt is quiet the moment the wrist stops. */
+    if (jerk > 4500) return;
+
+    /* A shake IS a violent transient lean; let it be a hop, not a sprint.
+     * The window also swallows the rebound of the hand arresting the shake. */
+    if (t - s_shake_ms < 400) return;
+
+    /* A cube PARKED on its side is not a command. When the accelerometer has
+     * been rock-still for ~4 s, whatever pose it rests in becomes the new
+     * level, so a cube leaned against a book stops pinning the pet to a wall
+     * — while a hand-held tilt (never still) steers relative to level.
+     * Baselines seed from the first sample after the app opens: without
+     * that, a cube lying screen-up reads a permanent full-scale pitch and
+     * the jetpack fires itself on open. */
+    static int base_l, base_r, base_z;
+    static int gx_lp, gy_lp, gz_lp;    /* slow gravity estimate, LSB */
+    static bool based;
+    static int still_polls;
+    int raw_l = pet_lean_signal(1), raw_r = pet_lean_signal(3);
+    if (!based) {
+        based = true;
+        /* Only Z seeds from the live pose: flat-on-desk and upright grips
+         * legitimately differ there and absolute zero means nothing. The
+         * L/R baselines MUST stay absolute — seeding them from the opening
+         * pose once declared a tilted pickup "level" and gave the pet a
+         * permanent phantom lean (L=5483 on a level grip, straight from the
+         * log) that also sat on the jetpack's level-gate and refused every
+         * launch. Level is level; only the parked-still adaptation below
+         * may redefine it. */
+        base_l = 0;
+        base_r = 0;
+        base_z = s_acc_z;
+        gx_lp = s_acc_x;
+        gy_lp = s_acc_y;
+        gz_lp = s_acc_z;
+    }
+    if (jerk < 900) {
+        if (still_polls < 200) still_polls++;
+        if (still_polls >= 200) {                /* adopt the resting pose */
+            base_l += (raw_l - base_l) / 8;
+            base_r += (raw_r - base_r) / 8;
+            base_z += (s_acc_z - base_z) / 8;
+        }
+    } else {
+        still_polls = 0;
+    }
+    /* how far the screen has pitched from its level — the flight trigger
+     * only uses this as a "roughly level grip" gate now */
+    s_fly_pitch = s_acc_z - base_z;
+
+    /* ---- vertical-motion sense: the jetpack's real trigger ----
+     * True altitude cannot survive double integration (accelerometer noise
+     * drifts metres in seconds, and this board has no barometer), but a
+     * LIFT is unmistakable: project acceleration onto the low-passed
+     * gravity direction, subtract gravity, and leaky-integrate. A sharp
+     * raise of the whole cube swings the integral hard positive; lowering
+     * the hand swings it negative; a shake alternates and cancels. The
+     * integral leaks to zero in ~0.3 s, so it cannot drift. */
+    gx_lp += (s_acc_x - gx_lp) / 16;
+    gy_lp += (s_acc_y - gy_lp) / 16;
+    gz_lp += (s_acc_z - gz_lp) / 16;
+    static int s_vv;
+    float gxl = gx_lp, gyl = gy_lp, gzl = gz_lp;
+    float gmag = sqrtf(gxl * gxl + gyl * gyl + gzl * gzl);
+    if (gmag > 2000.f) {
+        float av = ((float)s_acc_x * gxl + (float)s_acc_y * gyl +
+                    (float)s_acc_z * gzl) / gmag - gmag;
+        s_vv += (int)av;
+        s_vv -= s_vv / 16;
+        if (s_fly_mode == 0) {
+            /* liftoff wants a sharp raise from a roughly level grip —
+             * generous tolerance, hands are not spirit levels. Near-misses
+             * log too (throttled), so tuning works from the owner's own
+             * lifts instead of another guess. */
+            static int64_t last_miss_log;
+            if (s_vv > 14000 && s_lean_mag < 6500 &&
+                abs(s_fly_pitch) < 8000 && t - s_shake_ms > 600) {
+                s_fly_burst = 1;
+                ESP_LOGI(TAG, "pet imu: lift v=%d", s_vv);
+                s_vv = 0;
+            } else if (s_vv > 9000 && t - last_miss_log > 1500) {
+                last_miss_log = t;
+                ESP_LOGI(TAG, "pet imu: lift near-miss v=%d lean=%d pitch=%d",
+                         s_vv, s_lean_mag, abs(s_fly_pitch));
+            }
+        } else {
+            if (s_vv > 12000)       { s_fly_burst = 1;  s_vv = 0; }
+            else if (s_vv < -12000) { s_fly_burst = -1; s_vv = 0; }
+        }
+    }
+
+    int left = raw_l - base_l, right = raw_r - base_r;
+    int mag = left > right ? left : right;
+    s_lean_mag = mag > 0 ? mag : 0;
+    int dir = 0;
+    if (left > PET_LEAN_TH && left >= right)  dir = -1;
+    else if (right > PET_LEAN_TH)             dir = 1;
+
+    if (dir != 0) {
+        /* Motion play IS attention: without this, sixty seconds of pure
+         * tilt-steering — no touch, no keys — auto-locked the app out from
+         * under the player, and every control then looked dead at once.
+         * FOCUS holds itself awake the same way. */
+        lv_display_trigger_activity(NULL);
+        /* The tilt sets a target VELOCITY for the world, not a destination
+         * for the walker: the timer eases toward it and streams the planet
+         * underneath — the infinite walk. Steeper is faster. */
+        s_tilt_vel_tgt = dir * clampi(2 + (mag - PET_LEAN_TH) / 2500, 2, 6);
+        if (dir != logged_dir) {         /* diagnostics on change, not cadence */
+            logged_dir = (int8_t)dir;
+            ESP_LOGI(TAG, "pet imu: lean %s (L=%d R=%d)",
+                     dir < 0 ? "left" : "right", left, right);
+        }
+        pet_seen();
+    } else if (mag < PET_LEAN_RELEASE) {
+        logged_dir = 0;
+        s_tilt_vel_tgt = 0;              /* momentum decays in the timer */
+    }
+}
+
 static void pet_feed(void) {
-    s_food = clampi(s_food + 18, 0, 100);
+    if (pet_absent()) return;
+    /* A meal: most of it lands now, the rest when the snack is caught and
+     * eaten (ACT_EAT), totalling the meal's +30. Meals reset the snack run. */
+    s_pet.hunger = clampi(s_pet.hunger + 22, 0, 100);
+    s_pet.snack_run = 0;
     s_pet_dirty = true;
+    pet_seen();
     drop_food();
     log_event("pet fed");
 }
 static void pet_play(void) {
-    s_fun = clampi(s_fun + 20, 0, 100);
+    if (pet_absent()) return;
+    s_pet.happy = clampi(s_pet.happy + 20, 0, 100);
     s_nrg = clampi(s_nrg - 8, 0, 100);
     s_pet_dirty = true;
+    pet_seen();
     set_act(ACT_DANCE, 140);
     say("yay!");
     log_event("pet danced");
 }
 static void pet_rest(void) {
+    if (pet_absent()) return;
     s_nrg = clampi(s_nrg + 22, 0, 100);
     s_pet_dirty = true;
+    pet_seen();
     set_act(ACT_NAP, 200);
     say("zzz");
     log_event("pet napped");
 }
-
-/* decay + age, runs whichever screen is showing so the pet really lives */
-static void pet_tick(void) {
-    s_food = clampi(s_food - 1, 0, 100);
-    s_fun  = clampi(s_fun  - 1, 0, 100);
-    s_nrg  = clampi(s_nrg  - 1, 0, 100);
-    static uint32_t sec_acc;
-    sec_acc += PET_TICK_MS / 1000;
-    while (sec_acc >= 60) { sec_acc -= 60; s_pet_age_min++; }
-    s_pet_dirty = true;
-}
+/* Decay, aging, evolution and cues all live in pet_engine_service() now,
+ * beside the blob — the engine runs whichever screen is showing. */
 
 /* tap empty space to send it there, tap the astronaut to pet it,
  * double-tap anywhere to make it dance */
@@ -2540,9 +4130,18 @@ static void scene_tap_cb(lv_event_t *e) {
     bool dbl = (now - last_tap) < 400;
     last_tap = now;
 
+    if (pet_absent()) {
+        /* Tapping the egg is acknowledged — a shiver and a murmur — but an
+         * egg cannot be hurried, and a departed pet is not here to answer. */
+        if (s_pet.stage == PET_EGG) say("...!");
+        pet_seen();
+        return;
+    }
+
     if (dbl) {
-        s_fun = clampi(s_fun + 8, 0, 100);
+        s_pet.happy = clampi(s_pet.happy + 8, 0, 100);
         s_pet_dirty = true;
+        pet_seen();
         set_act(ACT_DANCE, 140);
         say("wheee!");
         return;
@@ -2551,8 +4150,9 @@ static void scene_tap_cb(lv_event_t *e) {
     lv_point_t p;
     lv_indev_get_point(lv_indev_active(), &p);
     if (abs(p.x - s_cx) < 46 && p.y > 180) {          /* on the astronaut */
-        s_fun = clampi(s_fun + 4, 0, 100);
+        s_pet.happy = clampi(s_pet.happy + 4, 0, 100);
         s_pet_dirty = true;
+        pet_seen();
         set_act(ACT_WAVE, 70);
         say("hehe");
     } else {
@@ -2565,6 +4165,13 @@ static bool home_gesture_from_bottom(lv_indev_t *indev);
 /* swipe: up = jump, left/right = dash; bottom-edge up = home */
 static void pet_gesture_cb(lv_event_t *e) {
     lv_indev_t *indev = lv_indev_active();
+    if (pet_absent()) {
+        if (home_gesture_from_bottom(indev)) {
+            lv_indev_wait_release(indev);
+            app_request(APP_DRAWER);
+        }
+        return;
+    }
     switch (lv_indev_get_gesture_dir(indev)) {
     case LV_DIR_TOP:
         if (home_gesture_from_bottom(indev)) {
@@ -2590,10 +4197,140 @@ static void pet_gesture_cb(lv_event_t *e) {
     }
 }
 
+/* HUD refresh, change-gated: lv_label_set_text has no equality short-circuit,
+ * so an unconditional rewrite here is a flush per tick forever. The bars gate
+ * themselves (lv_bar ignores an unchanged value). */
+static void pet_hud_refresh(const char *mood) {
+    if (s_fcount % 10) return;
+    char name[24];
+    uint32_t age_d = s_pet.hatched_utc
+        ? (uint32_t)((time(NULL) - s_pet.hatched_utc) * PET_TIME_SCALE / 86400)
+        : 0;
+    if (s_pet.stage == PET_ADULT)
+        snprintf(name, sizeof(name), "%s  %lud", s_pet.name, (unsigned long)age_d);
+    else
+        snprintf(name, sizeof(name), "%s  %s", s_pet.name, pet_stage_word());
+    if (strcmp(mood, s_pet_prev_mood) != 0) {
+        snprintf(s_pet_prev_mood, sizeof(s_pet_prev_mood), "%s", mood);
+        lv_label_set_text(s_pet_mood, mood);
+    }
+    if (strcmp(name, s_pet_prev_name) != 0) {
+        snprintf(s_pet_prev_name, sizeof(s_pet_prev_name), "%s", name);
+        lv_label_set_text(s_pet_name, name);
+    }
+    lv_bar_set_value(s_bar_food, s_pet.hunger, LV_ANIM_OFF);
+    lv_bar_set_value(s_bar_fun,  s_pet.happy,  LV_ANIM_OFF);
+    lv_bar_set_value(s_bar_nrg,  s_nrg,  LV_ANIM_OFF);
+}
+
+/* Mirrors days_timer_cb's QR section: redraw the code only when the link
+ * actually changed, show honest text while it is being minted or failing —
+ * and run the sync button's little state machine on top. */
+static void pet_qr_refresh(void) {
+    if (!s_pet_qr_panel || lv_obj_has_flag(s_pet_qr_panel, LV_OBJ_FLAG_HIDDEN))
+        return;
+
+    if (s_pet_qr_state == PET_QR_SYNCING) {
+        static const char *dots[] = { "SYNCING", "SYNCING.", "SYNCING..", "SYNCING..." };
+        lv_label_set_text(s_pet_qr_btn_l, dots[(s_fcount / 12) & 3]);
+        uint8_t res = s_pet_cfg_result;
+        if (res == 1) {
+            s_pet_qr_state = PET_QR_DONE;
+            lv_obj_add_flag(s_pet_qr, LV_OBJ_FLAG_HIDDEN);
+            lv_obj_add_flag(s_pet_qr_btn, LV_OBJ_FLAG_HIDDEN);
+            lv_obj_remove_flag(s_pet_qr_tick, LV_OBJ_FLAG_HIDDEN);
+            lv_obj_set_style_bg_color(s_pet_qr_tick, lv_color_hex(0x2E9E5B), 0);
+            lv_label_set_text(lv_obj_get_child(s_pet_qr_tick, 0), LV_SYMBOL_OK);
+            lv_label_set_text(s_pet_qr_note,
+                              "SAVED TO YOUR CUBE\nTap anywhere to see it");
+        } else if (res == 2) {
+            s_pet_qr_state = PET_QR_FAIL;
+            lv_obj_remove_flag(s_pet_qr_tick, LV_OBJ_FLAG_HIDDEN);
+            lv_obj_set_style_bg_color(s_pet_qr_tick, lv_color_hex(0xC0392B), 0);
+            lv_label_set_text(lv_obj_get_child(s_pet_qr_tick, 0), LV_SYMBOL_CLOSE);
+            lv_label_set_text(s_pet_qr_btn_l, "TRY AGAIN");
+            lv_label_set_text(s_pet_qr_note,
+                              "SYNC FAILED\nCheck Wi-Fi, then try again");
+        }
+        return;
+    }
+    if (s_pet_qr_state != PET_QR_SHOWING) return;
+
+    char url[PET_LINK_URL_MAX];
+    uint32_t version;
+    pet_link_snapshot(url, sizeof(url), &version);
+    bool fetching = __atomic_load_n(&s_pet_link_fetching, __ATOMIC_ACQUIRE) ||
+                    __atomic_load_n(&s_req_pet_link, __ATOMIC_ACQUIRE);
+    if (url[0] && s_pet_qr &&
+        (version != s_pet_link_seen_ver || strcmp(url, s_pet_link_drawn) != 0)) {
+        size_t n = strlen(url);
+        if (lv_qrcode_update(s_pet_qr, url, (uint32_t)n) == LV_RESULT_OK) {
+            snprintf(s_pet_link_drawn, sizeof(s_pet_link_drawn), "%s", url);
+            lv_obj_remove_flag(s_pet_qr, LV_OBJ_FLAG_HIDDEN);
+            lv_label_set_text(s_pet_qr_note,
+                              "SCAN, THEN DESIGN ON YOUR PHONE\n"
+                              "Saved there? Press the button below.");
+        } else {
+            lv_obj_add_flag(s_pet_qr, LV_OBJ_FLAG_HIDDEN);
+            lv_label_set_text(s_pet_qr_note, "QR ENCODE FAILED\nTap to close and retry");
+            ESP_LOGW(TAG, "pet: designer QR encode failed (%u bytes)", (unsigned)n);
+        }
+        s_pet_link_seen_ver = version;
+    } else if (!url[0]) {
+        lv_obj_add_flag(s_pet_qr, LV_OBJ_FLAG_HIDDEN);
+        lv_label_set_text(s_pet_qr_note, fetching ? "CREATING SECURE LINK..." :
+                          "BROKER UNAVAILABLE\nTap to close and retry");
+        s_pet_link_seen_ver = version;
+    }
+}
+
+static void pet_qr_open_cb(lv_event_t *e) {
+    lv_event_stop_bubbling(e);        /* the name sits over the tap-to-walk scene */
+    if (!s_pet_qr_panel) return;
+    pet_link_publish("");
+    s_pet_link_drawn[0] = '\0';
+    s_pet_link_seen_ver = UINT32_MAX;
+    s_pet_qr_state = PET_QR_SHOWING;
+    lv_obj_add_flag(s_pet_qr, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_flag(s_pet_qr_tick, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_remove_flag(s_pet_qr_btn, LV_OBJ_FLAG_HIDDEN);
+    lv_label_set_text(s_pet_qr_btn_l, "I SAVED - SYNC NOW");
+    lv_label_set_text(s_pet_qr_note, "CREATING SECURE LINK...");
+    lv_obj_remove_flag(s_pet_qr_panel, LV_OBJ_FLAG_HIDDEN);
+    __atomic_store_n(&s_req_pet_link, true, __ATOMIC_RELEASE);
+}
+
+static void pet_qr_sync_cb(lv_event_t *e) {
+    lv_event_stop_bubbling(e);
+    if (s_pet_qr_state == PET_QR_SYNCING) return;
+    s_pet_qr_state = PET_QR_SYNCING;
+    s_pet_cfg_result = 0;
+    lv_obj_add_flag(s_pet_qr_tick, LV_OBJ_FLAG_HIDDEN);
+    lv_label_set_text(s_pet_qr_note, "TALKING TO THE BROKER...");
+    __atomic_store_n(&s_req_pet_cfg, true, __ATOMIC_RELEASE);
+}
+
+static void pet_qr_close_cb(lv_event_t *e) {
+    lv_event_stop_bubbling(e);
+    /* Mid-sync the panel holds still: dismissing a spinner is how results
+     * get lost. It resolves to a tick or a cross within seconds. */
+    if (s_pet_qr_state == PET_QR_SYNCING) return;
+    if (s_pet_qr_panel) lv_obj_add_flag(s_pet_qr_panel, LV_OBJ_FLAG_HIDDEN);
+    /* Closing without pressing SYNC still fetches — a safety net for the
+     * user who saved on the phone and just taps the panel away. */
+    if (s_pet_qr_state == PET_QR_SHOWING) {
+        __atomic_store_n(&s_req_pet_cfg, true, __ATOMIC_RELEASE);
+        say("syncing...");
+    }
+    s_pet_qr_state = PET_QR_SHOWING;
+}
+
 static void pet_timer_cb(lv_timer_t *t) {
     if (!s_ch_wrap) return;
     s_fcount++;
     s_aframe++;
+
+    pet_qr_refresh();
 
     int worst;
     const char *mood = pet_mood_text(&worst);
@@ -2624,10 +4361,26 @@ static void pet_timer_cb(lv_timer_t *t) {
         s_ufo_x += 3;
         lv_obj_set_x(s_ufo, s_ufo_x);
         lv_obj_set_y(s_ufo, 96 + isin(s_ufo_life * 5, 12));
+        /* a golden one drops its treasure as it passes overhead */
+        if (s_ufo_gold && !s_ufo_dropped && s_ufo_x > 150) {
+            s_ufo_dropped = true;
+            for (int g = 0; g < 2; g++) {
+                if (s_gem_on[g]) continue;
+                s_gem_on[g] = true;
+                s_gem_x[g] = (int16_t)(s_cx + (g ? 120 : -90) + rnd(50));
+                lv_obj_remove_flag(s_gem[g], LV_OBJ_FLAG_HIDDEN);
+            }
+            say("!!");
+        }
         if (!s_ufo_life) lv_obj_add_flag(s_ufo, LV_OBJ_FLAG_HIDDEN);
     } else if (rnd(1400) == 0) {
         s_ufo_life = 190;
         s_ufo_x = -70;
+        /* one flyby in five turns up gold */
+        s_ufo_gold = rnd(5) == 0;
+        s_ufo_dropped = false;
+        lv_obj_set_style_bg_color(s_ufo,
+            lv_color_hex(s_ufo_gold ? 0xFFD54A : pet_col(PC_PROP)), 0);
         lv_obj_remove_flag(s_ufo, LV_OBJ_FLAG_HIDDEN);
     }
 
@@ -2645,6 +4398,340 @@ static void pet_timer_cb(lv_timer_t *t) {
         }
     }
 
+    /* An egg or an empty world: ambient sky only, plus the egg's small signs
+     * of life. Everything below assumes a creature that exists. */
+    if (s_pet.stage == PET_EGG || s_pet.stage == PET_AWAY) {
+        if (s_pet_egg) {
+            /* an occasional shiver, not a metronome — it is supposed to make
+             * you look twice */
+            int ph = s_fcount % 300;
+            lv_obj_set_style_translate_x(s_pet_egg,
+                ph < 24 ? isin(ph * 45, 2) : 0, 0);
+            if (s_fcount % 420 == 200) say("...");
+        }
+        if (s_bubble_life > 0) {
+            s_bubble_life--;
+            lv_obj_set_style_opa(s_bubble,
+                (lv_opa_t)(s_bubble_life > 35 ? 255 : s_bubble_life * 7), 0);
+            if (!s_bubble_life) lv_obj_add_flag(s_bubble, LV_OBJ_FLAG_HIDDEN);
+        }
+        pet_hud_refresh(s_pet.stage == PET_EGG
+                            ? "any day now"
+                            : "gone to see the stars - tap my name");
+        return;
+    }
+
+    /* ---- infinite travel: the world streams under the walker ----
+     * Velocity eases toward the tilt (momentum in, momentum out — the
+     * marble feel), the walker recentres, and everything on the surface
+     * track wraps around the planet. Sky gets parallax: stars at quarter
+     * speed, the moon at an eighth, which is what sells the distance. */
+    if ((s_fcount & 1) && s_tilt_vel != s_tilt_vel_tgt)
+        s_tilt_vel += (s_tilt_vel_tgt > s_tilt_vel) ? 1 : -1;
+
+    /* ---- jetpack: lift the cube, and the pet lifts with it ----
+     * The trigger went through four shapes before landing on the owner's
+     * own spec: not a pitch angle at all, but a sharp physical RAISE of the
+     * whole cube (the vertical-velocity burst from the motion poll), from a
+     * roughly level grip. In flight the same sense keeps flying it: raise
+     * again to climb, lower the hand to descend. Pitch-angle triggers all
+     * failed the hand they were built for — too eager at 18 degrees,
+     * unreachable at 33 from a reclined grip, and a zero-lean gate reset on
+     * the roll every real wrist leaks. */
+    if (s_fly_mode == 0) {
+        bool qr_open = s_pet_qr_panel &&
+                       !lv_obj_has_flag(s_pet_qr_panel, LV_OBJ_FLAG_HIDDEN);
+        int8_t burst = s_fly_burst;
+        s_fly_burst = 0;
+        if (burst == 1 && !qr_open) {
+            s_fly_mode = 1;
+            s_fly_alt = s_fly_peak = 0;
+            s_tilt_vel = s_tilt_vel_tgt = 0;
+            lv_obj_add_flag(s_pet_planet, LV_OBJ_FLAG_HIDDEN);
+            for (int i = 0; i < s_wobj_n; i++)
+                lv_obj_add_flag(s_wobj[i], LV_OBJ_FLAG_HIDDEN);
+            if (s_sign_on) { s_sign_on = false; lv_obj_add_flag(s_sign, LV_OBJ_FLAG_HIDDEN); }
+            if (s_walker_on) { s_walker_on = false; lv_obj_add_flag(s_walker, LV_OBJ_FLAG_HIDDEN); }
+            for (int g = 0; g < 2; g++) {
+                if (!s_gem_on[g]) continue;
+                s_gem_on[g] = false;
+                lv_obj_add_flag(s_gem[g], LV_OBJ_FLAG_HIDDEN);
+            }
+            lv_obj_add_flag(s_food_item, LV_OBJ_FLAG_HIDDEN);
+            s_food_ready = false;
+            s_walking_to_food = false;
+            lv_obj_remove_flag(s_jet_flame, LV_OBJ_FLAG_HIDDEN);
+            set_act(ACT_IDLE, 40);
+            say("liftoff!");
+            log_event("pet flew");
+        }
+    } else {
+        lv_display_trigger_activity(NULL);
+        /* burst-driven: another raise climbs, a lowered hand descends,
+         * silence keeps doing whatever the last gesture said */
+        int8_t burst = s_fly_burst;
+        s_fly_burst = 0;
+        if (burst == 1)       s_fly_mode = 1;
+        else if (burst == -1) s_fly_mode = 2;
+        int climb = (s_fly_mode == 1) ? 6 : -6;
+        s_fly_alt += climb;
+        if (s_fly_alt > s_fly_peak) s_fly_peak = s_fly_alt;
+        if (s_fly_mode == 2 && s_fly_alt <= 0) {
+            /* ---- touchdown ---- */
+            s_fly_alt = 0;
+            s_fly_mode = 0;
+            lv_obj_remove_flag(s_pet_planet, LV_OBJ_FLAG_HIDDEN);
+            for (int i = 0; i < s_wobj_n; i++) {
+                lv_obj_remove_flag(s_wobj[i], LV_OBJ_FLAG_HIDDEN);
+                lv_obj_set_pos(s_wobj[i],
+                               s_wobj_x[i] - lv_obj_get_width(s_wobj[i]) / 2,
+                               ground_y(s_wobj_x[i]) + s_wobj_dy[i]);
+            }
+            for (int g = 0; g < 2; g++) {
+                if (!s_gem_sky[g]) continue;
+                s_gem_sky[g] = false;
+                s_gem_on[g] = false;
+                lv_obj_add_flag(s_gem[g], LV_OBJ_FLAG_HIDDEN);
+            }
+            lv_obj_add_flag(s_jet_flame, LV_OBJ_FLAG_HIDDEN);
+            int m = s_fly_peak / 8;
+            if (m > (int)s_pet.best_alt) {
+                s_pet.best_alt = (uint16_t)m;
+                s_pet.stardust += 10;
+                say("new record!");
+            } else {
+                say("touchdown");
+            }
+            s_pet_dirty = true;
+            s_pet_quake = 10;
+            s_pet_quake_amp = 4;
+        } else if (s_fly_mode) {
+            /* the sky goes by: star field derived from altitude, so climb
+             * and descent replay the same sky in reverse */
+            if ((s_fcount & 1) == 0) {
+                for (int i = 0; i < STAR_N; i++) {
+                    int y = (s_star_by[i] + s_fly_alt * 2 + i * 17) % 500 - 10;
+                    lv_obj_set_y(s_star[i], y);
+                }
+                lv_obj_set_y(s_moon, (58 + s_fly_alt / 2) % 600 - 60);
+            }
+            s_cx = clampi(s_cx + s_tilt_vel_tgt / 2, 100, 380);
+            if (s_fcount & 1) lv_obj_set_height(s_jet_flame, 10 + rnd(10));
+            if (s_fly_mode == 1 && climb > 0 && (s_fly_alt % 96) < climb) {
+                for (int g = 0; g < 2; g++) {
+                    if (s_gem_on[g]) continue;
+                    s_gem_on[g] = true;
+                    s_gem_sky[g] = true;
+                    s_gem_x[g] = (int16_t)(90 + rnd(300));
+                    s_gem_y[g] = -20;
+                    lv_obj_remove_flag(s_gem[g], LV_OBJ_FLAG_HIDDEN);
+                    break;
+                }
+            }
+        }
+    }
+
+    bool traveling = s_tilt_vel != 0 && s_fly_mode == 0;
+    if (traveling) {
+        s_face = s_tilt_vel > 0 ? 1 : -1;
+        if (s_cx < 238)      s_cx += 2;
+        else if (s_cx > 242) s_cx -= 2;
+        if (s_act == ACT_WALK) set_act(ACT_IDLE, 40);  /* travel owns the legs */
+        s_next_pick = s_fcount + 150;                  /* no daydreams mid-hike */
+
+        int dx = -s_tilt_vel;
+        for (int i = 0; i < s_wobj_n; i++) {
+            int x = s_wobj_x[i] + dx;
+            if (x >= 560)      x -= WOBJ_WRAP;
+            else if (x < -80)  x += WOBJ_WRAP;
+            s_wobj_x[i] = (int16_t)x;
+            /* off-track x lands ground_y at the planet's centre — below the
+             * panel — so things genuinely set behind the horizon */
+            lv_obj_set_pos(s_wobj[i], x - lv_obj_get_width(s_wobj[i]) / 2,
+                           ground_y(x) + s_wobj_dy[i]);
+        }
+
+        s_sky_par += dx;
+        if (s_sky_par >= 4 * 480 || s_sky_par <= -4 * 480) s_sky_par = 0;
+        if ((s_fcount & 3) == 0) {
+            static const uint16_t par_sx[STAR_N] = { 34, 78, 132, 190, 250, 300,
+                                                     352, 404, 60, 220, 330, 430 };
+            for (int i = 0; i < STAR_N; i++) {
+                int x = (par_sx[i] * 480 / 460 + s_sky_par / 4) % 480;
+                if (x < 0) x += 480;
+                lv_obj_set_x(s_star[i], x);
+            }
+            int mx = (76 + s_sky_par / 8) % 526;
+            if (mx < 0) mx += 526;
+            lv_obj_set_x(s_moon, mx - 46);
+        }
+
+        /* a landed snack rides the ground; the walker eats it in passing */
+        if (s_food_ready) {
+            s_food_x += dx;
+            if (s_food_x < -20 || s_food_x > 500) {
+                lv_obj_add_flag(s_food_item, LV_OBJ_FLAG_HIDDEN);
+                s_food_ready = false;
+                s_walking_to_food = false;
+            } else if (abs(s_food_x - s_cx) < 24 && s_act != ACT_EAT) {
+                s_walking_to_food = false;
+                set_act(ACT_EAT, 90);
+            }
+        }
+
+        /* ---- the road pays out ---- */
+        s_travel_acc += abs(dx);
+        while (s_travel_acc >= 10) {
+            s_travel_acc -= 10;
+            s_pet.odo_m++;
+            if (s_pet.odo_m % PET_LAP_M == 0) {
+                s_pet.laps++;
+                s_pet.stardust += 25;
+                s_pet_quake = 18;                 /* celebratory rattle */
+                s_pet_quake_amp = 7;
+                say("LAP!");
+                s_pet_dirty = true;
+                log_event("pet lap");
+            }
+            /* every 250 m the land subtly changes its mind — biome drift.
+             * Color only, boundary only: retinting the ground is one big
+             * invalidation, affordable at walking pace, never per frame.
+             * Mono themes skip it; two tones are their whole contract. */
+            if (s_pet.odo_m % 250 == 0 && s_pet_planet &&
+                !s_pet_theme_pal[s_pet.theme & 3].mono) {
+                lv_color_t g = lv_color_hex(pet_col(PC_GROUND));
+                switch ((s_pet.odo_m / 250) & 3) {
+                case 1:  g = lv_color_darken(g, 40); break;
+                case 2:  g = lv_color_lighten(g, 28); break;
+                case 3:  g = lv_color_darken(g, 78); break;
+                default: break;
+                }
+                lv_obj_set_style_bg_color(s_pet_planet, g, 0);
+            }
+            /* a signpost stands 12 m short of every quarter-lap mark */
+            if (!s_sign_on && (s_pet.odo_m + 12) % 125 == 0) {
+                s_sign_on = true;
+                s_sign_x = (int16_t)(s_cx + s_face * (330 + rnd(90)));
+                lv_label_set_text_fmt(s_sign_label, "%lu",
+                                      (unsigned long)(s_pet.odo_m + 12));
+                lv_obj_remove_flag(s_sign, LV_OBJ_FLAG_HIDDEN);
+            }
+        }
+        if (s_sign_on) {
+            int x = s_sign_x + dx;
+            if (x < -80 || x >= 560) {
+                s_sign_on = false;
+                lv_obj_add_flag(s_sign, LV_OBJ_FLAG_HIDDEN);
+            } else {
+                s_sign_x = (int16_t)x;
+                lv_obj_set_pos(s_sign, x - 24, ground_y(x) - 54);
+            }
+        }
+        if (s_pet.odo_m >= s_gem_next_m) {
+            for (int g = 0; g < 2; g++) {
+                if (s_gem_on[g]) continue;
+                s_gem_on[g] = true;
+                s_gem_x[g] = (int16_t)(s_cx + s_face * (300 + rnd(160)));
+                lv_obj_remove_flag(s_gem[g], LV_OBJ_FLAG_HIDDEN);
+                break;
+            }
+            s_gem_next_m = s_pet.odo_m + 15 + rnd(35);
+        }
+        for (int g = 0; g < 2; g++) {
+            if (!s_gem_on[g]) continue;
+            int x = s_gem_x[g] + dx;
+            if (x < -80 || x >= 560) {            /* left behind */
+                s_gem_on[g] = false;
+                lv_obj_add_flag(s_gem[g], LV_OBJ_FLAG_HIDDEN);
+                continue;
+            }
+            s_gem_x[g] = (int16_t)x;
+        }
+        if (!s_walker_on && s_pet.odo_m >= s_walker_next_m) {
+            s_walker_on = true;
+            s_walker_waved = false;
+            s_walker_dir = (int8_t)-s_face;       /* coming the other way */
+            s_walker_x = (int16_t)(s_cx + s_face * (340 + rnd(120)));
+            lv_obj_remove_flag(s_walker, LV_OBJ_FLAG_HIDDEN);
+        }
+        if (s_walker_on) s_walker_x = (int16_t)(s_walker_x + dx);
+    }
+
+    if (s_was_traveling && !traveling) s_pet_dirty = true;   /* bank the odometer */
+    s_was_traveling = traveling;
+
+    /* The stranger walks on its own feet whether or not the world scrolls,
+     * waves once as you cross, and leaves the way it came. */
+    if (s_walker_on) {
+        s_walker_x = (int16_t)(s_walker_x + s_walker_dir * 2);
+        if (s_walker_x < -60 || s_walker_x > 540) {
+            s_walker_on = false;
+            lv_obj_add_flag(s_walker, LV_OBJ_FLAG_HIDDEN);
+            s_walker_next_m = s_pet.odo_m + 60 + rnd(120);
+        } else {
+            lv_obj_set_pos(s_walker, s_walker_x - 10,
+                           ground_y(s_walker_x) - 17 + isin(s_fcount * 20, 2));
+            if (!s_walker_waved && abs(s_walker_x - s_cx) < 52) {
+                s_walker_waved = true;
+                s_pet.happy = clampi(s_pet.happy + 2, 0, 100);
+                say("* waves *");
+                if (s_act == ACT_IDLE) set_act(ACT_WAVE, 60);
+            }
+        }
+    }
+
+    /* Crystals shine and get collected whether moving, standing or flying. */
+    for (int g = 0; g < 2; g++) {
+        if (!s_gem_on[g]) continue;
+        lv_obj_set_style_opa(s_gem[g],
+            (lv_opa_t)(200 + isin((s_fcount * 9 + g * 120) % 360, 55)), 0);
+        if (s_gem_sky[g]) {
+            /* sky treasure sails past the climber */
+            s_gem_y[g] = (int16_t)(s_gem_y[g] + (s_fly_mode == 1 ? 6 : 2));
+            if (s_gem_y[g] > 500) {
+                s_gem_on[g] = false;
+                s_gem_sky[g] = false;
+                lv_obj_add_flag(s_gem[g], LV_OBJ_FLAG_HIDDEN);
+                continue;
+            }
+            lv_obj_set_pos(s_gem[g], s_gem_x[g] - 6, s_gem_y[g]);
+            int fly_y = clampi(360 - s_fly_alt, 170, 400);
+            if (abs(s_gem_x[g] - s_cx) < 34 && abs(s_gem_y[g] - fly_y) < 40) {
+                s_gem_on[g] = false;
+                s_gem_sky[g] = false;
+                lv_obj_add_flag(s_gem[g], LV_OBJ_FLAG_HIDDEN);
+                s_pet.stardust += 5;
+                s_pet.happy = clampi(s_pet.happy + 1, 0, 100);
+                s_pet_dirty = true;
+                say("+5*");
+            }
+            continue;
+        }
+        lv_obj_set_pos(s_gem[g], s_gem_x[g] - 6, ground_y(s_gem_x[g]) - 15);
+        if (abs(s_gem_x[g] - s_cx) < 26) {
+            s_gem_on[g] = false;
+            lv_obj_add_flag(s_gem[g], LV_OBJ_FLAG_HIDDEN);
+            s_pet.stardust += 5;
+            s_pet.happy = clampi(s_pet.happy + 1, 0, 100);
+            s_pet_dirty = true;
+            say("+5*");
+        }
+    }
+
+    /* the odometer takes over the mood line while the road is rolling;
+     * the altimeter takes over from the odometer in the sky */
+    if (traveling) {
+        snprintf(s_trav_hud, sizeof(s_trav_hud), "%lum  lap %u",
+                 (unsigned long)(s_pet.odo_m - s_pet.odo_m % 5),
+                 (unsigned)s_pet.laps);
+        mood = s_trav_hud;
+    }
+    if (s_fly_mode) {
+        snprintf(s_trav_hud, sizeof(s_trav_hud), "ALT %dm  best %um",
+                 s_fly_alt / 8, (unsigned)s_pet.best_alt);
+        mood = s_trav_hud;
+    }
+
     /* falling snack */
     if (!lv_obj_has_flag(s_food_item, LV_OBJ_FLAG_HIDDEN)) {
         int gy = ground_y(s_food_x) - 14;
@@ -2659,7 +4746,23 @@ static void pet_timer_cb(lv_timer_t *t) {
     int bob = 0, lean = 0, leg_l = 0, leg_r = 0, arm = 0;
     int eye_h = 12, squash = 0;
 
-    switch (s_act) {
+    if (s_fly_mode) {
+        /* airborne: limbs trail, eyes wide, everything floats */
+        bob   = isin(s_fcount * 6, 4);
+        arm   = 12;
+        leg_l = isin(s_fcount * 10, 3);
+        leg_r = -leg_l;
+        eye_h = 14;
+    } else if (traveling && s_act == ACT_IDLE) {
+        /* the travelling gait: same limbs as ACT_WALK, cadence scaled to
+         * how hard the world is being tilted */
+        int step = (s_fcount * (14 + abs(s_tilt_vel) * 4)) % 360;
+        leg_l = isin(step, 7);
+        leg_r = -leg_l;
+        arm   = -leg_l;
+        bob   = -abs(isin(step * 2, 3));
+        if (worst <= 30) eye_h = 6;
+    } else switch (s_act) {
     case ACT_WALK: {
         int d = s_tx - s_cx;
         if (abs(d) <= s_walk_speed) {
@@ -2681,7 +4784,7 @@ static void pet_timer_cb(lv_timer_t *t) {
         if (s_aframe == 4) { say("yum!"); }
         if (s_aframe == 10) {
             lv_obj_add_flag(s_food_item, LV_OBJ_FLAG_HIDDEN);
-            s_food = clampi(s_food + 10, 0, 100);
+            s_pet.hunger = clampi(s_pet.hunger + 8, 0, 100);
             s_pet_dirty = true;
         }
         squash = isin(s_aframe * 40, 5);
@@ -2747,10 +4850,32 @@ static void pet_timer_cb(lv_timer_t *t) {
     }
     if (s_act != ACT_IDLE) s_next_pick = s_fcount + 150 + rnd(220);
 
-    /* ---- place the character on the surface ---- */
+    /* ---- the quake: a shake rattles the WORLD, not just the pet ----
+     * Sky props and the creature jitter on decaying sine offsets; the big
+     * ground circle stays put because translating it invalidates a
+     * full-width band per frame. Small objects, small dirty rects. */
+    int qx = 0, qy = 0;
+    if (s_pet_quake > 0) {
+        s_pet_quake--;
+        int a = (s_pet_quake_amp * s_pet_quake) / 24;
+        qx = isin(s_pet_quake * 67, a);
+        qy = isin(s_pet_quake * 53 + 90, a / 2);
+        lv_obj_set_style_translate_x(s_moon, qx, 0);
+        for (int i = 0; i < STAR_N; i += 2)
+            lv_obj_set_style_translate_y(s_star[i], qy, 0);
+        if (!s_pet_quake) {                     /* settle everything back */
+            lv_obj_set_style_translate_x(s_moon, 0, 0);
+            for (int i = 0; i < STAR_N; i += 2)
+                lv_obj_set_style_translate_y(s_star[i], 0, 0);
+        }
+    }
+
+    /* ---- place the character on the surface (or above it) ---- */
     int gy = ground_y(s_cx);
-    lv_obj_set_x(s_ch_wrap, s_cx - CH_W / 2 + lean);
-    lv_obj_set_y(s_ch_wrap, gy - CH_H + bob);
+    int base_y = gy - CH_H;
+    if (s_fly_mode) base_y = clampi(360 - s_fly_alt, 170, gy - CH_H);
+    lv_obj_set_x(s_ch_wrap, s_cx - CH_W / 2 + lean + qx);
+    lv_obj_set_y(s_ch_wrap, base_y + bob + qy);
 
     static int p_eye = -1, p_ll = 999, p_arm = 999, p_sq = 999, p_face = 0;
     if (eye_h != p_eye) {
@@ -2769,18 +4894,24 @@ static void pet_timer_cb(lv_timer_t *t) {
         p_arm = arm;
     }
     if (squash != p_sq) {
-        lv_obj_set_size(s_ch_body, CH_W - 8 + squash, 40 - squash);
+        if (s_pet.species == 1)
+            lv_obj_set_size(s_ch_body, CH_W - 4 + squash, 44 - squash);
+        else
+            lv_obj_set_size(s_ch_body, CH_W - 8 + squash, 40 - squash);
         p_sq = squash;
     }
-    if (s_face != p_face) {                       /* shift the visor to "face" a way */
-        lv_obj_align(s_ch_visor, LV_ALIGN_TOP_MID, s_face * 3, 6);
+    if (s_face != p_face) {                       /* shift the face to "look" a way */
+        lv_obj_align(s_ch_visor, LV_ALIGN_TOP_MID, s_face * 3,
+                     s_pet.species == 1 ? 8 : 6);
         p_face = s_face;
     }
 
-    /* antenna light blinks slowly */
-    if (s_fcount % 20 == 0) {
+    /* antenna light blinks slowly — the astronaut's alone; on the cat the
+     * slot holds an ear, and a blinking ear is nobody's pet */
+    if (s_pet.species == 0 && s_fcount % 20 == 0) {
         lv_obj_set_style_bg_color(s_ch_antdot,
-            lv_color_hex((s_fcount / 20) % 2 ? 0xE76F51 : 0x5A2A20), 0);
+            lv_color_hex((s_fcount / 20) % 2 ? pet_col(PC_ACCENT)
+                                             : pet_col(PC_BODY_DARK)), 0);
     }
 
     /* speech bubble rides above the head */
@@ -2792,14 +4923,7 @@ static void pet_timer_cb(lv_timer_t *t) {
         if (!s_bubble_life) lv_obj_add_flag(s_bubble, LV_OBJ_FLAG_HIDDEN);
     }
 
-    /* HUD refresh is cheap but pointless every frame */
-    if (s_fcount % 10 == 0) {
-        lv_label_set_text(s_pet_mood, mood);
-        lv_label_set_text_fmt(s_pet_name, "PIP  %lum", (unsigned long)s_pet_age_min);
-        lv_bar_set_value(s_bar_food, s_food, LV_ANIM_OFF);
-        lv_bar_set_value(s_bar_fun,  s_fun,  LV_ANIM_OFF);
-        lv_bar_set_value(s_bar_nrg,  s_nrg,  LV_ANIM_OFF);
-    }
+    pet_hud_refresh(mood);
 }
 
 /* ---------------- scene construction ---------------- */
@@ -2843,6 +4967,36 @@ static int s_touch_start_y = -1;
 static void touch_origin_cb(lv_event_t *e) {
     lv_indev_t *indev = lv_event_get_user_data(e);
     if (!indev) return;
+
+    /* A dark panel is not an inert one. esp_lcd_panel_disp_on_off() stops the
+     * CO5300 emitting and scanning; it does not stop the touch controller, the
+     * indev, LVGL, or a single widget. The whole UI stays live and invisible,
+     * so every button on the screen you cannot see still takes clicks — the
+     * lock screen's transport really did skip tracks from inside a pocket.
+     *
+     * This was guarded per-widget before: lock_tap_cb and lock_np_tap_cb each
+     * tested s_screen_on, which covered the screen and the cover art and
+     * nothing else. Prev, play and next were added later and inherited no such
+     * test, because there was nothing central to inherit it FROM — a gate per
+     * widget is a hole per widget anyone adds afterwards.
+     *
+     * One gate on the indev covers clicks, gestures and scrolls at once:
+     * CLICKED is sent on release, and wait_release cancels the release for this
+     * touch entirely. The wake request is raised here rather than left to the
+     * handler being cancelled, so touch-to-wake still works — and it now works
+     * from any screen rather than only from the two that happened to test for
+     * it. Pocket lock refuses the request downstream, at its single consumer.
+     *
+     * Those two handlers keep their own checks: this registration lives inside
+     * an `if (ui_lock())` at boot, so a lock timeout there would leave no gate
+     * at all, and the lock screen is the one place that must not fail open. */
+    if (!s_screen_on) {
+        s_req_wake = true;
+        s_touch_start_y = -1;          /* no gesture may be judged from it */
+        lv_indev_wait_release(indev);
+        return;
+    }
+
     lv_point_t point;
     lv_indev_get_point(indev, &point);
     s_touch_start_y = point.y;
@@ -2864,127 +5018,429 @@ static void gesture_home_cb(lv_event_t *e) {
     }
 }
 
+/* ---- the snack bar ----
+ *
+ * One banner, three modes: always-on, FOCUS's rotation lock, and pocket lock.
+ * Each is a toggle with no other trace on the glass at the moment it is
+ * pressed, so all any of them has to say is which way it just went — amber for
+ * on, slate for off. This was three copies of eleven style calls before the
+ * third one, which is the point they would have started to drift.
+ *
+ * Wording is a convention, not a free field: "<MODE>  ON" / "<MODE>  OFF",
+ * double-spaced, matching the always-on banner these were all modelled on. It
+ * also keeps the widest string inside the panel — at 18 px with 3 px letter
+ * spacing, "ROTATION LOCK DISABLED" measured 373 px, which puts its edges
+ * 53 px from the glass and into the band the curved cover clips.
+ *
+ * Returned rather than merely built, because FOCUS freezes the panel and has to
+ * counter-rotate its banner before it fades; callers on a screen that
+ * autorotates normally can ignore the return.
+ *
+ * fade_out animates opacity and does NOT delete, so the delayed delete is not
+ * optional — without it every toggle leaves an invisible label on the screen.
+ * Deleting the screen first cancels the animation and the pending delete along
+ * with it, so this is safe even if the app is torn down mid-fade. */
+static lv_obj_t *toast_show(const char *text, bool on, lv_coord_t dx, lv_coord_t dy) {
+    lv_obj_t *t = lv_label_create(lv_screen_active());
+    lv_obj_set_style_text_font(t, &hud_text_18, 0);
+    lv_obj_set_style_text_letter_space(t, 3, 0);
+    lv_obj_set_style_text_color(t, lv_color_hex(on ? 0xF59E0B : 0x7C8AA5), 0);
+    lv_obj_set_style_bg_color(t, lv_color_hex(0x08131C), 0);
+    lv_obj_set_style_bg_opa(t, 235, 0);
+    lv_obj_set_style_pad_all(t, 14, 0);
+    lv_obj_set_style_radius(t, 14, 0);
+    lv_obj_set_style_border_width(t, 1, 0);
+    lv_obj_set_style_border_color(t, lv_color_hex(on ? 0xF59E0B : 0x33465C), 0);
+    lv_label_set_text(t, text);
+    /* A label is not clickable by default, but this one lands over the lock
+     * screen's tap-to-unlock area — stated rather than inherited. */
+    lv_obj_remove_flag(t, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_align(t, LV_ALIGN_CENTER, dx, dy);
+    lv_obj_fade_out(t, 900, 900);
+    lv_obj_delete_delayed(t, 1900);
+    return t;
+}
+
+/* 76 px tall with widened hit test and 20 px type — the touch-target rule
+ * from HARDWARE.md pitfall #24. The first pass shipped these at 48 px and
+ * they mis-tapped on the glass, the same mistake MUSIC's transport and
+ * CONTROL both made once and fixed at 76. */
 static lv_obj_t *make_action_btn(lv_obj_t *parent, const char *txt,
                                  uint32_t color, lv_event_cb_t cb) {
     lv_obj_t *b = lv_button_create(parent);
-    lv_obj_set_size(b, 104, 48);
+    lv_obj_set_size(b, 104, 76);
     lv_obj_set_style_bg_color(b, lv_color_hex(color), 0);
-    lv_obj_set_style_radius(b, 24, 0);
+    lv_obj_set_style_radius(b, 26, 0);
     lv_obj_set_style_shadow_width(b, 0, 0);
+    lv_obj_set_ext_click_area(b, 8);
     lv_obj_add_event_cb(b, cb, LV_EVENT_CLICKED, NULL);
     lv_obj_t *l = lv_label_create(b);
+    lv_obj_set_style_text_font(l, &lv_font_montserrat_20, 0);
     lv_label_set_text(l, txt);
-    lv_obj_set_style_text_color(l, lv_color_hex(0x10162A), 0);
+    /* On a mono theme the button IS the ink color, so the label takes the
+     * paper color; everywhere else near-black reads on every accent. */
+    lv_obj_set_style_text_color(l, lv_color_hex(
+        s_pet_theme_pal[s_pet.theme & 3].mono ? pet_col(PC_SKY) : 0x10162A), 0);
     lv_obj_center(l);
     return b;
 }
 
-/* Unreferenced while FACET_APP_PET is 0. Kept compiled rather than deleted so it
- * cannot bit-rot; --gc-sections drops it from the image, so it costs no flash. */
+/* Unreferenced whenever FACET_APP_PET is 0 — kept compiled rather than deleted
+ * so it cannot bit-rot; --gc-sections drops it from such an image, so the
+ * attribute and this note stay even while the app ships. */
 __attribute__((unused))
+/* The astronaut rig — species 0. Every species fills the same part slots so
+ * the pose code in pet_timer_cb animates any of them. */
+static void pet_build_astro(void) {
+    s_ch_ant = rect(s_ch_wrap, 3, 10, 1, pet_col(PC_PROP));
+    lv_obj_align(s_ch_ant, LV_ALIGN_TOP_MID, 10, -4);
+    s_ch_antdot = rect(s_ch_wrap, 7, 7, 3, pet_col(PC_ACCENT));
+    lv_obj_align(s_ch_antdot, LV_ALIGN_TOP_MID, 10, -10);
+
+    s_ch_pack = rect(s_ch_wrap, 16, 26, 5, pet_col(PC_ACCENT));
+    lv_obj_align(s_ch_pack, LV_ALIGN_TOP_LEFT, 0, 12);
+
+    s_ch_leg_l = rect(s_ch_wrap, 11, 16, 4, pet_col(PC_BODY_DARK));
+    lv_obj_align(s_ch_leg_l, LV_ALIGN_BOTTOM_MID, -10, 0);
+    s_ch_leg_r = rect(s_ch_wrap, 11, 16, 4, pet_col(PC_BODY_DARK));
+    lv_obj_align(s_ch_leg_r, LV_ALIGN_BOTTOM_MID, 10, 0);
+
+    s_ch_arm_l = rect(s_ch_wrap, 9, 20, 4, pet_col(PC_BODY));
+    lv_obj_align(s_ch_arm_l, LV_ALIGN_TOP_LEFT, 3, 22);
+    s_ch_arm_r = rect(s_ch_wrap, 9, 20, 4, pet_col(PC_BODY));
+    lv_obj_align(s_ch_arm_r, LV_ALIGN_TOP_RIGHT, -3, 22);
+
+    /* body last so it sits over the pack and arm roots */
+    s_ch_body = rect(s_ch_wrap, CH_W - 8, 40, 14, pet_col(PC_BODY));
+    lv_obj_align(s_ch_body, LV_ALIGN_TOP_MID, 0, 6);
+
+    s_ch_visor = rect(s_ch_body, 32, 18, 9, pet_col(PC_BODY_DARK));
+    lv_obj_align(s_ch_visor, LV_ALIGN_TOP_MID, 0, 6);
+
+    s_ch_eye_l = rect(s_ch_visor, 6, 12, 3, pet_col(PC_EYE));
+    lv_obj_align(s_ch_eye_l, LV_ALIGN_CENTER, -7, 0);
+    s_ch_eye_r = rect(s_ch_visor, 6, 12, 3, pet_col(PC_EYE));
+    lv_obj_align(s_ch_eye_r, LV_ALIGN_CENTER, 7, 0);
+}
+
+/* BIT the cat — species 1, drawn vector-side until the sprite pipeline lands.
+ * Ears ride the antenna slots (their blink is guarded by species), the tail
+ * rides the pack slot, the face strip is a transparent container so the eye
+ * pose logic works unchanged. */
+static void pet_build_cat(void) {
+    s_ch_ant = rect(s_ch_wrap, 12, 14, 4, pet_col(PC_BODY_DARK));   /* ears */
+    lv_obj_align(s_ch_ant, LV_ALIGN_TOP_MID, -14, 2);
+    s_ch_antdot = rect(s_ch_wrap, 12, 14, 4, pet_col(PC_BODY_DARK));
+    lv_obj_align(s_ch_antdot, LV_ALIGN_TOP_MID, 14, 2);
+
+    s_ch_pack = rect(s_ch_wrap, 6, 22, 3, pet_col(PC_BODY_DARK));   /* tail */
+    lv_obj_align(s_ch_pack, LV_ALIGN_BOTTOM_LEFT, -2, -14);
+
+    s_ch_leg_l = rect(s_ch_wrap, 12, 12, 5, pet_col(PC_BODY));
+    lv_obj_align(s_ch_leg_l, LV_ALIGN_BOTTOM_MID, -12, 0);
+    s_ch_leg_r = rect(s_ch_wrap, 12, 12, 5, pet_col(PC_BODY));
+    lv_obj_align(s_ch_leg_r, LV_ALIGN_BOTTOM_MID, 12, 0);
+
+    /* front paws in the arm slots, small so the wave reads as a paw lift */
+    s_ch_arm_l = rect(s_ch_wrap, 9, 12, 4, pet_col(PC_BODY));
+    lv_obj_align(s_ch_arm_l, LV_ALIGN_BOTTOM_MID, -20, -4);
+    s_ch_arm_r = rect(s_ch_wrap, 9, 12, 4, pet_col(PC_BODY));
+    lv_obj_align(s_ch_arm_r, LV_ALIGN_BOTTOM_MID, 20, -4);
+
+    s_ch_body = rect(s_ch_wrap, CH_W - 4, 44, 18, pet_col(PC_BODY));
+    lv_obj_align(s_ch_body, LV_ALIGN_TOP_MID, 0, 8);
+
+    /* transparent face strip: the pose code moves and squints these */
+    s_ch_visor = rect(s_ch_body, 36, 18, 9, pet_col(PC_BODY));
+    lv_obj_set_style_bg_opa(s_ch_visor, LV_OPA_TRANSP, 0);
+    lv_obj_align(s_ch_visor, LV_ALIGN_TOP_MID, 0, 8);
+
+    s_ch_eye_l = rect(s_ch_visor, 6, 12, 3, pet_col(PC_BODY_DARK));
+    lv_obj_align(s_ch_eye_l, LV_ALIGN_CENTER, -9, 0);
+    s_ch_eye_r = rect(s_ch_visor, 6, 12, 3, pet_col(PC_BODY_DARK));
+    lv_obj_align(s_ch_eye_r, LV_ALIGN_CENTER, 9, 0);
+
+    /* blush, the cat's whole charm */
+    lv_obj_t *bl = rect(s_ch_body, 7, 5, 2, pet_col(PC_ACCENT));
+    lv_obj_align(bl, LV_ALIGN_TOP_MID, -17, 22);
+    lv_obj_t *br = rect(s_ch_body, 7, 5, 2, pet_col(PC_ACCENT));
+    lv_obj_align(br, LV_ALIGN_TOP_MID, 17, 22);
+}
+
+/* The hat rides the character wrap, so every pose and hop carries it. */
+static void pet_build_hat(void) {
+    int top = (s_pet.species == 1) ? 0 : -2;
+    switch (s_pet.hat) {
+    case 1: {                                            /* cap */
+        lv_obj_t *dome = rect(s_ch_wrap, 24, 10, 5, pet_col(PC_ACCENT));
+        lv_obj_align(dome, LV_ALIGN_TOP_MID, -2, top - 6);
+        lv_obj_t *brim = rect(s_ch_wrap, 34, 4, 2, pet_col(PC_ACCENT));
+        lv_obj_align(brim, LV_ALIGN_TOP_MID, 4, top + 2);
+        break;
+    }
+    case 2: {                                            /* crown */
+        lv_obj_t *band = rect(s_ch_wrap, 26, 8, 2, pet_col(PC_STAR));
+        lv_obj_align(band, LV_ALIGN_TOP_MID, 0, top - 4);
+        for (int i = 0; i < 3; i++) {
+            lv_obj_t *pt = rect(s_ch_wrap, 6, 7, 1, pet_col(PC_STAR));
+            lv_obj_align(pt, LV_ALIGN_TOP_MID, (i - 1) * 9, top - 10);
+        }
+        break;
+    }
+    case 3: {                                            /* bow */
+        lv_obj_t *l = rect(s_ch_wrap, 10, 9, 3, pet_col(PC_ACCENT));
+        lv_obj_align(l, LV_ALIGN_TOP_MID, -8, top - 6);
+        lv_obj_t *r = rect(s_ch_wrap, 10, 9, 3, pet_col(PC_ACCENT));
+        lv_obj_align(r, LV_ALIGN_TOP_MID, 8, top - 6);
+        lv_obj_t *knot = rect(s_ch_wrap, 6, 6, 2, pet_col(PC_BODY_DARK));
+        lv_obj_align(knot, LV_ALIGN_TOP_MID, 0, top - 5);
+        break;
+    }
+    default:
+        break;
+    }
+}
+
 static void build_pet_app(lv_obj_t *scr) {
     s_scr_pet = scr;
     lv_obj_remove_flag(s_scr_pet, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_set_style_bg_color(s_scr_pet, lv_color_hex(0x0A0F22), 0);
-    lv_obj_set_style_bg_grad_color(s_scr_pet, lv_color_hex(0x241B3A), 0);
+    lv_obj_set_style_bg_color(s_scr_pet, lv_color_hex(pet_col(PC_SKY)), 0);
+    lv_obj_set_style_bg_grad_color(s_scr_pet, lv_color_hex(pet_col(PC_SKY2)), 0);
     lv_obj_set_style_bg_grad_dir(s_scr_pet, LV_GRAD_DIR_VER, 0);
     lv_obj_set_style_pad_all(s_scr_pet, 0, 0);
 
-    /* --- sky --- */
+    const pet_world_pal_t *wp = &s_pet_world_pal[s_pet.world & 3];
+
+    /* --- sky (or water, or night air): the same twelve twinkles play
+     * stars, rising bubbles, fireflies and lit windows — only the color
+     * changes, the stagger animation already reads right for all four --- */
     /* uint16_t, not uint8_t: the five x positions past 255 used to wrap and
      * pile those stars up against the left edge */
     static const uint16_t sx[STAR_N] = { 34, 78, 132, 190, 250, 300, 352, 404, 60, 220, 330, 430 };
     static const uint16_t sy[STAR_N] = { 96, 52, 112, 40, 78, 34, 96, 130, 168, 150, 168, 74 };
     for (int i = 0; i < STAR_N; i++) {
         int sz = (i % 3 == 0) ? 4 : 3;
-        s_star[i] = rect(s_scr_pet, sz, sz, 2, 0xFFF3D6);
+        s_star[i] = rect(s_scr_pet, sz, sz, 2, pet_col(PC_STAR));
         lv_obj_set_pos(s_star[i], sx[i] * 480 / 460, sy[i]);
         s_star_ph[i] = (uint8_t)(i * 7);
     }
 
-    s_moon = rect(s_scr_pet, 46, 46, 23, 0xE9C46A);
+    s_moon = rect(s_scr_pet, 46, 46, 23, pet_col(PC_STAR));
     lv_obj_set_pos(s_moon, 76, 58);
-    lv_obj_t *moon_dip = rect(s_moon, 14, 14, 7, 0xD9B45A);
+    lv_obj_t *moon_dip = rect(s_moon, 14, 14, 7, pet_col(PC_SKY2));
+    lv_obj_set_style_bg_opa(moon_dip, 90, 0);
     lv_obj_set_pos(moon_dip, 8, 12);
+    if (!wp->moon) lv_obj_add_flag(s_moon, LV_OBJ_FLAG_HIDDEN);
 
-    s_shoot = rect(s_scr_pet, 26, 3, 2, 0xFFF3D6);
+    s_shoot = rect(s_scr_pet, 26, 3, 2, pet_col(PC_STAR));
     lv_obj_add_flag(s_shoot, LV_OBJ_FLAG_HIDDEN);
 
-    s_ufo = rect(s_scr_pet, 54, 14, 7, 0xB8C4D9);
+    /* the passer-by: UFO over the planet, a fish in the sea, a butterfly in
+     * the glade, a little plane over the skyline — same flight path */
+    s_ufo = rect(s_scr_pet, 54, 14, 7, pet_col(PC_PROP));
     lv_obj_add_flag(s_ufo, LV_OBJ_FLAG_HIDDEN);
-    lv_obj_t *ufo_dome = rect(s_ufo, 24, 12, 6, 0x8DE0D2);
+    lv_obj_t *ufo_dome = rect(s_ufo, 24, 12, 6, pet_col(PC_STAR));
     lv_obj_align(ufo_dome, LV_ALIGN_TOP_MID, 0, -6);
 
-    /* --- the planet: a big circle, only its cap is on screen --- */
-    lv_obj_t *planet = rect(s_scr_pet, PLANET_R * 2, PLANET_R * 2, PLANET_R, 0x2A9D8F);
-    lv_obj_set_pos(planet, PLANET_CX - PLANET_R, PLANET_CY - PLANET_R);
+    /* --- the ground: a big circle, only its cap is on screen --- */
+    /* The pocket planet is a true circle; the big-radius worlds draw as a
+     * flat slab. This is a renderer constraint, not a style choice: a
+     * radius-2400 rounded rect sends LVGL's software corner mask
+     * (circ_calc_aa4) into a Cache-error panic on every full redraw — the
+     * crash loop of 2026-08-24. The walking surface still follows ground_y's
+     * gentle curve; the few px of sag against the slab's straight horizon
+     * are invisible at these radii. */
+    int gr = pet_geo_r();
+    lv_obj_t *planet;
+    if (gr <= 300) {
+        planet = rect(s_scr_pet, gr * 2, gr * 2, gr, pet_col(PC_GROUND));
+        lv_obj_set_pos(planet, PLANET_CX - gr, pet_geo_cy() - gr);
+    } else {
+        int horizon = pet_geo_cy() - gr;
+        planet = rect(s_scr_pet, 520, 480 - horizon + 40, 0, pet_col(PC_GROUND));
+        lv_obj_set_pos(planet, -20, horizon);
+    }
+    s_pet_planet = planet;
     lv_obj_set_style_border_width(planet, 4, 0);
-    lv_obj_set_style_border_color(planet, lv_color_hex(0x6FD8C8), 0);
+    lv_obj_set_style_border_color(planet, lv_color_hex(pet_col(PC_GROUND_HI)), 0);
     lv_obj_set_style_border_opa(planet, 190, 0);
 
-    lv_obj_t *c1 = rect(planet, 54, 20, 10, 0x21857A);
-    lv_obj_set_pos(c1, PLANET_R - 130, PLANET_R - 232);
-    lv_obj_t *c2 = rect(planet, 34, 14, 7, 0x21857A);
-    lv_obj_set_pos(c2, PLANET_R + 74, PLANET_R - 224);
-    lv_obj_t *c3 = rect(planet, 22, 10, 5, 0x21857A);
-    lv_obj_set_pos(c3, PLANET_R - 16, PLANET_R - 200);
+    /* Everything on the surface rides the travel track — ground details and
+     * props scroll around the planet while the walker holds centre stage.
+     * Positions are (track x of centre, y offset from the surface line). */
+    s_wobj_n = 0;
+    s_tilt_vel = s_tilt_vel_tgt = 0;
+    s_sky_par = 0;
+
+    lv_obj_t *c1 = rect(s_scr_pet, 54, 20, 10, pet_col(PC_SPOT));
+    wobj_add(c1, 137, 18);
+    lv_obj_t *c2 = rect(s_scr_pet, 34, 14, 7, pet_col(PC_SPOT));
+    wobj_add(c2, 331, 30);
+    lv_obj_t *c3 = rect(s_scr_pet, 22, 10, 5, pet_col(PC_SPOT));
+    wobj_add(c3, 235, 66);
+
+    /* --- per-world set dressing, also on the track. Enough of it that a
+     * lap keeps changing scenery even in a mono theme, where structure is
+     * the only signature a world has. --- */
+    switch (s_pet.world & 3) {
+    case 1: {                                        /* the seabed */
+        lv_obj_t *k1 = rect(s_scr_pet, 6, 44, 3, pet_col(PC_SPOT));
+        wobj_add(k1, 99, -40);
+        lv_obj_t *k2 = rect(s_scr_pet, 5, 30, 2, pet_col(PC_GROUND_HI));
+        wobj_add(k2, 390, -26);
+        lv_obj_t *k3 = rect(s_scr_pet, 6, 36, 3, pet_col(PC_GROUND_HI));
+        wobj_add(k3, 505, -32);
+        lv_obj_t *rock = rect(s_scr_pet, 30, 16, 8, pet_col(PC_SPOT));
+        wobj_add(rock, -40, -12);
+        break;
+    }
+    case 2: {                                        /* the glade */
+        lv_obj_t *trunk = rect(s_scr_pet, 10, 46, 3, 0x5D4037);
+        wobj_add(trunk, 377, -42);
+        lv_obj_t *crown = rect(s_scr_pet, 62, 52, 26, pet_col(PC_GROUND_HI));
+        wobj_add(crown, 377, -88);
+        lv_obj_t *bush = rect(s_scr_pet, 34, 20, 10, pet_col(PC_GROUND_HI));
+        wobj_add(bush, 96, -16);
+        lv_obj_t *trunk2 = rect(s_scr_pet, 8, 30, 3, 0x5D4037);
+        wobj_add(trunk2, 520, -26);
+        lv_obj_t *crown2 = rect(s_scr_pet, 40, 34, 17, pet_col(PC_SPOT));
+        wobj_add(crown2, 520, -56);
+        break;
+    }
+    case 3: {                                        /* the rooftop */
+        lv_obj_t *b1 = rect(s_scr_pet, 44, 90, 3, pet_col(PC_SKY2));
+        wobj_add(b1, 82, -84);
+        lv_obj_t *b2 = rect(s_scr_pet, 34, 62, 3, pet_col(PC_SKY2));
+        wobj_add(b2, 400, -58);
+        lv_obj_t *mast = rect(s_scr_pet, 4, 54, 2, pet_col(PC_PROP));
+        wobj_add(mast, 500, -50);
+        lv_obj_t *duct = rect(s_scr_pet, 40, 18, 4, pet_col(PC_SPOT));
+        wobj_add(duct, -30, -14);
+        break;
+    }
+    default: {                                       /* the pocket planet */
+        lv_obj_t *flag_pole = rect(s_scr_pet, 3, 26, 1, pet_col(PC_PROP));
+        wobj_add(flag_pole, 520, -24);
+        lv_obj_t *flag = rect(s_scr_pet, 14, 9, 2, pet_col(PC_ACCENT));
+        wobj_add(flag, 528, -24);
+        lv_obj_t *c4 = rect(s_scr_pet, 40, 16, 8, pet_col(PC_SPOT));
+        wobj_add(c4, -50, 22);
+        break;
+    }
+    }
+    /* park every track object where it belongs before the first scroll */
+    for (int i = 0; i < s_wobj_n; i++) {
+        lv_obj_set_pos(s_wobj[i], s_wobj_x[i] - lv_obj_get_width(s_wobj[i]) / 2,
+                       ground_y(s_wobj_x[i]) + s_wobj_dy[i]);
+    }
+
+    /* --- the encounter reel's cast, hidden until the road deals them --- */
+    for (int g = 0; g < 2; g++) {
+        s_gem[g] = rect(s_scr_pet, 12, 12, 4, pet_col(PC_STAR));
+        lv_obj_set_style_border_width(s_gem[g], 2, 0);
+        lv_obj_set_style_border_color(s_gem[g], lv_color_hex(pet_col(PC_ACCENT)), 0);
+        lv_obj_add_flag(s_gem[g], LV_OBJ_FLAG_HIDDEN);
+        s_gem_on[g] = false;
+    }
+    s_walker = lv_obj_create(s_scr_pet);
+    lv_obj_remove_style_all(s_walker);
+    lv_obj_set_size(s_walker, 20, 18);
+    lv_obj_remove_flag(s_walker, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_remove_flag(s_walker, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_t *wb = rect(s_walker, 20, 14, 6, pet_col(PC_PROP));
+    lv_obj_align(wb, LV_ALIGN_BOTTOM_MID, 0, 0);
+    lv_obj_t *we1 = rect(s_walker, 3, 5, 1, pet_col(PC_SKY));
+    lv_obj_align(we1, LV_ALIGN_BOTTOM_MID, -4, -6);
+    lv_obj_t *we2 = rect(s_walker, 3, 5, 1, pet_col(PC_SKY));
+    lv_obj_align(we2, LV_ALIGN_BOTTOM_MID, 4, -6);
+    lv_obj_add_flag(s_walker, LV_OBJ_FLAG_HIDDEN);
+    s_walker_on = false;
+    s_travel_acc = 0;
+    s_was_traveling = false;
+    s_ufo_gold = s_ufo_dropped = false;
+    s_gem_sky[0] = s_gem_sky[1] = false;
+
+    /* the distance signpost, planted ahead of each lap-quarter */
+    s_sign = lv_obj_create(s_scr_pet);
+    lv_obj_remove_style_all(s_sign);
+    lv_obj_set_size(s_sign, 48, 56);
+    lv_obj_remove_flag(s_sign, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_remove_flag(s_sign, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_t *pole = rect(s_sign, 4, 30, 1, pet_col(PC_PROP));
+    lv_obj_align(pole, LV_ALIGN_BOTTOM_MID, 0, 0);
+    lv_obj_t *board = rect(s_sign, 48, 26, 5, pet_col(PC_STAR));
+    lv_obj_align(board, LV_ALIGN_TOP_MID, 0, 0);
+    s_sign_label = lv_label_create(s_sign);
+    lv_obj_set_style_text_color(s_sign_label, lv_color_hex(pet_col(PC_SKY)), 0);
+    lv_label_set_text(s_sign_label, "");
+    lv_obj_align(s_sign_label, LV_ALIGN_TOP_MID, 0, 4);
+    lv_obj_add_flag(s_sign, LV_OBJ_FLAG_HIDDEN);
+    s_sign_on = false;
+    /* first payouts land soon after the first stroll begins */
+    s_gem_next_m = s_pet.odo_m + 10 + rnd(20);
+    s_walker_next_m = s_pet.odo_m + 40 + rnd(60);
 
     /* rocket on the pad, hidden until it flies */
-    s_rocket = rect(s_scr_pet, 18, 34, 8, 0xE76F51);
+    s_rocket = rect(s_scr_pet, 18, 34, 8, pet_col(PC_ACCENT));
     lv_obj_add_flag(s_rocket, LV_OBJ_FLAG_HIDDEN);
-    lv_obj_t *nose = rect(s_rocket, 10, 10, 5, 0xF4F1DE);
+    lv_obj_t *nose = rect(s_rocket, 10, 10, 5, pet_col(PC_BODY));
     lv_obj_align(nose, LV_ALIGN_TOP_MID, 0, 2);
-    s_flame = rect(s_scr_pet, 8, 16, 4, 0xE9C46A);
+    s_flame = rect(s_scr_pet, 8, 16, 4, pet_col(PC_STAR));
     lv_obj_add_flag(s_flame, LV_OBJ_FLAG_HIDDEN);
 
-    s_food_item = rect(s_scr_pet, 18, 18, 9, 0xF4A261);
+    s_food_item = rect(s_scr_pet, 18, 18, 9, pet_col(PC_ACCENT));
     lv_obj_add_flag(s_food_item, LV_OBJ_FLAG_HIDDEN);
 
-    /* --- the astronaut --- */
+    /* --- the creature the phone chose --- */
     s_ch_wrap = lv_obj_create(s_scr_pet);
     lv_obj_remove_style_all(s_ch_wrap);
     lv_obj_set_size(s_ch_wrap, CH_W, CH_H);
     lv_obj_remove_flag(s_ch_wrap, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_set_pos(s_ch_wrap, 240 - CH_W / 2, 200);
 
-    s_ch_ant = rect(s_ch_wrap, 3, 10, 1, 0xB8C4D9);
-    lv_obj_align(s_ch_ant, LV_ALIGN_TOP_MID, 10, -4);
-    s_ch_antdot = rect(s_ch_wrap, 7, 7, 3, 0xE76F51);
-    lv_obj_align(s_ch_antdot, LV_ALIGN_TOP_MID, 10, -10);
+    if (s_pet.species == 1) pet_build_cat();
+    else                    pet_build_astro();
+    pet_build_hat();
 
-    s_ch_pack = rect(s_ch_wrap, 16, 26, 5, 0xE76F51);
-    lv_obj_align(s_ch_pack, LV_ALIGN_TOP_LEFT, 0, 12);
-
-    s_ch_leg_l = rect(s_ch_wrap, 11, 16, 4, 0x264653);
-    lv_obj_align(s_ch_leg_l, LV_ALIGN_BOTTOM_MID, -10, 0);
-    s_ch_leg_r = rect(s_ch_wrap, 11, 16, 4, 0x264653);
-    lv_obj_align(s_ch_leg_r, LV_ALIGN_BOTTOM_MID, 10, 0);
-
-    s_ch_arm_l = rect(s_ch_wrap, 9, 20, 4, 0xE0DCC8);
-    lv_obj_align(s_ch_arm_l, LV_ALIGN_TOP_LEFT, 3, 22);
-    s_ch_arm_r = rect(s_ch_wrap, 9, 20, 4, 0xE0DCC8);
-    lv_obj_align(s_ch_arm_r, LV_ALIGN_TOP_RIGHT, -3, 22);
-
-    /* body last so it sits over the pack and arm roots */
-    s_ch_body = rect(s_ch_wrap, CH_W - 8, 40, 14, 0xF4F1DE);
-    lv_obj_align(s_ch_body, LV_ALIGN_TOP_MID, 0, 6);
-
-    s_ch_visor = rect(s_ch_body, 32, 18, 9, 0x264653);
-    lv_obj_align(s_ch_visor, LV_ALIGN_TOP_MID, 0, 6);
-
-    s_ch_eye_l = rect(s_ch_visor, 6, 12, 3, 0x8DE0D2);
-    lv_obj_align(s_ch_eye_l, LV_ALIGN_CENTER, -7, 0);
-    s_ch_eye_r = rect(s_ch_visor, 6, 12, 3, 0x8DE0D2);
-    lv_obj_align(s_ch_eye_r, LV_ALIGN_CENTER, 7, 0);
+    /* the jetpack flame, tucked under the character until liftoff */
+    s_jet_flame = rect(s_ch_wrap, 10, 16, 4, pet_col(PC_STAR));
+    lv_obj_align(s_jet_flame, LV_ALIGN_BOTTOM_MID, 0, 16);
+    lv_obj_add_flag(s_jet_flame, LV_OBJ_FLAG_HIDDEN);
+    s_fly_mode = 0;
+    s_fly_alt = s_fly_peak = 0;
+    s_fly_burst = 0;
 
     s_bubble = lv_label_create(s_scr_pet);
-    lv_obj_set_style_text_color(s_bubble, lv_color_hex(0xE9C46A), 0);
+    lv_obj_set_style_text_color(s_bubble, lv_color_hex(pet_col(PC_STAR)), 0);
     lv_label_set_text(s_bubble, "");
     lv_obj_add_flag(s_bubble, LV_OBJ_FLAG_HIDDEN);
 
+    /* --- before hatching / after leaving, the creature is not here --- */
+    s_pet_egg = NULL;
+    if (s_pet.stage == PET_EGG) {
+        lv_obj_add_flag(s_ch_wrap, LV_OBJ_FLAG_HIDDEN);
+        int gy = ground_y(240);
+        s_pet_egg = rect(s_scr_pet, 44, 54, 22, pet_col(PC_BODY));
+        lv_obj_set_pos(s_pet_egg, 240 - 22, gy - 50);
+        lv_obj_t *spot = rect(s_pet_egg, 12, 10, 5, pet_col(PC_ACCENT));
+        lv_obj_set_pos(spot, 8, 14);
+        lv_obj_t *spot2 = rect(s_pet_egg, 8, 7, 3, pet_col(PC_ACCENT));
+        lv_obj_set_pos(spot2, 26, 30);
+        /* the murmurs rise from the shell, not from a walking character */
+        lv_obj_set_pos(s_bubble, 240 + 30, gy - 76);
+    } else if (s_pet.stage == PET_AWAY) {
+        lv_obj_add_flag(s_ch_wrap, LV_OBJ_FLAG_HIDDEN);
+        /* a tiny sign planted where it used to stand */
+        int gy = ground_y(262);
+        lv_obj_t *post = rect(s_scr_pet, 4, 26, 2, pet_col(PC_PROP));
+        lv_obj_set_pos(post, 262, gy - 26);
+        lv_obj_t *board = rect(s_scr_pet, 34, 18, 4, pet_col(PC_STAR));
+        lv_obj_set_pos(board, 247, gy - 42);
+    }
+
     /* --- HUD: name + mood + three slim bars, kept out of the scene --- */
     s_pet_name = lv_label_create(s_scr_pet);
-    lv_obj_set_style_text_color(s_pet_name, lv_color_hex(0xF4F1DE), 0);
+    lv_obj_set_style_text_color(s_pet_name, lv_color_hex(pet_col(PC_TEXT)), 0);
     lv_label_set_text(s_pet_name, "PIP");
     lv_obj_align(s_pet_name, LV_ALIGN_TOP_MID, 0, TOP_MARGIN - 8);
 
@@ -2996,35 +5452,111 @@ static void build_pet_app(lv_obj_t *scr) {
     lv_obj_set_flex_align(bars, LV_FLEX_ALIGN_SPACE_BETWEEN,
                           LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
     lv_obj_remove_flag(bars, LV_OBJ_FLAG_SCROLLABLE);
-    s_bar_food = make_stat_bar(bars, 0xF4A261);
-    s_bar_fun  = make_stat_bar(bars, 0xE76F51);
-    s_bar_nrg  = make_stat_bar(bars, 0x8DE0D2);
+    bool mono = s_pet_theme_pal[s_pet.theme & 3].mono;
+    s_bar_food = make_stat_bar(bars, mono ? pet_col(PC_TEXT) : 0xF4A261);
+    s_bar_fun  = make_stat_bar(bars, mono ? pet_col(PC_TEXT) : 0xE76F51);
+    s_bar_nrg  = make_stat_bar(bars, mono ? pet_col(PC_TEXT) : 0x8DE0D2);
 
     s_pet_mood = lv_label_create(s_scr_pet);
     lv_obj_set_width(s_pet_mood, CONTENT_W);
     lv_obj_set_style_text_align(s_pet_mood, LV_TEXT_ALIGN_CENTER, 0);
-    lv_obj_set_style_text_color(s_pet_mood, lv_color_hex(0x9AA7B8), 0);
+    lv_obj_set_style_text_color(s_pet_mood, lv_color_hex(pet_col(PC_DIM)), 0);
     lv_label_set_text(s_pet_mood, "having a good day");
     lv_obj_align(s_pet_mood, LV_ALIGN_TOP_MID, 0, TOP_MARGIN + 34);
 
-    /* --- touch action bar --- */
-    lv_obj_t *acts = lv_obj_create(s_scr_pet);
-    lv_obj_remove_style_all(acts);
-    lv_obj_set_size(acts, 330, 50);
-    lv_obj_align(acts, LV_ALIGN_BOTTOM_MID, 0, -BOTTOM_MARGIN);
-    lv_obj_set_flex_flow(acts, LV_FLEX_FLOW_ROW);
-    lv_obj_set_flex_align(acts, LV_FLEX_ALIGN_SPACE_BETWEEN,
-                          LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
-    lv_obj_remove_flag(acts, LV_OBJ_FLAG_SCROLLABLE);
-    make_action_btn(acts, "FEED",  0xF4A261, act_feed_cb);
-    make_action_btn(acts, "DANCE", 0xE76F51, act_play_cb);
-    make_action_btn(acts, "NAP",   0x8DE0D2, act_rest_cb);
+    /* --- touch action bar (an egg or an empty world offers no verbs) --- */
+    if (!pet_absent()) {
+        lv_obj_t *acts = lv_obj_create(s_scr_pet);
+        lv_obj_remove_style_all(acts);
+        lv_obj_set_size(acts, 340, 76);
+        lv_obj_align(acts, LV_ALIGN_BOTTOM_MID, 0, -BOTTOM_MARGIN);
+        lv_obj_set_flex_flow(acts, LV_FLEX_FLOW_ROW);
+        lv_obj_set_flex_align(acts, LV_FLEX_ALIGN_SPACE_BETWEEN,
+                              LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+        lv_obj_remove_flag(acts, LV_OBJ_FLAG_SCROLLABLE);
+        /* Mono themes keep their two-tone promise on the verbs too. */
+        make_action_btn(acts, "FEED",  mono ? pet_col(PC_TEXT) : 0xF4A261, act_feed_cb);
+        make_action_btn(acts, "DANCE", mono ? pet_col(PC_TEXT) : 0xE76F51, act_play_cb);
+        make_action_btn(acts, "NAP",   mono ? pet_col(PC_TEXT) : 0x8DE0D2, act_rest_cb);
+    }
+
+    /* Fresh labels must not be gated against a previous build's text. */
+    s_pet_prev_mood[0] = '\0';
+    s_pet_prev_name[0] = '\0';
+
+    /* The name doubles as the door to the phone designer. */
+    lv_obj_add_flag(s_pet_name, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_set_ext_click_area(s_pet_name, 24);
+    lv_obj_add_event_cb(s_pet_name, pet_qr_open_cb, LV_EVENT_CLICKED, NULL);
+
+    /* Designer QR overlay, built last so it sits over everything. White
+     * panel: a QR drawn onto a dark scene scans poorly (the setup QR learned
+     * this); black modules on white with the quiet zone kept. */
+    s_pet_qr_panel = lv_obj_create(s_scr_pet);
+    lv_obj_remove_style_all(s_pet_qr_panel);
+    lv_obj_set_size(s_pet_qr_panel, 480, 480);
+    lv_obj_set_style_bg_color(s_pet_qr_panel, lv_color_hex(0xFFFFFF), 0);
+    lv_obj_set_style_bg_opa(s_pet_qr_panel, LV_OPA_COVER, 0);
+    lv_obj_remove_flag(s_pet_qr_panel, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_event_cb(s_pet_qr_panel, pet_qr_close_cb, LV_EVENT_CLICKED, NULL);
+    s_pet_qr = lv_qrcode_create(s_pet_qr_panel);
+    lv_qrcode_set_size(s_pet_qr, 200);
+    lv_qrcode_set_dark_color(s_pet_qr, lv_color_hex(0x000000));
+    lv_qrcode_set_light_color(s_pet_qr, lv_color_hex(0xFFFFFF));
+    lv_qrcode_set_quiet_zone(s_pet_qr, true);
+    lv_obj_align(s_pet_qr, LV_ALIGN_CENTER, 0, -58);
+    lv_obj_remove_flag(s_pet_qr, LV_OBJ_FLAG_CLICKABLE);
+    s_pet_qr_note = lv_label_create(s_pet_qr_panel);
+    lv_obj_set_width(s_pet_qr_note, 300);
+    lv_obj_set_style_text_align(s_pet_qr_note, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_style_text_color(s_pet_qr_note, lv_color_hex(0x10162A), 0);
+    lv_label_set_text(s_pet_qr_note, "");
+    lv_obj_align(s_pet_qr_note, LV_ALIGN_CENTER, 0, 74);
+
+    /* The sync button — 72 px per the touch rule. Sized and placed so its
+     * corners sit well inside the panel's corner arcs: on the glass the
+     * first 320x76 at -42 crowded the curve and read as a layout mistake. */
+    s_pet_qr_btn = lv_button_create(s_pet_qr_panel);
+    lv_obj_set_size(s_pet_qr_btn, 292, 72);
+    lv_obj_set_style_radius(s_pet_qr_btn, 24, 0);
+    lv_obj_set_style_bg_color(s_pet_qr_btn, lv_color_hex(0xE76F51), 0);
+    lv_obj_set_style_shadow_width(s_pet_qr_btn, 0, 0);
+    lv_obj_align(s_pet_qr_btn, LV_ALIGN_BOTTOM_MID, 0, -58);
+    lv_obj_add_event_cb(s_pet_qr_btn, pet_qr_sync_cb, LV_EVENT_CLICKED, NULL);
+    s_pet_qr_btn_l = lv_label_create(s_pet_qr_btn);
+    lv_obj_set_style_text_font(s_pet_qr_btn_l, &lv_font_montserrat_20, 0);
+    lv_obj_set_style_text_color(s_pet_qr_btn_l, lv_color_hex(0xFFFFFF), 0);
+    lv_label_set_text(s_pet_qr_btn_l, "I SAVED - SYNC NOW");
+    lv_obj_center(s_pet_qr_btn_l);
+
+    /* the verdict badge: a green tick or a red cross where the QR was */
+    s_pet_qr_tick = lv_obj_create(s_pet_qr_panel);
+    lv_obj_remove_style_all(s_pet_qr_tick);
+    lv_obj_set_size(s_pet_qr_tick, 120, 120);
+    lv_obj_set_style_radius(s_pet_qr_tick, 60, 0);
+    lv_obj_set_style_bg_color(s_pet_qr_tick, lv_color_hex(0x2E9E5B), 0);
+    lv_obj_set_style_bg_opa(s_pet_qr_tick, LV_OPA_COVER, 0);
+    lv_obj_remove_flag(s_pet_qr_tick, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_align(s_pet_qr_tick, LV_ALIGN_CENTER, 0, -28);
+    lv_obj_t *tick_l = lv_label_create(s_pet_qr_tick);
+    lv_obj_set_style_text_font(tick_l, &lv_font_montserrat_20, 0);
+    lv_obj_set_style_text_color(tick_l, lv_color_hex(0xFFFFFF), 0);
+    lv_label_set_text(tick_l, LV_SYMBOL_OK);
+    lv_obj_center(tick_l);
+    lv_obj_add_flag(s_pet_qr_tick, LV_OBJ_FLAG_HIDDEN);
+
+    lv_obj_add_flag(s_pet_qr_panel, LV_OBJ_FLAG_HIDDEN);
 
     /* tap the world to send it walking, tap the astronaut to pet it */
     lv_obj_add_flag(s_scr_pet, LV_OBJ_FLAG_CLICKABLE);
     lv_obj_add_event_cb(s_scr_pet, scene_tap_cb, LV_EVENT_CLICKED, NULL);
     lv_obj_add_event_cb(s_scr_pet, pet_gesture_cb, LV_EVENT_GESTURE, NULL);
 
+    pet_seen();                     /* opening the app counts as a visit */
+    /* Opening the app is also the natural "did anything change?" moment: a
+     * design saved on the phone should appear on the next visit without the
+     * QR ceremony. The cfg_ver gate makes the fetch free when nothing did. */
+    __atomic_store_n(&s_req_pet_cfg, true, __ATOMIC_RELEASE);
     s_app_timer = lv_timer_create(pet_timer_cb, PET_FPS_MS, NULL);
 }
 
@@ -3423,9 +5955,12 @@ static lv_obj_t *s_cfg_rot_val;
 static lv_obj_t *s_cfg_rot_sw, *s_cfg_rot_btn, *s_cfg_time_sw;
 static lv_obj_t *s_cfg_lockkey_val, *s_cfg_lockkey_btn;
 static lv_obj_t *s_cfg_always_sw, *s_cfg_rings_sw;
+static lv_obj_t *s_cfg_aodim_sw, *s_cfg_aodim_sld;
+static lv_obj_t *s_cfg_aodim_val, *s_cfg_aodim_sub;
 static lv_obj_t *s_cfg_bright_val;
 static lv_obj_t *s_cfg_vol_val;
-static lv_obj_t *s_cfg_batt_bar, *s_cfg_batt_val, *s_cfg_batt_sub;
+static lv_obj_t *s_cfg_batt_bar, *s_cfg_batt_val, *s_cfg_batt_sub, *s_cfg_chgeta_sw;
+static lv_obj_t *s_cfg_chgeta_sub;
 static lv_obj_t *s_cfg_care_val, *s_cfg_care_sub, *s_cfg_care_sld, *s_cfg_care_btn;
 static lv_obj_t *s_cfg_net_val;
 static lv_obj_t *s_cfg_ble_val;
@@ -3507,7 +6042,13 @@ static lv_obj_t *s_cfg_log;
  * control means "this cannot act" (the autorotate switch with no IMU), and a
  * slider that greyed out every time the list moved would read as a fault. This
  * is invisible, and it costs no dirty area mid-scroll. */
-#define CFG_SLIDER_MAX 4
+/* Headroom on purpose. The desk-clock delay slider took this table to exactly
+ * four, and overflowing it is a SILENT downgrade rather than an error:
+ * cfg_slider() simply skips registering, and the unregistered slider then
+ * commits a value whenever a finger lands on it to arrest a scroll — the exact
+ * bug the two guards above exist to prevent, reappearing on whichever control
+ * happened to be added last. */
+#define CFG_SLIDER_MAX 6
 static lv_obj_t *s_cfg_sliders[CFG_SLIDER_MAX];
 static int32_t   s_cfg_slider_snap[CFG_SLIDER_MAX];
 static int       s_cfg_slider_n;
@@ -4145,37 +6686,88 @@ static void cfg_pick_build(lv_obj_t *scr) {
 }
 
 static void cfg_always_cb(lv_event_t *e) {
-    s_always_on = lv_obj_has_state(lv_event_get_target(e), LV_STATE_CHECKED);
+    /* The cosmetic half only. Flipping the MODE from a settings column while
+     * the mode's real switch is a key-hold on the lock screen made two
+     * owners for one state; this one now just decides whether the mode
+     * wears its amber ring. */
+    s_ao_ring_pref = lv_obj_has_state(lv_event_get_target(e), LV_STATE_CHECKED);
     s_req_lock_pref_save = true;
-    ESP_LOGI(TAG, "always-on %s", s_always_on ? "ON" : "OFF");
+    ESP_LOGI(TAG, "desk-clock ring %s", s_ao_ring_pref ? "ON" : "OFF");
 }
 
 static void cfg_rings_cb(lv_event_t *e) {
     s_lock_rings = lv_obj_has_state(lv_event_get_target(e), LV_STATE_CHECKED);
-    /* Drop always-on with them. Leaving it set would strand a faded switch in
-     * the ON position with no way to clear it, and keep the panel awake with
-     * nothing on screen explaining why. */
-    if (!s_lock_rings && s_always_on) {
-        s_always_on = false;
-        if (s_cfg_always_sw) lv_obj_remove_state(s_cfg_always_sw, LV_STATE_CHECKED);
-        ESP_LOGI(TAG, "always-on OFF (rings off, it has no indicator)");
-    }
+    /* Deliberately does NOT touch desk clock. An earlier version force-
+     * disabled it here so its indicator ring could not vanish while the mode
+     * ran — and that coupling was worse than the problem: it silently threw
+     * away a setting the user chose. The amber cue ring simply hides with
+     * the rings; the mode itself is the user's business. */
     s_req_lock_pref_save = true;
     ESP_LOGI(TAG, "lock-screen rings %s", s_lock_rings ? "ON" : "OFF");
+}
+
+/* Minutes above a minute: "dim after  300 s" makes the reader do the division,
+ * and the whole point of a stops table is that every value on it is one a
+ * person would have said out loud. */
+static void ao_dim_label(char *buf, size_t n, int secs) {
+    if (secs >= 60 && secs % 60 == 0) {
+        snprintf(buf, n, "dim after  %d min", secs / 60);
+    } else {
+        snprintf(buf, n, "dim after  %d s", secs);
+    }
+}
+
+/* No brightness write here, and none is missing. This runs on the LVGL task and
+ * the panel belongs to the main loop (pitfall #13); switching the feature off
+ * simply makes the idle block's expression false on its next 20 ms pass, which
+ * restores through ao_dim_set() — the one writer. Same shape as every other
+ * setting in this app: record, raise a flag, let the loop act. */
+static void cfg_aodim_cb(lv_event_t *e) {
+    s_ao_dim_on = lv_obj_has_state(lv_event_get_target(e), LV_STATE_CHECKED);
+    s_req_lock_pref_save = true;
+    ESP_LOGI(TAG, "desk-clock dim pref %s", s_ao_dim_on ? "ON" : "OFF");
+}
+
+/* Same shape as cfg_care_cb and for the same reasons: the readout is rewritten
+ * on every VALUE_CHANGED so the delay reads true while the knob is moving — see
+ * cfg_vol_cb for why that is safe now — and NVS waits for the main loop, because
+ * committing per VALUE_CHANGED erases flash on every pixel of a drag. */
+static void cfg_aodim_delay_cb(lv_event_t *e) {
+    int i = clampi((int)lv_slider_get_value(lv_event_get_target(e)),
+                   0, AO_DIM_STOPS - 1);
+    s_ao_dim_s = s_ao_dim_stops[i];
+    if (s_cfg_aodim_val) {
+        char buf[32];
+        ao_dim_label(buf, sizeof buf, s_ao_dim_s);
+        lv_label_set_text(s_cfg_aodim_val, buf);
+    }
+    if (lv_event_get_code(e) != LV_EVENT_RELEASED) return;
+
+    s_req_lock_pref_save = true;
+    ESP_LOGI(TAG, "desk-clock dim delay -> %d s", s_ao_dim_s);
 }
 
 /* Stated as a percentage, not as volts and not as a mode name. The percentage
  * is the number printed two lines above it in this same card, and the one every
  * other device states; "balanced 4.1V" asks the reader to learn a mapping first.
- * Volts are what we actually write — the percentages are the standard Li-ion
- * curve, and they line up with what the readout shows once a capped cell
- * settles (4.10 V reads ~87%, 4.00 V ~77%). */
+ * Volts are what we actually write, so the percentage is DERIVED from them
+ * rather than written down beside them. The old table said 75/85/100 against
+ * 4.00/4.10/4.20 V while a comment two lines up admitted 4.10 V reads ~87% —
+ * the label and the hardware disagreed by four points, in writing, and the
+ * charge countdown inherited it: it counted down to "85%" while the gauge sailed
+ * through 86 and 87 with the charger still working, then withdrew its estimate
+ * early because the target had notionally been passed. One source of truth
+ * removes the whole class. */
 static int chg_mode_pct(int mode) {
-    switch (mode) {
-        case CHG_LIFESPAN: return 75;
-        case CHG_BALANCED: return 85;
-        default:           return 100;
-    }
+    int mv = chg_cv_mv(chg_mode_cv_code(mode));
+    if (mv <= 0) return 100;
+    /* The firmware's own voltage scale (HARDWARE.md §7: 3.30 V ~ 0%,
+     * 4.20 V ~ 100%). Rounded at BOTH steps — truncating the division first
+     * turns 77.8 into 77 and then into 75, which is how the old hand-written
+     * table's error survived a re-derivation that was supposed to remove it. */
+    int pct = ((mv - 3300) * 100 + 450) / 900;
+    pct = ((pct + 2) / 5) * 5;              /* to the nearest 5 */
+    return clampi(pct, 5, 100);
 }
 
 /* One line saying what the limit buys you. A bare "85%" states a number without
@@ -4201,21 +6793,35 @@ static int chg_slider_to_mode(int val)  { return CHG_LIFESPAN - val; }
 
 /* Three stops on a slider rather than three buttons: it inherits the 76 px
  * touch sizing and the widened hit area that this panel needs, and a row of
- * buttons would have to fight the card's flex column for width. Label on
- * release only, for the reason cfg_vol_cb spells out above. */
+ * buttons would have to fight the card's flex column for width. Percentage and
+ * hint both follow the knob, for the reason cfg_vol_cb spells out above; three
+ * stops is also the case that needed it most, since the knob alone cannot say
+ * which of three unlabelled positions it landed on. chg_mode_pct() is pure
+ * arithmetic on the CV table, not a charger read, so it is free to call per
+ * step. */
 static void cfg_care_cb(lv_event_t *e) {
     int val = clampi((int)lv_slider_get_value(lv_event_get_target(e)),
                      CHG_FULL, CHG_LIFESPAN);
     s_chg_mode = chg_slider_to_mode(val);
-    if (lv_event_get_code(e) != LV_EVENT_RELEASED) return;
-
     if (s_cfg_care_val) {
         lv_label_set_text_fmt(s_cfg_care_val, "charge limit  %d%%",
                               chg_mode_pct(s_chg_mode));
     }
     if (s_cfg_care_sub) lv_label_set_text(s_cfg_care_sub, chg_mode_hint(s_chg_mode));
+    if (lv_event_get_code(e) != LV_EVENT_RELEASED) return;
+
     s_req_chg_save = true;
     ESP_LOGI(TAG, "battery care -> charge to %d%%", chg_mode_pct(s_chg_mode));
+}
+
+/* No RELEASED guard, unlike the sliders in this card: a switch commits once on
+ * a tap rather than streaming values through a drag, so there is no label to
+ * re-lay out under a moving finger. The NVS write is still deferred to the main
+ * loop, because this callback holds the LVGL lock and flash erases must not. */
+static void cfg_chgeta_cb(lv_event_t *e) {
+    s_chg_eta_on = lv_obj_has_state(lv_event_get_target(e), LV_STATE_CHECKED);
+    s_req_chg_save = true;
+    ESP_LOGI(TAG, "charge countdown %s", s_chg_eta_on ? "ON" : "OFF");
 }
 
 /* Arms a single full charge, which reverts itself at charge-done. It is also
@@ -4229,45 +6835,54 @@ static void cfg_care_once_cb(lv_event_t *e) {
     ESP_LOGI(TAG, "one-shot full charge %s", s_chg_once ? "ARMED" : "cancelled");
 }
 
-/* Same shape as cfg_vol_cb and for the same three reasons: the label is only
- * rewritten on release, because resizing it mid-drag re-lays out the card and
- * moves the slider under the finger; the panel write is left to the main loop,
- * because it is QSPI IO that needs the LVGL lock this callback already holds;
- * and NVS waits too, because committing per VALUE_CHANGED would erase flash on
- * every pixel of the drag. */
+/* Same shape as cfg_vol_cb and for the same three reasons: the readout is
+ * rewritten on every VALUE_CHANGED, which is safe because the label's geometry
+ * is pinned (see cfg_vol_cb); the panel write is left to the main loop, because
+ * it is QSPI IO that needs the LVGL lock this callback already holds; and NVS
+ * waits too, because committing per VALUE_CHANGED would erase flash on every
+ * pixel of the drag. The glass is already brightening under the finger — the
+ * number was the one part of this control that lagged behind it. */
 static void cfg_bright_cb(lv_event_t *e) {
     s_bright = clampi((int)lv_slider_get_value(lv_event_get_target(e)),
                       BRIGHT_MIN, 100);
     s_req_bright_apply = true;
-    if (lv_event_get_code(e) != LV_EVENT_RELEASED) return;
-
     if (s_cfg_bright_val) {
         lv_label_set_text_fmt(s_cfg_bright_val, "brightness  %d%%", s_bright);
     }
+    if (lv_event_get_code(e) != LV_EVENT_RELEASED) return;
+
     s_req_bright_save = true;
 }
 
-/* Deliberately does almost nothing while the knob is moving.
+/* The number follows the knob; only the commits wait for the finger to lift.
+ * This is the comment the other three sliders on this panel point at.
  *
- * Rewriting the label on every LV_EVENT_VALUE_CHANGED was a crash: the text
- * length changes, the label sits in a LV_SIZE_CONTENT flex card, so the card and
- * the whole scrolling column re-laid out dozens of times a second — which moves
- * the slider itself while LVGL is midway through delivering an input event to
- * that very slider. The knob position is feedback enough during a drag; the
- * numbers land when you let go.
+ * Rewriting the label on every LV_EVENT_VALUE_CHANGED USED to be a crash, and
+ * the reason is worth keeping: the text length changes, the label sat in a
+ * LV_SIZE_CONTENT flex card, so the card and the whole scrolling column re-laid
+ * out dozens of times a second — which moves the slider itself while LVGL is
+ * midway through delivering an input event to that very slider. What removed
+ * the hazard was not the release guard but the fix underneath it: every readout
+ * above a slider here is now pinned to lv_pct(100) by one montserrat_20 line
+ * (26 px), so the text can change all it likes and the geometry does not. The
+ * guard outlived the bug it was standing in for, and a value that only appears
+ * after you let go reads as a control that did not hear you. Those pinned
+ * heights are now load-bearing: a readout on this panel that goes back to
+ * LV_SIZE_CONTENT brings the crash back with it.
  *
  * NVS is written from the main loop rather than here, because a commit erases
- * flash and can block for tens of milliseconds with the LVGL lock held. */
+ * flash and can block for tens of milliseconds with the LVGL lock held. The
+ * confirmation clip waits for release too — one per drag, not one per pixel. */
 static void cfg_vol_cb(lv_event_t *e) {
     s_vol = (int)lv_slider_get_value(lv_event_get_target(e));
-    if (lv_event_get_code(e) != LV_EVENT_RELEASED) return;
-
     if (s_cfg_vol_val) {
         /* integer dB, not %f: newlib's float formatting is stack-hungry and this
          * runs on the LVGL task, whose 8 KB is already carrying the renderer */
         lv_label_set_text_fmt(s_cfg_vol_val, "volume  %d%%   /   %+d dB",
                               s_vol, (int)vol_db(s_vol));
     }
+    if (lv_event_get_code(e) != LV_EVENT_RELEASED) return;
+
     s_req_vol_save = true;
     sfx_play(SFX_DONE);      /* the loudest clip: the one to judge a level by */
 }
@@ -4380,11 +6995,10 @@ static void cfg_timer_cb(lv_timer_t *t) {
         cfg_button_live(s_cfg_rot_btn, s_autorot);
     }
 
-    /* Always-on has no standing indicator once the rings are off: the amber
-     * base ring IS the readout, and lock_refresh() hides it with the rest.
-     * The mode would still run, which is worse than it not running — a lit
-     * panel with nothing saying why. Same fade-not-hide treatment the
-     * calibration button gets, and change-gated for the same reason. */
+    /* The amber-ring preference is meaningless without rings to host it —
+     * an amber ring cannot appear in a ring set that does not exist — so it
+     * fades with them. Only the cosmetic switch fades: the desk-clock MODE
+     * lives on the lock screen's right-key hold and never asks this card. */
     if (s_cfg_always_sw &&
         s_lock_rings != lv_obj_has_flag(s_cfg_always_sw, LV_OBJ_FLAG_CLICKABLE)) {
         cfg_switch_live(s_cfg_always_sw, s_lock_rings);
@@ -4409,7 +7023,16 @@ static void cfg_timer_cb(lv_timer_t *t) {
         label_set_fmt_changed(s_cfg_batt_val, "%d%%   %d mV%s", pct, s_batt_mv, power);
     }
     int drain = battery_drain_mv_h();
-    if (drain > 0) {
+    int eta = s_chg_eta_mins;
+    /* While current is flowing the drain figure is not just uninteresting, it
+     * is unmeasurable — the line said "drain measuring..." for the whole of
+     * every charge. The countdown is the number that belongs in that slot. */
+    if (eta > 0 && s_chg_eta_on) {
+        char eta_buf[32];
+        chg_eta_text(eta_buf, sizeof eta_buf, eta);
+        label_set_fmt_changed(s_cfg_batt_sub, "%s   /   %s", eta_buf,
+                              s_doze ? "dozing" : "active");
+    } else if (drain > 0) {
         label_set_fmt_changed(s_cfg_batt_sub, "drain  %d mV/h   /   %s", drain,
                               s_doze ? "dozing" : "active");
     } else {
@@ -4717,12 +7340,69 @@ static void build_control_app(lv_obj_t *scr) {
 
     /* ---- lock screen ---- */
     c = cfg_card(col, "LOCK SCREEN", CFG_ACCENT_LOCK);
-    s_cfg_always_sw = cfg_switch(c, "Always-on screen", CFG_ACCENT_LOCK,
-                                 s_always_on, cfg_always_cb);
+    /* Rings first, then the switch that depends on them. The second switch
+     * is COSMETIC: whether desk-clock mode (toggled by holding the right key
+     * on the lock screen — its only real switch) announces itself with an
+     * amber ring. With the rings off it fades, because an amber ring cannot
+     * appear in a ring set that does not exist — while the MODE stays none
+     * of this card's business. */
     s_cfg_rings_sw = cfg_switch(c, "Lock-screen rings", CFG_ACCENT_LOCK,
                                 s_lock_rings, cfg_rings_cb);
+    s_cfg_always_sw = cfg_switch(c, "Amber ring in desk clock", CFG_ACCENT_LOCK,
+                                 s_ao_ring_pref, cfg_always_cb);
     s_cfg_time_sw = cfg_switch(c, "24-hour time", CFG_ACCENT_LOCK,
                                s_clock_24, cfg_clock_cb);
+
+    /* Grouped with the lock-screen toggles because that is where the user
+     * looks for it — this switch governs a caption on the LOCK SCREEN, and
+     * that is what someone reaching for it has in mind. It does also gate the
+     * CONTROL battery sub-line, which is the argument for putting it in
+     * BATTERY instead; that argument lost, because a setting belongs where it
+     * will be looked for rather than where its implementation reaches.
+     *
+     * "Charge countdown" was the first label and it was not one: it names an
+     * implementation, and a reader who has never seen the caption cannot tell
+     * from those two words what would appear or where. The sub-line says what
+     * it is in the words someone would use asking for it. Under ~34 characters
+     * so it stays one montserrat_20 line — cfg_text wraps, and a label that
+     * grows a second line re-lays out the card under the finger. */
+    s_cfg_chgeta_sw = cfg_switch(c, "Charge time estimate", CFG_ACCENT_LOCK,
+                                 s_chg_eta_on, cfg_chgeta_cb);
+    s_cfg_chgeta_sub = cfg_text(c, 0x64748B);
+    lv_obj_set_height(s_cfg_chgeta_sub, 26);   /* one montserrat_20 line, uncl'd */
+    lv_label_set_text(s_cfg_chgeta_sub, "show charging time estimation");
+
+    /* The desk-clock dim belongs in THIS card, not in DISPLAY, because it only
+     * ever acts while the lock screen's own mode is holding the panel awake.
+     * DISPLAY's brightness slider is the level this takes a percentage OF, not
+     * a sibling of it. */
+    s_cfg_aodim_sw = cfg_switch(c, "Dim in desk clock", CFG_ACCENT_LOCK,
+                                s_ao_dim_on, cfg_aodim_cb);
+    s_cfg_aodim_val = cfg_text(c, 0xC7D2E0);
+    lv_obj_set_height(s_cfg_aodim_val, 26);    /* one montserrat_20 line, uncl'd */
+    {
+        char buf[32];
+        ao_dim_label(buf, sizeof buf, s_ao_dim_s);
+        lv_label_set_text(s_cfg_aodim_val, buf);
+    }
+    s_cfg_aodim_sub = cfg_text(c, 0x64748B);
+    lv_obj_set_height(s_cfg_aodim_sub, 26);    /* one montserrat_20 line, uncl'd */
+    /* Says what undoes it. A control that darkens the screen on a timer needs
+     * to state its own escape hatch on the card, or the first time it fires it
+     * reads as the panel failing. Kept under ~34 characters so it stays one
+     * montserrat_20 line — cfg_text wraps, and a label that grows a second line
+     * re-lays out the card under the finger. */
+    lv_label_set_text(s_cfg_aodim_sub, "touch or a key brings it back");
+    /* Seven stops rather than a seconds range, and deliberately NOT faded while
+     * the switch above is off — unlike every other dependent control in this
+     * app. cfg_scroll_guard_cb() owns LV_OBJ_FLAG_CLICKABLE on every registered
+     * slider and re-asserts it on SCROLL_END, so cfg_button_live()'s fade would
+     * quietly come undone the first time the column moved, leaving a control
+     * that looks dead and is not. Choosing a delay before switching the feature
+     * on is harmless and it is remembered. */
+    s_cfg_aodim_sld = cfg_slider(c, 0, AO_DIM_STOPS - 1,
+                                 ao_dim_to_slider(s_ao_dim_s),
+                                 CFG_ACCENT_LOCK, 0xFDE68A, cfg_aodim_delay_cb);
 
     /* The middle key is the only one genuinely free on the lock screen: the
      * left key locks, the right key's HOLD is the desk-clock toggle, and PWR
@@ -4739,6 +7419,12 @@ static void build_control_app(lv_obj_t *scr) {
     s_cfg_lockkey_btn = cfg_button(c, "", CFG_ACCENT_LOCK, cfg_lockkey_cb);
     s_cfg_lockkey_val = lv_obj_get_child(s_cfg_lockkey_btn, 0);   /* its label */
     cfg_lockkey_label();
+    /* This button now sits under a slider, so it needs the same clearance the
+     * BATTERY card's does: cfg_slider adds CFG_EXT_CLICK (18 px) of invisible
+     * hit area below its track and cfg_button adds 6 px above itself, which is
+     * more than the card's 14 px gutter — finishing a drag near the bottom of
+     * the delay slider would otherwise fire this button. */
+    lv_obj_set_style_margin_top(s_cfg_lockkey_btn, 18, 0);
 
     /* ---- audio ---- */
     c = cfg_card(col, "AUDIO", CFG_ACCENT_SND);
@@ -4856,6 +7542,14 @@ static int64_t  s_pomo_tick_ms;
 static int64_t  s_pomo_done_at;
 static uint32_t s_pomo_sessions;
 
+/* Rotation lock: the cube stops selecting a duration, so a session survives
+ * being picked up, knocked, or carried to another desk. It is a plain toggle
+ * held only in RAM — never in the blob — so a reboot always comes back unlocked
+ * and the indicator on the glass is the only thing that has to be believed.
+ * Deliberately NOT cleared when a session ends: re-arming it for every session
+ * is the whole cost the feature exists to remove. */
+static bool     s_pomo_rot_lock;
+
 static bool     s_pomo_flat;
 static int64_t  s_pomo_flat_since;
 static int      s_pomo_last_rot = -1;
@@ -4867,6 +7561,7 @@ static int      s_acc_ref_x, s_acc_ref_y, s_acc_ref_z;
 static lv_obj_t *s_pomo_dial[POMO_SLOTS];
 static lv_obj_t *s_pomo_clock, *s_pomo_word, *s_pomo_ring, *s_pomo_arc, *s_pomo_fill;
 static lv_obj_t *s_pomo_tick, *s_pomo_hint;   /* the DONE state: green check + tap hint */
+static lv_obj_t *s_pomo_padlock;              /* rotation-lock indicator, hidden when off */
 static int s_pomo_drawn_rot = -1;
 
 typedef struct {
@@ -4944,6 +7639,16 @@ static int pomo_top_edge(void) {
     return (rot_from_base(s_base_rot) - s_rot + 4) & 3;
 }
 
+/* Which duration a start would use. Every caller that means "the duration the
+ * user chose" goes through here rather than through pomo_top_edge(), which
+ * means "which way is up" — the two are the same thing only while the cube is
+ * free to choose. Under rotation lock the pinned slot wins, so a tap on a
+ * sideways cube starts the session that is highlighted rather than the one
+ * gravity happens to point at. */
+static int pomo_pick_edge(void) {
+    return s_pomo_rot_lock ? s_pomo_sel : pomo_top_edge();
+}
+
 /* 0.1-degree units, clockwise. Edge i must be pre-rotated by -90*i so that
  * turning the cube by +90*i cancels it out and the label reads upright. */
 static int32_t pomo_edge_angle(int i) {
@@ -4979,9 +7684,14 @@ static void pomo_refresh(void) {
     int wr = pomo_top_edge();
     int32_t counter = (3600 - 900 * wr) % 3600;
 
-    /* Highlight whichever label is physically at the top. */
+    /* Highlight whichever label is physically at the top — or, under rotation
+     * lock, the slot that is actually pinned. The highlight has to track the
+     * SELECTION and not the top edge, or a locked cube turned 90 degrees lights
+     * a duration it is not going to run. Only `wr` may drive the counter-
+     * rotation below: the readout stays fixed to the reader either way. */
+    int hl = s_pomo_rot_lock ? s_pomo_sel : wr;
     for (int i = 0; i < POMO_SLOTS; i++) {
-        bool active = (i == wr);
+        bool active = (i == hl);
         lv_obj_set_style_text_color(s_pomo_dial[i],
             lv_color_hex(active ? 0xFFB454 : 0x33465C), 0);
         lv_obj_set_style_text_letter_space(s_pomo_dial[i], active ? 3 : 1, 0);
@@ -5006,17 +7716,35 @@ static void pomo_refresh(void) {
         static const lv_coord_t hx[4] = {   0,  86,   0, -86 };
         static const lv_coord_t hy[4] = {  86,   0, -86,   0 };
 
+        /* The padlock rides 95 px world-ABOVE the digits, in the band between
+         * the top dial label (its box ends at 146) and the digits (theirs
+         * starts at 27). Same sign convention as the word's table, negated:
+         * world-up is the direction world-down is not. */
+        static const lv_coord_t px[4] = {   0, -95,   0,  95 };
+        static const lv_coord_t py[4] = { -95,   0,  95,   0 };
+
         lv_obj_set_style_transform_rotation(s_pomo_clock, counter, 0);
         lv_obj_set_style_transform_rotation(s_pomo_word, counter, 0);
         lv_obj_set_style_transform_rotation(s_pomo_tick, counter, 0);
         lv_obj_set_style_transform_rotation(s_pomo_hint, counter, 0);
+        lv_obj_set_style_transform_rotation(s_pomo_padlock, counter, 0);
         lv_obj_align(s_pomo_clock, LV_ALIGN_CENTER, cx[wr], cy[wr]);
         lv_obj_align(s_pomo_word,  LV_ALIGN_CENTER, wx[wr], wy[wr]);
         lv_obj_align(s_pomo_hint,  LV_ALIGN_CENTER, hx[wr], hy[wr]);
+        lv_obj_align(s_pomo_padlock, LV_ALIGN_CENTER, px[wr], py[wr]);
 
         /* keep the depleting ring starting from world-up, not screen-up */
         lv_arc_set_rotation(s_pomo_arc,  (270 - 90 * wr + 360) % 360);
         lv_arc_set_rotation(s_pomo_fill, (270 - 90 * wr + 360) % 360);
+    }
+
+    /* The padlock is the only readout of a mode with no other trace on the
+     * glass, so it shows for as long as the mode is on rather than as a toast.
+     * Change-gated like every other flag flip in here: this runs at 4 Hz and
+     * the setters invalidate whether or not anything moved. */
+    if (lv_obj_has_flag(s_pomo_padlock, LV_OBJ_FLAG_HIDDEN) == s_pomo_rot_lock) {
+        if (s_pomo_rot_lock) lv_obj_remove_flag(s_pomo_padlock, LV_OBJ_FLAG_HIDDEN);
+        else                 lv_obj_add_flag(s_pomo_padlock, LV_OBJ_FLAG_HIDDEN);
     }
 
     int left = s_pomo_left_s < 0 ? 0 : s_pomo_left_s;
@@ -5120,12 +7848,50 @@ static void pomo_set_running(bool run, const char *why) {
     }
 }
 
+/* Rotation lock: the right key's HOLD verb in FOCUS. On BTN_LONG, so the banner
+ * is already up while the finger is still down and lifting is simply what
+ * leaves it — a tap can never reach this, by the same construction that keeps
+ * the lock screen's two right-key verbs apart.
+ *
+ * The banner counter-rotates and has its offset rotated by hand, for the reason
+ * every label in this app does (see pomo_refresh): FOCUS freezes the panel, so
+ * anything aligned in screen space reads sideways the moment the cube is
+ * turned — and a cube being turned is exactly when this gets pressed. It is the
+ * one caller of toast_show() that needs the object back. */
+static void pomo_rot_lock_toggle(void) {
+    s_pomo_rot_lock = !s_pomo_rot_lock;
+    ESP_LOGI(TAG, "pomodoro: rotation lock %s (pinned %d min)",
+             s_pomo_rot_lock ? "ON" : "OFF", s_pomo_min[s_pomo_sel]);
+    sfx_play(SFX_TICK);
+
+    if (!ui_lock()) return;
+    /* Put the padlock in or out now rather than up to 250 ms later, so the
+     * indicator and the banner arrive together instead of a beat apart. */
+    if (s_pomo_clock) pomo_refresh();
+
+    static const lv_coord_t bx[4] = {   0,  122,    0, -122 };
+    static const lv_coord_t by[4] = { 122,    0, -122,    0 };
+    int wr = pomo_top_edge();
+
+    lv_obj_t *toast = toast_show(s_pomo_rot_lock ? "ROTATION LOCK  ON"
+                                                 : "ROTATION LOCK  OFF",
+                                 s_pomo_rot_lock, bx[wr], by[wr]);
+    /* The pivot is in box coordinates and the box is LV_SIZE_CONTENT, so it is
+     * not known until layout has run. Measuring beats hardcoding a width the
+     * two strings would have to agree on. */
+    lv_obj_update_layout(toast);
+    lv_obj_set_style_transform_pivot_x(toast, lv_obj_get_width(toast) / 2, 0);
+    lv_obj_set_style_transform_pivot_y(toast, lv_obj_get_height(toast) / 2, 0);
+    lv_obj_set_style_transform_rotation(toast, (3600 - 900 * wr) % 3600, 0);
+    bsp_display_unlock();
+}
+
 static void pomo_tap_cb(lv_event_t *e) {
     /* Tap starts an idle timer and toggles a live one. DONE deliberately ignores
      * taps: the finish screen retires itself after POMO_DONE_MS, and a stray tap
      * on it would otherwise start a whole new session by accident. */
     switch (s_pomo_state) {
-    case POMO_IDLE:  pomo_begin(pomo_top_edge(), true); break;
+    case POMO_IDLE:  pomo_begin(pomo_pick_edge(), true); break;
     case POMO_RUN:   pomo_set_running(false, "tap");     break;
     case POMO_PAUSE: pomo_set_running(true,  "tap");     break;
     case POMO_DONE:
@@ -5134,7 +7900,7 @@ static void pomo_tap_cb(lv_event_t *e) {
          * grace period exists because someone tapping to pause right as the
          * timer hits zero would otherwise launch a fresh session unseen. */
         if (now_ms() - s_pomo_done_at > POMO_TAP_GRACE_MS) {
-            pomo_begin(pomo_top_edge(), true);
+            pomo_begin(pomo_pick_edge(), true);
         }
         break;
     default: break;
@@ -5237,6 +8003,50 @@ static void build_pomo_app(lv_obj_t *scr) {
     lv_obj_add_flag(s_pomo_hint, LV_OBJ_FLAG_HIDDEN);
     lv_obj_remove_flag(s_pomo_hint, LV_OBJ_FLAG_CLICKABLE);
 
+    /* The padlock is DRAWN, not set as text: LVGL's symbol set has no padlock
+     * glyph and the hud fonts are ASCII-only, so any character that looks like
+     * one renders as an empty box (CLAUDE.md). Two children under one container
+     * — an arc for the shackle, a rounded slab for the body — and the container
+     * carries the transform, which rotates the pair as a unit. It is 16x22, so
+     * the transient layer a rotated widget allocates is negligible. Amber
+     * regardless of state: the word below owns run/pause/done, this owns the
+     * mode, and colouring them alike would merge two independent readouts. */
+    s_pomo_padlock = lv_obj_create(scr);
+    lv_obj_set_size(s_pomo_padlock, 16, 22);
+    lv_obj_set_style_bg_opa(s_pomo_padlock, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(s_pomo_padlock, 0, 0);
+    lv_obj_set_style_pad_all(s_pomo_padlock, 0, 0);
+    lv_obj_set_style_transform_pivot_x(s_pomo_padlock, 8, 0);
+    lv_obj_set_style_transform_pivot_y(s_pomo_padlock, 11, 0);
+    lv_obj_remove_flag(s_pomo_padlock, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_remove_flag(s_pomo_padlock, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_align(s_pomo_padlock, LV_ALIGN_CENTER, 0, -95);
+    lv_obj_add_flag(s_pomo_padlock, LV_OBJ_FLAG_HIDDEN);
+
+    /* Shackle: the top half of a ring. LVGL angle 0 is 3 o'clock going
+     * clockwise, so 180->360 sweeps through 12 o'clock. Its lower legs run
+     * behind the body, which is what makes the two shapes read as one lock. */
+    lv_obj_t *sh = lv_arc_create(s_pomo_padlock);
+    lv_obj_set_size(sh, 12, 12);
+    lv_obj_align(sh, LV_ALIGN_TOP_MID, 0, 0);
+    lv_obj_remove_style(sh, NULL, LV_PART_KNOB);
+    lv_obj_remove_flag(sh, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_set_style_arc_width(sh, 2, LV_PART_MAIN);
+    lv_obj_set_style_arc_width(sh, 0, LV_PART_INDICATOR);
+    lv_obj_set_style_arc_color(sh, lv_color_hex(0xFFB454), LV_PART_MAIN);
+    lv_arc_set_bg_angles(sh, 180, 360);
+
+    lv_obj_t *body = lv_obj_create(s_pomo_padlock);
+    lv_obj_set_size(body, 16, 12);
+    lv_obj_align(body, LV_ALIGN_BOTTOM_MID, 0, 0);
+    lv_obj_set_style_bg_color(body, lv_color_hex(0xFFB454), 0);
+    lv_obj_set_style_bg_opa(body, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_width(body, 0, 0);
+    lv_obj_set_style_radius(body, 3, 0);
+    lv_obj_set_style_pad_all(body, 0, 0);
+    lv_obj_remove_flag(body, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_remove_flag(body, LV_OBJ_FLAG_SCROLLABLE);
+
     lv_obj_add_event_cb(scr, gesture_home_cb, LV_EVENT_GESTURE, NULL);
     lv_obj_add_flag(scr, LV_OBJ_FLAG_CLICKABLE);
     lv_obj_add_event_cb(scr, pomo_tap_cb, LV_EVENT_CLICKED, NULL);
@@ -5244,7 +8054,7 @@ static void build_pomo_app(lv_obj_t *scr) {
     s_pomo_drawn_rot = -1;
     s_pomo_active_ms = now_ms();
     if (s_pomo_state == POMO_IDLE) {
-        s_pomo_sel = pomo_top_edge();
+        s_pomo_sel = pomo_pick_edge();
         s_pomo_total_s = s_pomo_min[s_pomo_sel] * 60;
         s_pomo_left_s = s_pomo_total_s;
     }
@@ -5289,7 +8099,14 @@ static void pomo_poll(int64_t t) {
     /* --- turning the cube picks a duration and starts it --- */
     int wr = pomo_top_edge();
     if (s_pomo_last_rot < 0) s_pomo_last_rot = wr;
-    if (wr != s_pomo_last_rot && !flat) {
+    if (wr != s_pomo_last_rot && s_pomo_rot_lock) {
+        /* Locked: swallow the turn, but still bank it. Leaving s_pomo_last_rot
+         * stale would make unlocking fire the accumulated turn immediately —
+         * the release, not the press, would restart the session — which is the
+         * one thing this mode exists to prevent. No detent either: the tick
+         * would promise a change that is not coming. */
+        s_pomo_last_rot = wr;
+    } else if (wr != s_pomo_last_rot && !flat) {
         s_pomo_last_rot = wr;
         sfx_play(SFX_TICK);                       /* the detent */
         s_pomo_active_ms = t;
@@ -7315,16 +10132,27 @@ static void sp_vol_hud_paint(bool with_title) {
 }
 
 /* Dragging the gauge sets the level directly. Guarded on s_sp_vol_ok because a
- * device that refuses remote volume must not appear to accept a drag. */
+ * device that refuses remote volume must not appear to accept a drag.
+ *
+ * The readout follows the knob on every VALUE_CHANGED and the PUT waits for
+ * RELEASED — the two halves of this callback answer to different costs. The
+ * borrowed title line is absolutely positioned on this screen, so repainting it
+ * mid-drag moves nothing (unlike CONTROL's flex cards, see cfg_vol_cb); a
+ * Spotify round trip per pixel of drag is a different matter entirely. */
 static void sp_vol_slider_cb(lv_event_t *e) {
     if (!s_sp_vol_ok) return;
     int v = lv_slider_get_value(s_sp_vol_bar);
-    if (v == s_sp_vol) return;
-    s_sp_vol = v;
-    s_sp_vol_painted = v;
+    if (v != s_sp_vol) {
+        s_sp_vol = v;
+        s_sp_vol_painted = v;
+        s_sp_vol_shown = now_ms();
+        sp_vol_hud_paint(true);
+    }
+    if (lv_event_get_code(e) != LV_EVENT_RELEASED) return;
+
+    /* sp_push_volume() weighs the level against s_sp_vol_sent, so a drag that
+     * ended where it began costs nothing on the wire. */
     sp_send(SP_CMD_VOLUME);
-    s_sp_vol_shown = now_ms();
-    sp_vol_hud_paint(true);
 }
 
 static void sp_vol_hud_show(void) {
@@ -7673,9 +10501,10 @@ static void build_music_app(lv_obj_t *scr) {
     lv_obj_set_style_bg_opa(s_sp_vol_bar, LV_OPA_COVER, 0);
     lv_obj_set_style_pad_all(s_sp_vol_bar, 10, LV_PART_KNOB);
     lv_obj_set_style_bg_color(s_sp_vol_bar, lv_color_hex(0xF2E9DC), LV_PART_KNOB);
-    /* Commit on RELEASED only. A VALUE_CHANGED handler fires on every pixel of
-     * drag, which would be one Spotify PUT per pixel — and the volume slider in
-     * CONTROL hard-crashed this board for the sibling reason. */
+    /* Both events, one callback: it repaints on VALUE_CHANGED and only commits
+     * on RELEASED, so the number tracks the thumb without spending a Spotify PUT
+     * per pixel of drag. */
+    lv_obj_add_event_cb(s_sp_vol_bar, sp_vol_slider_cb, LV_EVENT_VALUE_CHANGED, NULL);
     lv_obj_add_event_cb(s_sp_vol_bar, sp_vol_slider_cb, LV_EVENT_RELEASED, NULL);
     /* LVGL sets LV_OBJ_FLAG_GESTURE_BUBBLE on every child that has a parent
      * (lv_obj.c:593), so a drag here reached the screen's gesture handler and
@@ -7844,10 +10673,11 @@ static void build_music_app(lv_obj_t *scr) {
 
 /* ---------------- app drawer ---------------- */
 
-/* PIP is compiled but not registered. Its code stays — this is a build-time
- * choice about what ships in THIS image, not a deletion. Flip to 1 to bring it
- * back; nothing else needs changing. */
-#define FACET_APP_PET 0
+/* PIP ships in this image. The flag stays because it is a build-time choice,
+ * not a constant: flipping it to 0 compiles the app out again, leaving a
+ * zeroed hole in s_apps that everything walking the table must skip — see
+ * app_enabled() and HARDWARE.md pitfall #31. */
+#define FACET_APP_PET 1
 
 typedef struct {
     const char *name;                 /* shown in the drawer */
@@ -7927,24 +10757,65 @@ static void tile_cb(lv_event_t *e) {
     app_request((int)(intptr_t)lv_obj_get_user_data(lv_event_get_target(e)));
 }
 
+/* The scroll hint: a faint pulsing chevron under the grid. Four tiles fill
+ * the viewport exactly, so nothing about the resting drawer says "there is
+ * more" — the hint is that sentence. It hides once the user has scrolled,
+ * because at that point they know, and an arrow pointing down from the last
+ * row would be a lie. */
+static void drawer_hint_opa_cb(void *obj, int32_t v) {
+    lv_obj_set_style_opa(obj, (lv_opa_t)v, 0);
+}
+
+static void drawer_scroll_cb(lv_event_t *e) {
+    lv_obj_t *hint = lv_event_get_user_data(e);
+    bool scrolled = lv_obj_get_scroll_y(lv_event_get_target(e)) > 24;
+    if (scrolled == lv_obj_has_flag(hint, LV_OBJ_FLAG_HIDDEN)) return;
+    if (scrolled) {
+        lv_anim_delete(hint, drawer_hint_opa_cb);
+        lv_obj_add_flag(hint, LV_OBJ_FLAG_HIDDEN);
+    }
+}
+
 static void build_drawer(lv_obj_t *scr) {
     lv_obj_set_style_bg_color(scr, lv_color_hex(0x000000), 0);
     lv_obj_remove_flag(scr, LV_OBJ_FLAG_SCROLLABLE);
 
-    /* 2x2 of 196 px tiles with a 16 px gap fills 408 px of the 480 px panel.
-     * The outer tile corners land at (36,36), still inside the display's
-     * corner radius, so nothing is clipped. */
+    /* Two 196 px tiles per row with a 16 px gap fill 408 px of the 480 px
+     * panel; the outer tile corners land at (36,36), still inside the
+     * display's corner radius, so nothing is clipped. Five apps outgrow the
+     * 2x2, so rows past the second scroll into view. The viewport stays
+     * 412 px: growing it to show a sliver of row three would lift the top
+     * corners to (36,22), which is OUTSIDE the r=110 corner arc — (36,36)
+     * is already near the limit. */
     lv_obj_t *grid = lv_obj_create(scr);
     lv_obj_remove_style_all(grid);
     lv_obj_set_size(grid, 412, 412);
     lv_obj_center(grid);
     lv_obj_set_flex_flow(grid, LV_FLEX_FLOW_ROW_WRAP);
+    /* Tracks pack from the TOP, not the centre. Centring tracks in a
+     * container their content overflows makes the content spill both ends:
+     * the drawer opened half-scrolled ("row one cut, PIP peeking") and the
+     * scroller, whose limits assume top-packed content, sprang every upward
+     * drag straight back down. START shows exactly the first four tiles and
+     * gives the scroller honest limits. */
     lv_obj_set_flex_align(grid, LV_FLEX_ALIGN_CENTER,
-                          LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+                          LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_START);
     lv_obj_set_style_pad_row(grid, 16, 0);
     lv_obj_set_style_pad_column(grid, 16, 0);
-    lv_obj_remove_flag(grid, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_scroll_dir(grid, LV_DIR_VER);
+    /* remove_style_all stripped the theme's scrollbar, so give the ACTIVE
+     * mode something visible: a thin accent sliver during the drag is the
+     * only hint the drawer holds more than four tiles. */
+    lv_obj_set_scrollbar_mode(grid, LV_SCROLLBAR_MODE_ACTIVE);
+    lv_obj_set_style_bg_color(grid, lv_color_hex(0x3A4556), LV_PART_SCROLLBAR);
+    lv_obj_set_style_bg_opa(grid, 140, LV_PART_SCROLLBAR);
+    lv_obj_set_style_width(grid, 4, LV_PART_SCROLLBAR);
+    lv_obj_set_style_radius(grid, 2, LV_PART_SCROLLBAR);
+    /* The grid owns a drag now; without this the drag would also reach any
+     * screen-level gesture handler (HARDWARE.md pitfall #25). */
+    lv_obj_remove_flag(grid, LV_OBJ_FLAG_GESTURE_BUBBLE);
 
+    int shown = 0;
     for (int i = 0; i < APP_COUNT; i++) {
         if (!app_enabled(i)) continue;          /* compiled out of this image */
         lv_color_t accent = lv_color_hex(s_apps[i].color);
@@ -7952,15 +10823,15 @@ static void build_drawer(lv_obj_t *scr) {
         lv_obj_t *tile = lv_button_create(grid);
         lv_obj_set_size(tile, 196, 196);
         lv_obj_set_style_radius(tile, 34, 0);
-        lv_obj_set_style_bg_color(tile, lv_color_hex(0x0C1018), 0);
-        lv_obj_set_style_bg_grad_color(tile, lv_color_hex(0x141B26), 0);
-        lv_obj_set_style_bg_grad_dir(tile, LV_GRAD_DIR_VER, 0);
+        /* Flat fill, no gradient, no shadow. The drawer scrolls now, and a
+         * scroll repaints every visible tile per frame: an 18 px shadow is a
+         * blur re-run per tile per frame (the known 20 fps route), and a
+         * vertical gradient both fills slower than flat and bands on RGB565.
+         * The accent glow the shadow used to give survives in the border. */
+        lv_obj_set_style_bg_color(tile, lv_color_hex(0x10151F), 0);
         lv_obj_set_style_border_width(tile, 2, 0);
         lv_obj_set_style_border_color(tile, accent, 0);
-        lv_obj_set_style_border_opa(tile, 130, 0);
-        lv_obj_set_style_shadow_width(tile, 18, 0);
-        lv_obj_set_style_shadow_color(tile, accent, 0);
-        lv_obj_set_style_shadow_opa(tile, 45, 0);
+        lv_obj_set_style_border_opa(tile, 150, 0);
         /* pressed state gives the tap somewhere to land visually */
         lv_obj_set_style_bg_color(tile, lv_color_hex(0x1B2432), LV_STATE_PRESSED);
         lv_obj_set_style_border_opa(tile, 255, LV_STATE_PRESSED);
@@ -7977,8 +10848,31 @@ static void build_drawer(lv_obj_t *scr) {
         lv_obj_set_style_text_font(l, &hud_text_18, 0);
         lv_obj_set_style_text_color(l, lv_color_hex(0xC7D2E0), 0);
         lv_obj_set_style_text_letter_space(l, 2, 0);
-        lv_label_set_text(l, s_apps[i].name);
+        /* the pet's tile answers to its given name, not its factory one */
+        lv_label_set_text(l, (i == APP_PET && s_pet.name[0]) ? s_pet.name
+                                                             : s_apps[i].name);
         lv_obj_align(l, LV_ALIGN_CENTER, 0, 46);
+        shown++;
+    }
+
+    if (shown > 4) {
+        lv_obj_t *hint = lv_label_create(scr);
+        lv_obj_set_style_text_font(hint, &lv_font_montserrat_20, 0);
+        lv_obj_set_style_text_color(hint, lv_color_hex(0x7A8BA5), 0);
+        lv_label_set_text(hint, LV_SYMBOL_DOWN);
+        /* In the strip below the grid: grid bottom is y446, panel edge 480.
+         * Centred, so the corner arcs are nowhere near it. */
+        lv_obj_align(hint, LV_ALIGN_BOTTOM_MID, 0, -6);
+        lv_anim_t a;
+        lv_anim_init(&a);
+        lv_anim_set_var(&a, hint);
+        lv_anim_set_exec_cb(&a, drawer_hint_opa_cb);
+        lv_anim_set_values(&a, 30, 150);
+        lv_anim_set_duration(&a, 900);
+        lv_anim_set_playback_duration(&a, 900);
+        lv_anim_set_repeat_count(&a, LV_ANIM_REPEAT_INFINITE);
+        lv_anim_start(&a);
+        lv_obj_add_event_cb(grid, drawer_scroll_cb, LV_EVENT_SCROLL, hint);
     }
 }
 
@@ -8110,17 +11004,92 @@ static void wall_txt(int slot, char *out, size_t n) {
     snprintf(out, n, WALL_DIR "/w%d.txt", slot);
 }
 
+/* Built-in fallback wallpaper: neon-lit palms on black (Andre Tan / Unsplash),
+ * 480x480, denoised and palette-quantised to 64 colours offline so it embeds
+ * at ~75 KB. It exists for the states where the pool has nothing to offer —
+ * no card, a fresh card, or every cached file failing validation — which used
+ * to mean a bare black lock screen. Served straight from flash as a C-array
+ * PNG: LodePNG's LV_IMAGE_SRC_VARIABLE path reads the dimensions out of the
+ * PNG bytes itself, so only data/data_size need filling, and the dsc must be
+ * a stable static because the decoded bitmap is cached keyed on its address. */
+#define WALL_DEFAULT_CREDIT "Andre Tan"
+extern const uint8_t wall_default_start[] asm("_binary_wall_default_png_start");
+extern const uint8_t wall_default_end[]   asm("_binary_wall_default_png_end");
+static lv_image_dsc_t s_wall_default_dsc;
+
+static const void *wall_default_src(void) {
+    if (!s_wall_default_dsc.data) {
+        /* EMBED_FILES emits no .align directive (verified in the generated
+         * .S — this build landed the blob at an odd address), and LodePNG
+         * reads the PNG dimensions through a uint32_t cast of the data
+         * pointer. The LX7 happens to tolerate unaligned loads, but the bytes
+         * are staged once into an aligned PSRAM copy rather than leaning on
+         * that; the raw flash pointer stays as the fallback if PSRAM is
+         * somehow exhausted. */
+        size_t n = (size_t)(wall_default_end - wall_default_start);
+        uint8_t *buf = heap_caps_malloc(n, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        if (buf) memcpy(buf, wall_default_start, n);
+        s_wall_default_dsc.header.cf = LV_COLOR_FORMAT_RAW;
+        s_wall_default_dsc.data      = buf ? buf : wall_default_start;
+        s_wall_default_dsc.data_size = (uint32_t)n;
+    }
+    return &s_wall_default_dsc;
+}
+
+/* Mean luminance (0-255) of a decodable image source, sampled on an 8 px grid.
+ * Goes through the ordinary decoder, so on a primed slot it is a cache hit
+ * costing microseconds, and on a miss it warms the exact cache entry the
+ * upcoming draw would have filled anyway — measuring is not an extra decode.
+ * Returns -1 when nothing decodes. Caller holds the LVGL lock. */
+static int wall_src_lum(const void *src) {
+    lv_image_decoder_dsc_t dsc;
+    if (lv_image_decoder_open(&dsc, src, NULL) != LV_RESULT_OK) return -1;
+    const lv_draw_buf_t *b = dsc.decoded;
+    if (!b || !b->data) { lv_image_decoder_close(&dsc); return -1; }
+    uint32_t bpp = lv_color_format_get_size(b->header.cf);
+    uint64_t sum = 0;
+    uint32_t n = 0;
+    for (uint32_t y = 0; y < b->header.h; y += 8) {
+        const uint8_t *row = b->data + (size_t)y * b->header.stride;
+        for (uint32_t x = 0; x < b->header.w; x += 8, n++) {
+            const uint8_t *p = row + (size_t)x * bpp;
+            if (bpp == 2) {                       /* RGB565, little-endian */
+                uint16_t c = (uint16_t)(p[0] | (p[1] << 8));
+                sum += (((c >> 11) & 0x1F) * 527 + 23) >> 6;
+                sum += (((c >> 5) & 0x3F) * 259 + 33) >> 6;
+                sum += ((c & 0x1F) * 527 + 23) >> 6;
+            } else {                              /* 3- or 4-byte true colour */
+                sum += p[0] + p[1] + p[2];
+            }
+        }
+    }
+    lv_image_decoder_close(&dsc);
+    return n ? (int)(sum / ((uint64_t)n * 3)) : -1;
+}
+
 /* A cached wallpaper is only usable if it really is a PNG. Earlier builds
  * saved a progressive JPEG under a .png name, and a stale bad file would
- * otherwise never be replaced — the fetch only runs when the file is missing. */
+ * otherwise never be replaced — the fetch only runs when the file is missing.
+ *
+ * Both ends are checked, and the tail matters more than the head: a download
+ * cut off mid-body has a perfect 8-byte signature and a missing tail, and with
+ * only the head checked such a file passed as usable forever — the "stale
+ * partial wallpaper" bug. Every PNG ends with the fixed 12-byte IEND chunk, so
+ * the last 8 bytes ("IEND" + its constant CRC) are as cheap to verify as the
+ * signature and prove the writer reached the end of the stream. */
 static bool wallpaper_valid(const char *path) {
-    static const uint8_t sig[8] = { 0x89, 'P', 'N', 'G', 0x0D, 0x0A, 0x1A, 0x0A };
+    static const uint8_t sig[8]  = { 0x89, 'P', 'N', 'G', 0x0D, 0x0A, 0x1A, 0x0A };
+    static const uint8_t iend[8] = { 'I', 'E', 'N', 'D', 0xAE, 0x42, 0x60, 0x82 };
     FILE *f = fopen(path, "rb");
     if (!f) return false;
-    uint8_t hdr[8] = {0};
-    size_t n = fread(hdr, 1, sizeof(hdr), f);
+    uint8_t hdr[8] = {0}, tail[8] = {0};
+    bool ok = fread(hdr, 1, sizeof(hdr), f) == sizeof(hdr) &&
+              memcmp(hdr, sig, sizeof(sig)) == 0 &&
+              fseek(f, -8, SEEK_END) == 0 && ftell(f) >= 8 &&
+              fread(tail, 1, sizeof(tail), f) == sizeof(tail) &&
+              memcmp(tail, iend, sizeof(iend)) == 0;
     fclose(f);
-    return n == sizeof(hdr) && memcmp(hdr, sig, sizeof(sig)) == 0;
+    return ok;
 }
 
 static void wall_scan(void) {
@@ -8350,7 +11319,14 @@ static bool asset_fetch_auth(const char *url, const char *path, const char *bear
             }
             esp_err_t err = esp_http_client_perform(c);
             int status = esp_http_client_get_status_code(c);
-            ok = (err == ESP_OK && status == 200);
+            /* perform() can return ESP_OK on a body that stopped short of the
+             * advertised Content-Length (a clean FIN mid-transfer). Renaming
+             * that file into place is how a partial image used to enter the
+             * pool as a permanent citizen, so the byte count is part of
+             * "success", not a nice-to-have. No length advertised = trusted,
+             * as before. */
+            ok = (err == ESP_OK && status == 200 &&
+                  (s_dl_total <= 0 || s_dl_got == s_dl_total));
             ESP_LOGI(TAG, "asset: HTTP %d, heap %u", status,
                      (unsigned)hp_free());
             esp_http_client_cleanup(c);
@@ -8474,6 +11450,16 @@ static bool unsplash_wallpaper(int slot) {
             wall_png(slot, dest, sizeof(dest));
             s_dl_state = DL_IMAGE;
             ok = asset_fetch(img, dest);
+            /* Both ends of the file, same test the boot scan applies. Catches
+             * what the length check cannot: a server that never advertised a
+             * Content-Length, or bytes that were never a PNG at all. A slot
+             * must not be marked usable on the transport's word alone. */
+            if (ok && !wallpaper_valid(dest)) {
+                ESP_LOGW(TAG, "slot %d: downloaded file failed PNG validation",
+                         slot);
+                remove(dest);
+                ok = false;
+            }
         }
         if (ok) {
             s_wall_have |= (uint16_t)(1u << slot);
@@ -8617,6 +11603,32 @@ static bool store_load(const char *id, void *data, size_t len) {
 #define TELEMETRY_PATH   BSP_SD_MOUNT_POINT "/logs/pwrlog3.csv"
 #define TELEMETRY_PERIOD 60000
 
+/* One-shot pool audit: decode every slot and log its mean luminance. "Black
+ * wallpaper" has indistinguishable causes from the glass (missing file, decoder
+ * rejection, or a genuinely dark photo under the lock screen's dim); this
+ * names which slot is which in one boot. Costs ~600 ms per slot, so it stays 0
+ * in commits — same contract as CFG_PERF_SCROLL_SELFTEST. */
+#define CFG_WALL_POOL_AUDIT 0
+
+#if CFG_WALL_POOL_AUDIT
+static void wall_pool_audit(void) {
+    for (int i = 0; i < WALL_SLOTS; i++) {
+        if (!(s_wall_have & (1u << i))) {
+            ESP_LOGW(TAG, "audit w%d: no file", i);
+            continue;
+        }
+        char lvpath[72];
+        wall_lv(i, lvpath, sizeof(lvpath));
+        if (!ui_lock()) return;
+        int lum = wall_src_lum(lvpath);
+        bsp_display_unlock();
+        if (lum < 0) ESP_LOGW(TAG, "audit w%d: DECODE FAILED", i);
+        else ESP_LOGI(TAG, "audit w%d: mean_lum=%d/255%s", i, lum,
+                      lum < 40 ? "  <- NEAR BLACK" : "");
+    }
+}
+#endif
+
 static void sd_init(void) {
     esp_err_t err = bsp_sdcard_mount();
     if (err == ESP_OK) {
@@ -8625,6 +11637,9 @@ static void sd_init(void) {
         store_init_dirs();
         remove(WALLPAPER_OLD);          /* pre-pool single wallpaper */
         wall_scan();
+#if CFG_WALL_POOL_AUDIT
+        wall_pool_audit();
+#endif
         wall_cache_prime();
     } else {
         ESP_LOGW(TAG, "no microSD (%s) — telemetry disabled", esp_err_to_name(err));
@@ -9008,6 +12023,27 @@ static void lock_refresh(void) {
         lv_obj_set_style_text_opa(s_lock_charge, 96, 0);
     }
     was_charging = s_batt_charging;
+
+    /* The countdown is hidden, not blanked, in every case the estimator has no
+     * answer for: the first minutes of a charge before a rate exists, a cube
+     * already past its limit, and a docked cube the cap has stopped. An empty
+     * label would still hold its line and open a gap under the percentage. */
+    int eta = s_chg_eta_mins;
+    if (eta > 0) {
+        char eta_buf[32];
+        chg_eta_text(eta_buf, sizeof eta_buf, eta);
+        for (char *p = eta_buf; *p; p++) *p = toupper((unsigned char)*p);
+        label_set_changed(s_lock_eta, eta_buf);
+    }
+    /* Suppressed while the now-playing panel is up, and that is a space fact
+     * rather than a preference: lock_clock_layout() raises the clock from
+     * CENTER-18 to CENTER-140 to make room for the card, which puts the
+     * hud_clock_48 digits at roughly y70..130. The percentage already occupies
+     * y42..64, so the band this caption needs no longer exists — it drew
+     * straight through the clock. The transport card wins the same way the
+     * clock yields to it, and the countdown is still on the CONTROL card. */
+    obj_set_hidden_changed(s_lock_eta, eta <= 0 || s_lock_np_up || !s_chg_eta_on);
+
     if (lv_arc_get_bg_angle_start(s_lock_batt_arc) != 0 ||
         lv_arc_get_bg_angle_end(s_lock_batt_arc) != arc_end) {
         lv_arc_set_bg_angles(s_lock_batt_arc, 0, arc_end);
@@ -9017,17 +12053,14 @@ static void lock_refresh(void) {
         lv_obj_set_style_arc_color(s_lock_batt_arc, arc_color, LV_PART_MAIN);
     }
 
-    /* The Always On cue has its own 412 px path inside the 430 px battery
-     * gauge. Sharing one path hid it at 100%; placing it outside at 444 px let
-     * the rounded panel mask clip its corners. */
-    if (s_lock_ring) {
-        lv_color_t ring_color = lv_color_hex(s_always_on ? 0xF59E0B : 0x123A52);
-        if (!lv_color_eq(lv_obj_get_style_arc_color(s_lock_ring, LV_PART_MAIN),
-                         ring_color)) {
-            lv_obj_set_style_arc_color(s_lock_ring, ring_color, LV_PART_MAIN);
-        }
-    }
+    /* The desk-clock cue is its own amber ring at 394 px, inside the 412 px
+     * base and the 430 px battery gauge (444 px clipped at the corners; one
+     * shared path hid the cue at 100%). It shows only when the mode is on
+     * AND the rings are drawn — with rings off the mode still runs, it just
+     * has no jewellery. */
     obj_set_hidden_changed(s_lock_ring, !s_lock_rings);
+    obj_set_hidden_changed(s_lock_ao_ring,
+                           !(s_lock_rings && s_ao_ring_pref && s_always_on));
     obj_set_hidden_changed(s_lock_inner_ring, !s_lock_rings);
     obj_set_hidden_changed(s_lock_batt_arc, !s_lock_rings);
 }
@@ -9203,31 +12236,53 @@ static void lock_timer_cb(lv_timer_t *t) {
     lock_refresh();
 }
 
+/* Unlocking is a swipe up; a tap is not a verb here at all.
+ *
+ * Tap-to-unlock was in conflict with the desk-clock dim the moment that landed.
+ * A dimmed panel invites exactly one thing — touch it to see it properly — and
+ * that same touch was also the gesture that threw you into the drawer. The two
+ * cannot share an input: one is a glance, the other is a decision.
+ *
+ * So a tap now does nothing except be a touch, and that is enough. LVGL stamps
+ * `last_activity_time` on the press (lv_indev.c:268), which is one of the two
+ * terms in the main loop's `idle`, so the dim lifts on the next 20 ms pass
+ * without this function knowing the dim exists. Restating it here as an
+ * explicit un-dim call would be a second writer of a decision the idle
+ * expression already owns.
+ *
+ * The bottom-edge rule that gesture_home_cb applies everywhere else is
+ * deliberately NOT applied here. On an app screen the edge is what separates
+ * "go home" from an ordinary upward drag inside content; the lock screen has no
+ * scrollable content to be confused with, and a locked device you have to swipe
+ * from precisely the right 72 px is a device that feels stuck. */
+static void lock_gesture_cb(lv_event_t *e) {
+    lv_indev_t *indev = lv_indev_active();
+    if (!indev) return;
+    if (lv_indev_get_gesture_dir(indev) != LV_DIR_TOP) return;
+    /* Asleep, this cannot be reached: touch_origin_cb cancels the touch before
+     * a gesture can form, so a swipe on a dark panel wakes and stops there —
+     * the same rule a tap has always had. */
+    if (!s_screen_on) return;
+    /* LV_EVENT_GESTURE repeats for as long as the finger is down (pitfall #25),
+     * and app_open()'s own 250 ms debounce is not the right guard for a screen
+     * this one leaves. */
+    lv_indev_wait_release(indev);
+    ESP_LOGI(TAG, "lock: swipe up -> home");
+    app_request(APP_DRAWER);      /* always home, not "wherever you locked from" */
+}
+
 static void lock_tap_cb(lv_event_t *e) {
     /* Asleep? The first touch only wakes — it must not unlock, the same way a
-     * phone shows you the lock screen before letting you in. */
+     * phone shows you the lock screen before letting you in. Kept even though
+     * touch_origin_cb now raises the same request for every screen: that gate
+     * is registered inside an `if (ui_lock())` at boot, and the lock screen is
+     * the one place that must not fail open. */
     if (!s_screen_on) {
         s_req_wake = true;
         return;
     }
-    ESP_LOGI(TAG, "lock: screen tapped -> home");
-    if (now_ms() - s_lock_swipe_at < 500) return;   /* that was a swipe, not a tap */
-
-    /* The now-playing panel owns its own area. Its buttons consume their own
-     * clicks, but the gaps between them fell through to here and unlocked — so
-     * reaching for pause left the lock screen, and a swipe to dismiss was fighting
-     * the unlock for the same touch. The panel is 246 px tall against the bottom
-     * edge with a 42 px margin, so it starts at y192; below that the lock screen
-     * does nothing and the panel decides. Above it, tap still unlocks. */
-    if (s_lock_np_up) {
-        lv_indev_t *indev = lv_indev_active();
-        if (indev) {
-            lv_point_t pt;
-            lv_indev_get_point(indev, &pt);
-            if (pt.y >= 192) return;
-        }
-    }
-    app_request(APP_DRAWER);      /* always home, not "wherever you locked from" */
+    /* Deliberately empty otherwise. See lock_gesture_cb above: the tap's whole
+     * job is to have happened. */
 }
 
 /* The cover is a shortcut straight into MUSIC. Everywhere else on this screen
@@ -9256,10 +12311,15 @@ static void build_lock_screen(lv_obj_t *scr) {
     lv_obj_set_style_bg_color(scr, lv_color_hex(0x000000), 0);
     lv_obj_set_style_bg_grad_dir(scr, LV_GRAD_DIR_NONE, 0);
 
+    /* Test hook for the embedded fallback below: a full pool never exercises
+     * it naturally, and a decoder rejection is silent on the glass (pitfall
+     * #27), so this forces the no-usable-slot branch for one flashed run.
+     * Keep it 0 in commits, same contract as CFG_PERF_SCROLL_SELFTEST. */
+#define CFG_WALL_DEFAULT_TEST 0
     /* Consume the prepared next slot. A cache hit keeps the hidden render short,
      * while separating current from primed restores a new image on every lock. */
     int slot = -1;
-    if (s_sd_ok) {
+    if (s_sd_ok && !CFG_WALL_DEFAULT_TEST) {
         if (s_wall_primed >= 0 && (s_wall_have & (1u << s_wall_primed))) {
             slot = s_wall_primed;
         } else {
@@ -9267,11 +12327,48 @@ static void build_lock_screen(lv_obj_t *scr) {
         }
         s_wall_primed = -1;
     }
-    if (slot >= 0) {
+    /* No usable slot — no card, an empty pool, or everything failed the boot
+     * validation — falls back to the wallpaper embedded in the app image, so
+     * the lock screen is never bare black. Same widget, different source. */
+    {
         char lvpath[72];
-        wall_lv(slot, lvpath, sizeof(lvpath));
+        const void *src;
+        if (slot >= 0) {
+            wall_lv(slot, lvpath, sizeof(lvpath));
+            src = lvpath;               /* set_src copies the path string */
+        } else {
+            src = wall_default_src();
+        }
+        /* The old flat 43% dim (opa 110) kept the clock legible over bright
+         * photos — and erased dark ones. A nebula at mean luminance 29/255
+         * landed at an effective ~12/255, which from the glass is "black
+         * wallpaper, no image", indistinguishable from the missing-file bug it
+         * was reported as (an on-device audit found slots at 29, 44 and 51
+         * against the pool's space themes, all decoding perfectly). So dim
+         * toward a target effective brightness instead: a bright photo keeps
+         * the old 110 floor, one already at or below the target draws at full
+         * opacity. Measuring costs nothing extra — wall_src_lum() goes through
+         * the decoder, so it IS the cache warm-up the draw needed anyway. */
+        int lum = wall_src_lum(src);
+        uint32_t opa = 110;
+        if (lum > 0) {
+            opa = 255u * WALL_DIM_TARGET / (uint32_t)lum;
+            if (opa > 255) opa = 255;
+            if (opa < 110) opa = 110;
+        }
+        /* Names what is actually behind the clock. "Black wallpaper" has three
+         * different causes — missing file, decoder rejection, dark photo — and
+         * from the glass they are identical. One line per build separates them
+         * without a debug flash. */
+        ESP_LOGI(TAG, "lock wallpaper: %s%d, lum %d, opa %u",
+                 slot >= 0 ? "slot " : "default, slot ", slot, lum,
+                 (unsigned)opa);
         lv_obj_t *wall = lv_image_create(scr);
-        lv_image_set_src(wall, lvpath);
+        /* Also held file-scope: the desk-clock dim hides this to leave genuinely
+         * unlit black behind the clock. Its NULL row in app_open()'s teardown
+         * is part of that change, not an optional extra. */
+        s_lock_wall = wall;
+        lv_image_set_src(wall, src);
         /* Fill the panel, whatever size the file turned out to be.
          *
          * The request asks imgix for exactly 480x480, but what comes back is not
@@ -9283,20 +12380,25 @@ static void build_lock_screen(lv_obj_t *scr) {
         lv_obj_set_size(wall, BSP_LCD_H_RES, BSP_LCD_V_RES);
         lv_obj_center(wall);
         lv_image_set_inner_align(wall, LV_IMAGE_ALIGN_COVER);
-        lv_obj_set_style_image_opa(wall, 110, 0);
+        lv_obj_set_style_image_opa(wall, (lv_opa_t)opa, 0);
         lv_obj_remove_flag(wall, LV_OBJ_FLAG_CLICKABLE);
         s_wall_slot = slot;
 
         /* attribution for whatever is actually on screen, shown in STATUS */
-        char cpath[64];
-        wall_txt(slot, cpath, sizeof(cpath));
         s_wall_credit[0] = '\0';
-        FILE *cf = fopen(cpath, "r");
-        if (cf) {
-            if (fgets(s_wall_credit, sizeof(s_wall_credit), cf)) {
-                s_wall_credit[strcspn(s_wall_credit, "\r\n")] = '\0';
+        if (slot >= 0) {
+            char cpath[64];
+            wall_txt(slot, cpath, sizeof(cpath));
+            FILE *cf = fopen(cpath, "r");
+            if (cf) {
+                if (fgets(s_wall_credit, sizeof(s_wall_credit), cf)) {
+                    s_wall_credit[strcspn(s_wall_credit, "\r\n")] = '\0';
+                }
+                fclose(cf);
             }
-            fclose(cf);
+        } else {
+            snprintf(s_wall_credit, sizeof(s_wall_credit), "%s",
+                     WALL_DEFAULT_CREDIT);
         }
     }
 
@@ -9311,6 +12413,22 @@ static void build_lock_screen(lv_obj_t *scr) {
     lv_obj_set_style_arc_width(s_lock_ring, 0, LV_PART_INDICATOR);
     lv_obj_set_style_arc_color(s_lock_ring, lv_color_hex(0x123A52), LV_PART_MAIN);
     lv_arc_set_bg_angles(s_lock_ring, 0, 360);
+
+    /* The desk-clock cue: its OWN amber ring, present only while the mode is
+     * on. It used to be a recolor of the base ring above, which coupled two
+     * unrelated settings — rings off force-disabled desk clock "because the
+     * indicator would vanish". Decoupled by request: the mode runs with or
+     * without rings; the cue simply needs rings to have somewhere to live. */
+    s_lock_ao_ring = lv_arc_create(scr);
+    lv_obj_set_size(s_lock_ao_ring, 394, 394);
+    lv_obj_center(s_lock_ao_ring);
+    lv_obj_remove_style(s_lock_ao_ring, NULL, LV_PART_KNOB);
+    lv_obj_remove_flag(s_lock_ao_ring, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_set_style_arc_width(s_lock_ao_ring, 5, LV_PART_MAIN);
+    lv_obj_set_style_arc_width(s_lock_ao_ring, 0, LV_PART_INDICATOR);
+    lv_obj_set_style_arc_color(s_lock_ao_ring, lv_color_hex(0xF59E0B), LV_PART_MAIN);
+    lv_arc_set_bg_angles(s_lock_ao_ring, 0, 360);
+    lv_obj_add_flag(s_lock_ao_ring, LV_OBJ_FLAG_HIDDEN);
 
     s_lock_inner_ring = lv_arc_create(scr);
     lv_obj_set_size(s_lock_inner_ring, 372, 372);
@@ -9335,7 +12453,12 @@ static void build_lock_screen(lv_obj_t *scr) {
 
     s_lock_time = lv_label_create(scr);
     lv_obj_set_style_text_font(s_lock_time, &hud_clock_76, 0);
-    lv_obj_set_style_text_color(s_lock_time, lv_color_hex(0xE8FBFF), 0);
+    /* Recorded, not duplicated: the dim recolours this label to amber and has
+     * to put it back. A second copy of the constant over there would go stale
+     * the first time anyone retunes the clock's colour here, and the symptom
+     * would be a clock that comes back from a dim the wrong shade. */
+    s_lock_time_col = 0xE8FBFF;
+    lv_obj_set_style_text_color(s_lock_time, lv_color_hex(s_lock_time_col), 0);
     lv_label_set_text(s_lock_time, "--:--");
     lv_obj_align(s_lock_time, LV_ALIGN_CENTER, 0, -18);
 
@@ -9377,8 +12500,41 @@ static void build_lock_screen(lv_obj_t *scr) {
     lv_obj_align(s_lock_charge, LV_ALIGN_TOP_MID, 52, TOP_MARGIN + 13);
     lv_obj_add_flag(s_lock_charge, LV_OBJ_FLAG_HIDDEN);
 
+    /* Time to the charge limit, directly under the percentage it belongs to.
+     * The secondary cyan and not the bolt's green, on purpose: this is a
+     * caption on the number above it, not a second signal competing with the
+     * bolt for attention. It exists only while current is flowing, so the
+     * screen's resting state — clock, date, ring — is unchanged.
+     * Fixed width and centred text, like the date: the string changes length
+     * as the estimate falls and a natural-width label would shuffle sideways.
+     *
+     * Montserrat 14 rather than hud_text_18, which is a deliberate typeface
+     * break: hud_text_18 is the smallest Orbitron subset compiled in, so at
+     * 18 px the caption matched the percentage above it and the two read as
+     * one two-line block rather than a number and its note. There is no
+     * Orbitron 14 to reach for — subsetting one would be ~50 KB of flash for
+     * this one string — and montserrat_14 is already linked. Letter spacing
+     * drops to 1 with it: 2 was tuned for Orbitron's wider figures and looks
+     * gappy on Montserrat at this size. */
+    s_lock_eta = lv_label_create(scr);
+    lv_obj_set_style_text_font(s_lock_eta, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(s_lock_eta, lv_color_hex(0x5FD3EC), 0);
+    lv_obj_set_style_text_letter_space(s_lock_eta, 1, 0);
+    lv_obj_set_width(s_lock_eta, CONTENT_W);
+    lv_obj_set_style_text_align(s_lock_eta, LV_TEXT_ALIGN_CENTER, 0);
+    lv_label_set_text(s_lock_eta, "");
+    /* +44, not +34. The percentage occupies y42..60, so the old offset left a
+     * 4 px gap that read as a collision; this gives 10 px of clear space and
+     * still sits well above the clock's own band. */
+    lv_obj_align(s_lock_eta, LV_ALIGN_TOP_MID, 0, TOP_MARGIN + 44);
+    lv_obj_add_flag(s_lock_eta, LV_OBJ_FLAG_HIDDEN);
+
     lv_obj_add_flag(scr, LV_OBJ_FLAG_CLICKABLE);
     lv_obj_add_event_cb(scr, lock_tap_cb, LV_EVENT_CLICKED, NULL);
+    /* Not gesture_home_cb: that one requires the swipe to start in the bottom
+     * 72 px, which is the right rule for a screen with content to scroll and
+     * the wrong one for a locked device. See lock_gesture_cb. */
+    lv_obj_add_event_cb(scr, lock_gesture_cb, LV_EVENT_GESTURE, NULL);
 
     s_lock_slow = 0;
     s_lock_pointer_down = false;
@@ -9466,41 +12622,41 @@ static void lock_engage(void) {
  * indefinitely. A banner confirms which way it just went, then fades itself
  * out and deletes itself — no timer to own or tear down. */
 static void always_on_toggle(void) {
-    /* Rings off means always-on has no standing indicator, so CONTROL greys
-     * the switch. The right-key hold has to agree, or the key quietly
-     * enables a mode the UI says is unavailable. */
-    if (!s_lock_rings && !s_always_on) {
-        ESP_LOGI(TAG, "always-on refused: lock-screen rings are off");
-        return;
-    }
+    /* The right-key hold on the lock screen is the mode's ONLY switch —
+     * CONTROL carries just the cosmetic preference for its amber ring. The
+     * hold works with the rings off; the mode then simply runs unadorned. */
     s_always_on = !s_always_on;
     s_req_lock_pref_save = true;
     ESP_LOGI(TAG, "always-on %s", s_always_on ? "ON" : "OFF");
 
     if (!ui_lock()) return;
     lock_refresh();                          /* recolours the base ring */
+    toast_show(s_always_on ? "ALWAYS ON SCREEN  ON"
+                           : "ALWAYS ON SCREEN  OFF", s_always_on, 0, 118);
+    bsp_display_unlock();
+}
 
-    lv_obj_t *toast = lv_label_create(lv_screen_active());
-    lv_obj_set_style_text_font(toast, &hud_text_18, 0);
-    lv_obj_set_style_text_letter_space(toast, 3, 0);
-    lv_obj_set_style_text_color(toast,
-        lv_color_hex(s_always_on ? 0xF59E0B : 0x7C8AA5), 0);
-    lv_obj_set_style_bg_color(toast, lv_color_hex(0x08131C), 0);
-    lv_obj_set_style_bg_opa(toast, 235, 0);
-    lv_obj_set_style_pad_all(toast, 14, 0);
-    lv_obj_set_style_radius(toast, 14, 0);
-    lv_obj_set_style_border_width(toast, 1, 0);
-    lv_obj_set_style_border_color(toast,
-        lv_color_hex(s_always_on ? 0xF59E0B : 0x33465C), 0);
-    lv_label_set_text(toast, s_always_on ? "ALWAYS ON SCREEN  ON"
-                                         : "ALWAYS ON SCREEN  OFF");
-    lv_obj_align(toast, LV_ALIGN_CENTER, 0, 118);
-    /* fade_out only animates opacity — it does NOT delete, so without the
-     * delayed delete every toggle would leave an invisible label behind.
-     * Deleting an object cancels animations bound to it, so this is still safe
-     * if the lock screen is torn down before the timer elapses. */
-    lv_obj_fade_out(toast, 900, 900);
-    lv_obj_delete_delayed(toast, 1900);
+/* Pocket lock: hold the LEFT key on the lock screen to stop touch waking the
+ * panel. For a cube going into a bag or a coat pocket, where the alternative is
+ * a screen lit against fabric for the length of a commute.
+ *
+ * Same key, two verbs, kept apart the way the right key's two are: a short
+ * press still sleeps the panel, because BTN_SHORT only fires on a release that
+ * beat LONG_PRESS_MS while BTN_LONG fires with the finger still down. So the
+ * hold can never also sleep, and a tap can never toggle this.
+ *
+ * Only touch is refused, and only while the panel is off. Keys are untouched —
+ * they are the way back in, and unlike the glass they are not what a pocket
+ * leans on. The gate itself lives at the single consumer of s_req_wake rather
+ * than in the two touch callbacks that raise it, so neither of them has to know
+ * this mode exists. */
+static void pocket_lock_toggle(void) {
+    s_pocket_lock = !s_pocket_lock;
+    ESP_LOGI(TAG, "pocket lock %s", s_pocket_lock ? "ON" : "OFF");
+
+    if (!ui_lock()) return;
+    toast_show(s_pocket_lock ? "POCKET LOCK  ON"
+                             : "POCKET LOCK  OFF", s_pocket_lock, 0, 118);
     bsp_display_unlock();
 }
 
@@ -9532,6 +12688,16 @@ static bool app_back(void) {
         }
         return false;
     }
+    if (s_app == APP_POMO) {
+        /* Consumed, and deliberately consumed to do NOTHING. The fallthrough
+         * from here is Home, and Home tore the screen out from under a running
+         * countdown on the key most likely to be brushed while the cube is
+         * being turned. FOCUS is left the two ways every app can be left — the
+         * middle key, and the swipe up this screen already carries — so the tap
+         * costs nothing by being inert, and the right key's meaning here is now
+         * entirely in its hold. */
+        return true;
+    }
     if (s_app == APP_DAYS && s_days_qr_panel &&
         !lv_obj_has_flag(s_days_qr_panel, LV_OBJ_FLAG_HIDDEN)) {
         if (ui_lock()) {
@@ -9562,13 +12728,11 @@ static void app_action(void) {
         sp_send(s_sp_playing ? SP_CMD_PLAY : SP_CMD_PAUSE);
         break;
     case APP_POMO:
-        if (s_pomo_state == POMO_RUN || s_pomo_state == POMO_PAUSE) {
-            pomo_log("cancelled");
-            s_pomo_state = POMO_IDLE;
-            s_pomo_left_s = s_pomo_total_s;
-            sfx_play(SFX_PAUSE);
-            ESP_LOGI(TAG, "pomodoro: cancelled");
-        }
+        /* Was cancel-session. Cancel had no indicator and no undo, and it sat
+         * on the one key a hand finds while turning the cube; rotation lock is
+         * what that hold is for now. Nothing else binds cancel — a session is
+         * ended by letting it finish or by leaving it paused. */
+        pomo_rot_lock_toggle();
         break;
     case APP_DAYS:
         /* Hold right = refresh now. */
@@ -9617,6 +12781,23 @@ static void app_open(int idx) {
         s_req_ble_off = true;
     }
 
+    /* Lift the desk-clock dim BEFORE nav_fade_begin(), which captures
+     * s_bright_applied as the level to ramp back to — entering it dimmed would
+     * hand the incoming screen the dim level permanently, with nothing left on
+     * the glass to explain why.
+     *
+     * The wallpaper pointer is dropped first so the lift is brightness-only.
+     * That widget is about to be deleted a few lines below, so un-hiding it
+     * would buy an ~80 ms lit full-screen repaint of an image nobody will ever
+     * see, immediately before the fade-out. (The teardown block below still
+     * nulls it too — this is the load-bearing one, that one is the rule.)
+     *
+     * This is what covers the screen changes with no finger behind them: the
+     * lock screen's middle-key shortcut, the PET rebuild driven from the main
+     * loop, and the self-test walk. */
+    s_lock_wall = NULL;
+    ao_dim_set(false);
+
     bool reveal = nav_fade_begin();
     if (!ui_lock()) {
         if (reveal) rot_fade_end();
@@ -9627,11 +12808,22 @@ static void app_open(int idx) {
     if (s_app >= 0 && s_app < APP_COUNT && s_apps[s_app].save) {
         s_apps[s_app].save();
     }
+    /* Closing PET is the natural moment the dashboard's picture goes stale;
+     * report what the visit changed. */
+    if (s_app == APP_PET) pet_report_publish();
     if (s_app_timer) { lv_timer_delete(s_app_timer); s_app_timer = NULL; }
     s_scr_home = s_scr_setup = s_scr_pet = NULL;
     s_status_label = NULL; s_batt_bar = NULL; s_batt_label = NULL;
     s_bolt_label = NULL; s_fps_label = NULL; s_events_label = NULL;
-    s_ch_wrap = NULL;
+    s_ch_wrap = NULL; s_pet_egg = NULL;
+    s_gem[0] = s_gem[1] = NULL; s_walker = NULL;
+    s_gem_on[0] = s_gem_on[1] = false; s_walker_on = false;
+    s_gem_sky[0] = s_gem_sky[1] = false;
+    s_pet_planet = NULL; s_sign = NULL; s_sign_label = NULL;
+    s_jet_flame = NULL; s_sign_on = false; s_fly_mode = 0;
+    s_pet_qr_panel = NULL; s_pet_qr = NULL; s_pet_qr_note = NULL;
+    s_pet_qr_btn = NULL; s_pet_qr_btn_l = NULL; s_pet_qr_tick = NULL;
+    s_pet_qr_state = PET_QR_SHOWING;
     s_cfg_wall_pool = NULL; s_cfg_wall_state = NULL;
     s_cfg_wall_bar = NULL; s_cfg_wall_sub = NULL;
     s_cfg_days_val = NULL;
@@ -9640,6 +12832,9 @@ static void app_open(int idx) {
     s_cfg_lockkey_val = NULL; s_cfg_lockkey_btn = NULL;
     s_cfg_pick = NULL; s_cfg_picklist = NULL; s_cfg_pickmore = NULL;
     s_cfg_always_sw = NULL; s_cfg_rings_sw = NULL;
+    s_cfg_aodim_sw = NULL; s_cfg_aodim_sld = NULL;
+    s_cfg_aodim_val = NULL; s_cfg_aodim_sub = NULL;
+    s_cfg_chgeta_sw = NULL; s_cfg_chgeta_sub = NULL;
     s_cfg_bright_val = NULL;
     s_cfg_batt_bar = NULL;
     s_cfg_batt_val = NULL; s_cfg_batt_sub = NULL;
@@ -9678,7 +12873,7 @@ static void app_open(int idx) {
     s_sp_spin = NULL; s_sp_chip = NULL;
     s_sp_scr = NULL; s_sp_bg_drawn = 0;
     s_pomo_clock = NULL; s_pomo_word = NULL;
-    s_pomo_tick = NULL; s_pomo_hint = NULL;
+    s_pomo_tick = NULL; s_pomo_hint = NULL; s_pomo_padlock = NULL;
     s_pomo_ring = NULL; s_pomo_arc = NULL; s_pomo_fill = NULL;
     for (int i = 0; i < POMO_SLOTS; i++) s_pomo_dial[i] = NULL;
     s_days_today = NULL; s_days_time = NULL; s_days_num = NULL;
@@ -9689,8 +12884,10 @@ static void app_open(int idx) {
     lock_snapshot_clear();
     s_lock_time = NULL; s_lock_date = NULL; s_lock_meridiem = NULL;
     s_lock_batt = NULL;
-    s_lock_charge = NULL; s_lock_ring = NULL; s_lock_inner_ring = NULL;
-    s_lock_batt_arc = NULL;
+    s_lock_charge = NULL; s_lock_eta = NULL;
+    s_lock_ring = NULL; s_lock_inner_ring = NULL;
+    s_lock_batt_arc = NULL; s_lock_ao_ring = NULL;
+    s_lock_wall = NULL;     /* already dropped at the top; kept for the rule */
     s_lock_np = NULL;
     s_lock_np_art = NULL; s_lock_np_ph = NULL;
     s_lock_np_track = NULL; s_lock_np_prev = NULL; s_lock_np_play = NULL;
@@ -10018,16 +13215,19 @@ static void perf_mini_tick(lv_timer_t *t) {
     static int idx;
     lv_display_trigger_activity(NULL);
     switch (idx++) {
-    /* No PET: FACET_APP_PET is 0 in this profile, so the app does not exist
-     * in this image — requesting it was tonight's crash loop. */
+    /* PET is requested through app_enabled(), never by bare enum: a build
+     * with FACET_APP_PET 0 leaves a hole in s_apps, and requesting a hole
+     * was one night's entire crash loop (HARDWARE.md #31). */
     case 0: app_request(APP_DRAWER);                                  break;
     case 1: perf_snap_dump("drawer");
+            app_request(app_enabled(APP_PET) ? APP_PET : APP_DRAWER); break;
+    case 2: if (app_enabled(APP_PET)) perf_snap_dump("pet");
             s_lock_rings = false; s_lock_np_off = true;
             app_request(APP_LOCK);                                    break;
-    case 2: perf_snap_dump("lock_noring");
+    case 3: perf_snap_dump("lock_noring");
             s_lock_rings = true; s_lock_np_off = false;
             app_request(APP_MUSIC);                                   break;
-    case 3: /* second settle period: give MUSIC two full polls so the edge
+    case 4: /* second settle period: give MUSIC two full polls so the edge
              * chrome (shuffle/like/devices column, volume slider) has every
              * chance to arrive before the frame is judged */          break;
     default:
@@ -10169,8 +13369,12 @@ void app_main(void) {
      * same network since before the table existed reports nothing as saved, and
      * the phone asks for a password the cube is holding. Self-dedupes. */
     if (s_ssid[0] && s_pass[0]) known_remember(s_ssid, s_pass);
-    pet_load();
-    pomo_load();
+    /* pet_load and pomo_load used to run HERE — before sd_init() — which
+     * silently pinned them to the NVS fallback forever: every v2 pet save
+     * went to the card, every boot re-read a fossil v1 blob from NVS and
+     * re-migrated it, and the pet lived the same 45 minutes on repeat.
+     * State loads belong AFTER the card mounts, where days_load already
+     * was. */
     /* Ahead of the display, not with the other settings further down, and handed
      * to the BSP rather than applied here: the panel is already lit and holding a
      * 600 ms delay partway through bsp_display_start_with_config(), so anything
@@ -10240,7 +13444,15 @@ void app_main(void) {
             }
             bsp_display_unlock();
         }
-        app_open(APP_DRAWER);
+        /* Boot lands on the LOCK screen, not the drawer. A cube that has just
+         * been powered on or reflashed is in exactly the state waking from
+         * sleep leaves it in, and that path has always landed here — coming up
+         * on the drawer instead meant a reboot was the one way to find the
+         * device already unlocked, which is both inconsistent and the wrong
+         * default for something that spends its life on a desk. It also means
+         * the desk-clock dim and its wallpaper blackout are reachable from a
+         * cold boot without touching anything. */
+        app_open(APP_LOCK);
         log_mem("ui-built");
 
 
@@ -10248,6 +13460,11 @@ void app_main(void) {
 
     sd_init();
     days_load();
+    pet_load();
+    pomo_load();
+    /* The drawer built above knew only the factory pet name; now that the
+     * real one is loaded, rebuild it before anyone looks too closely. */
+    if (s_app == APP_DRAWER) app_request(APP_DRAWER);
     rtc_init();
     chg_load();          /* before pmu_init: the first CV write is the user's */
     pmu_init();
@@ -10287,7 +13504,7 @@ void app_main(void) {
     }
 
     int64_t last_stats = now_ms(), last_perf = now_ms();
-    int64_t last_batt = 0, last_imu = 0, last_pet = now_ms(), last_pet_save = now_ms();
+    int64_t last_batt = 0, last_imu = 0, last_pet_save = now_ms();
     int64_t last_tele = now_ms(), last_rejoin = now_ms(), last_sp_poll = 0;
     uint32_t last_refr = 0;
     int64_t s_last_btn = now_ms();
@@ -10416,6 +13633,20 @@ void app_main(void) {
 
         if (key_used) {
             /* consumed by MUSIC; the global bindings sit this one out */
+        } else if (s_app == APP_LOCK && kleft == BTN_LONG) {
+            /* Ahead of the plain LEFT branch, not inside the APP_LOCK branch
+             * below it: that branch is only reached when LEFT produced nothing,
+             * so putting it there would make this unreachable — the exact shape
+             * of the bug that once made the lock screen's right-key hold dead
+             * code. A short press still sleeps the panel; the two verbs cannot
+             * collide, because BTN_SHORT only fires on a release that beat
+             * LONG_PRESS_MS and BTN_LONG fires with the finger still down.
+             *
+             * On a cube with CFG_SNAP_CHORD on, arming a lobe screenshot
+             * (LEFT held, then MIDDLE) passes through 800 ms of held LEFT and
+             * so also toggles this. Dev-only, and visible when it happens. */
+            ESP_LOGI(TAG, "LEFT hold on lock -> pocket lock toggle");
+            pocket_lock_toggle();
         } else if (kleft == BTN_SHORT || kleft == BTN_LONG) {
             ESP_LOGI(TAG, "LEFT -> lock");
             lock_engage();
@@ -10428,6 +13659,30 @@ void app_main(void) {
             if (kright == BTN_LONG) {
                 ESP_LOGI(TAG, "RIGHT hold on lock -> desk clock toggle");
                 app_action();
+            }
+            /* Same key, other verb: a quick press shuffles the wallpaper. No
+             * clash with the hold is possible by construction — BTN_SHORT only
+             * fires on a release that beat LONG_PRESS_MS, and BTN_LONG fires
+             * while the finger is still down, so lifting quickly can never
+             * toggle desk clock and holding through 800 ms can never shuffle.
+             * Rebuilding the lock screen is the existing change-the-picture
+             * path: it consumes the primed slot (a cache hit, so the hidden
+             * render stays short), re-arms the primer for the next press, and
+             * the nav fade hides the full-frame repaint no TE pin can make
+             * coherent. app_open()'s 250 ms debounce absorbs key mashing. */
+            if (kright == BTN_SHORT) {
+                /* Only when there is a different picture to show: two-plus in
+                 * the pool, or one that arrived while the embedded default was
+                 * up. Otherwise the rebuild would fade out and back in on the
+                 * same image, which reads as a glitch rather than a shuffle. */
+                int have = __builtin_popcount(s_wall_have);
+                if (have > 1 || (have == 1 && s_wall_slot < 0)) {
+                    ESP_LOGI(TAG, "RIGHT tap on lock -> next wallpaper");
+                    app_open(APP_LOCK);
+                } else {
+                    ESP_LOGI(TAG, "RIGHT tap on lock ignored: %d wallpaper(s)",
+                             have);
+                }
             }
             /* Second exception, and an opt-in the rule above did not anticipate
              * rather than a hole in it: the middle key does nothing at all here
@@ -10481,14 +13736,52 @@ void app_main(void) {
                 s_last_btn = t;               /* reset the clock, don't re-fire */
                 lock_engage();
             }
+
+            /* Desk-clock dim. Its own branch, deliberately outside the if/else
+             * above: those two decide whether to CHANGE state (lock, sleep) and
+             * are mutually exclusive, while this one describes the panel during
+             * the state that always-on exists to hold still. It is one
+             * expression re-evaluated every pass rather than a pair of
+             * enter/exit rules, because that makes "every exit path restores"
+             * structural instead of a list somebody has to keep complete —
+             * always-on switched off, the panel asleep, FOCUS opened, a finger
+             * on the glass, the feature switched off in CONTROL: each of them
+             * just makes this false on the next 20 ms pass.
+             *
+             * s_app != APP_POMO because FOCUS already owns a dim and two owners
+             * of one output fight (pitfall #23's shape, applied to brightness).
+             * It is NOT enough that FOCUS pins activity while a session runs:
+             * POMO_IDLE does not, so on a cube parked on an unstarted FOCUS
+             * both timers run down on the same screen and every pass would
+             * write the other's level to 0x51, forever. FOCUS wins there
+             * because its dim is the one that knows the cube has been picked
+             * up — it watches the accelerometer, this only watches idle.
+             *
+             * Runs before pomo_poll() and before the s_req_bright_apply write
+             * further down this loop, so a touch restores in the same pass that
+             * observed it rather than one pass later. */
+            ao_dim_set(s_ao_dim_on && s_always_on && s_screen_on &&
+                       s_app != APP_POMO &&
+                       idle > (int64_t)s_ao_dim_s * 1000);
         }
 
         if (s_req_wake) {                 /* touch-to-wake, still locked */
             s_req_wake = false;
-            s_last_btn = t;
-            if (!s_screen_on) {
-                ESP_LOGI(TAG, "touch wake (stays locked)");
-                screen_toggle_power();
+            /* Pocket lock refuses the wake AND the idle stamp. Stamping anyway
+             * would be the quiet half of the bug: a cube riding against fabric
+             * raises this flag continuously, so s_last_btn would be pinned to
+             * now forever and the sleep timer could never run down again if the
+             * mode were switched off with the panel lit. The flag is still
+             * consumed rather than left set — it is a request that was answered
+             * with no, not one still waiting. */
+            if (s_pocket_lock) {
+                if (!s_screen_on) ESP_LOGD(TAG, "touch ignored (pocket lock)");
+            } else {
+                s_last_btn = t;
+                if (!s_screen_on) {
+                    ESP_LOGI(TAG, "touch wake (stays locked)");
+                    screen_toggle_power();
+                }
             }
         }
 
@@ -10548,7 +13841,7 @@ void app_main(void) {
          * touch sample. The flag is cleared only when the write actually lands —
          * clearing it up front would drop the request on a lock timeout, or
          * whenever it arrived while the panel was off or dimmed. */
-        if (s_req_bright_apply && s_screen_on && !s_pomo_dimmed) {
+        if (s_req_bright_apply && s_screen_on && !s_pomo_dimmed && !s_ao_dimmed) {
             if (bright_apply(s_bright)) s_req_bright_apply = false;
         }
 
@@ -10774,9 +14067,15 @@ void app_main(void) {
             }
         }
 
-        if (t - last_pet >= PET_TICK_MS) {
-            last_pet = t;
-            pet_tick();
+        pet_engine_service();          /* self-paced to ~1 Hz internally */
+        if (s_req_pet_rebuild) {
+            s_req_pet_rebuild = false;
+            /* Straight to app_open, NOT app_request: the request consumer
+             * filters same-app requests (want != s_app), which silently ate
+             * every mid-app rebuild — a design applied while the user stood
+             * in the pet app changed the data and never the screen. app_open
+             * handles a same-app rebuild through all the teardown rules. */
+            if (s_app == APP_PET) app_open(APP_PET);
         }
         /* NVS commits erase flash, which stalls a BLE controller running
          * from flash. The dirty flag stays set, so the write lands on the
@@ -10785,11 +14084,23 @@ void app_main(void) {
             last_pet_save = t;
             pet_save();
         }
+        /* An hourly heartbeat keeps the dashboard honest even when nobody
+         * opens the app; event pushes (evolution, departure) are immediate. */
+        static int64_t last_pet_push;
+        if (t - last_pet_push >= 60 * 60 * 1000LL) {
+            last_pet_push = t;
+            pet_report_publish();
+        }
 
-        if (!s_doze && t - last_imu >= 100) {     /* rotation is meaningless dozing */
+        /* PET reads the IMU as a joystick and a shake detector; 10 Hz
+         * undersamples a hand shake (one sample per half-oscillation), so
+         * the cadence rises to 50 Hz only while PET is the active app. The
+         * read is one 6-byte I2C burst, ~2% bus time at 50 Hz. */
+        if (!s_doze && t - last_imu >= (s_app == APP_PET ? 20 : 100)) {
             last_imu = t;
             imu_poll();
             pomo_poll(t);                         /* needs fresh accelerometer */
+            if (s_app == APP_PET) pet_motion_poll();
         }
 
         if (!s_rtc_written && s_time_synced) {
@@ -10860,9 +14171,19 @@ void app_main(void) {
                     strftime(clock, sizeof(clock), "%H:%M:%S", &tinfo);
                 }
             }
-            ESP_LOGI(TAG, "uptime=%llds clock=%s scr=%d idle=%lu/%llds wifi=%s%d screen=%s batt=%d%% %dmV%s%s cap=%dmV%s fps=%u.%u "
-                          "rot=%d sd=%lu pet[%d/%d/%d]%s",
+            /* Pocket lock earns a place here because its whole symptom is an
+             * absence — "the touchscreen stopped working" — with nothing on the
+             * glass to contradict that. One token turns a debug session into a
+             * grep. It prints only when on, so a healthy line is unchanged.
+             *
+             * The desk-clock dim is here for exactly the same reason: from the
+             * glass "the screen went dim on its own" is indistinguishable from
+             * a brightness bug, and this token separates them without a flash. */
+            ESP_LOGI(TAG, "uptime=%llds clock=%s scr=%d%s%s idle=%lu/%llds wifi=%s%d screen=%s batt=%d%% %dmV%s%s cap=%dmV%s fps=%u.%u "
+                          "rot=%d sd=%lu pet[%s f%d %d/%d m%d]%s",
                      (long long)(t / 1000), clock, (int)s_app,
+                     s_pocket_lock ? " POCKET" : "",
+                     s_ao_dimmed ? " AODIM" : "",
                      (unsigned long)lv_display_get_inactive_time(NULL),
                      (long long)((t - s_last_btn) / 1000),
                      s_wifi_up ? "up" : "down", wifi_rssi(),
@@ -10872,7 +14193,9 @@ void app_main(void) {
                      s_bypass ? " BYP" : (s_vbus ? " PLUG" : ""),
                      chg_cv_mv(chg_cv_code()), s_chg_once ? " ONCE" : "",
                      (unsigned)(s_last_fps_x10 / 10), (unsigned)(s_last_fps_x10 % 10),
-                     s_rot * 90, (unsigned long)s_tele_rows, s_food, s_fun, s_nrg,
+                     s_rot * 90, (unsigned long)s_tele_rows, pet_stage_word(),
+                     (int)s_pet.form, (int)s_pet.hunger, (int)s_pet.happy,
+                     (int)s_pet.mistakes,
                      s_stack_fallback ? " STACK-FALLBACK!" : "");
             log_mem("periodic");
         }

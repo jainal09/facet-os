@@ -107,6 +107,10 @@ func (b *broker) rateLimit(next http.Handler) http.Handler {
 			if user, ok := b.authenticateDaysSession(r); ok {
 				key = "days-user:" + user
 			}
+		} else if r.URL.Path == "/pet/data" || r.URL.Path == "/pet/design" {
+			if user, ok := b.authenticatePetSession(r); ok {
+				key = "pet-user:" + user
+			}
 		}
 		allowed := global.allow("global") && perClient.allow(key)
 		if allowed && sensitivePath(r.URL.Path) {
@@ -136,7 +140,9 @@ func remoteKey(r *http.Request) string {
 func sensitivePath(path string) bool {
 	switch path {
 	case "/spotify/token", "/pair", "/callback", "/art", "/art.bin", "/queue",
-		"/countdown", "/days/link", "/days/session":
+		"/countdown", "/days/link", "/days/session",
+		"/pet/link", "/pet/session", "/pet/data", "/pet/design", "/pet/cfg",
+		"/pet/st", "/pet/sheet":
 		return true
 	default:
 		return false

@@ -75,11 +75,20 @@ idf_component_register(
     # UI sounds live in flash, not on the card: ~99 KB of a 2.4 MB free app
     # slot, and no dependency on the SD card or the network to make a noise.
     # Authored by assets/sounds/render.py — see that file for why.
-    EMBED_FILES "../assets/sounds/tick.wav"
+    # The fallback wallpaper also lives in flash (~75 KB): with no card, an
+    # empty pool, or every cached PNG failing validation, the lock screen must
+    # still show something better than bare black. Palette-quantised and
+    # denoised offline — see assets/wall_default.png provenance in git log.
+    EMBED_FILES "../assets/wall_default.png"
+                "../assets/sounds/tick.wav"
                 "../assets/sounds/start.wav"
                 "../assets/sounds/pause.wav"
                 "../assets/sounds/resume.wav"
                 "../assets/sounds/done.wav"
+                "../assets/sounds/chirp.wav"
+                "../assets/sounds/munch.wav"
+                "../assets/sounds/hatch.wav"
+                "../assets/sounds/trombone.wav"
     REQUIRES bt nvs_flash esp_wifi esp_event esp_netif esp_http_client mbedtls esp_hw_support
              esp_timer esp_driver_gpio esp_driver_i2c esp_lcd_touch fatfs json esp_codec_dev esp_driver_i2s esp_app_format
              esp32_s3_touch_amoled_2_16 espressif__esp_lv_decoder

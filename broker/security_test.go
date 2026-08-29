@@ -84,7 +84,7 @@ func TestEmbeddedPagesHaveStrictMatchingCSPAndNoStoredBearer(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for name, data := range map[string][]byte{"days": daysPage, "provision": provision} {
+	for name, data := range map[string][]byte{"days": daysPage, "provision": provision, "pet": petPage} {
 		text := string(data)
 		if strings.Contains(text, "unsafe-inline") {
 			t.Errorf("%s page CSP permits unsafe-inline", name)
@@ -115,6 +115,13 @@ func TestEmbeddedPagesHaveStrictMatchingCSPAndNoStoredBearer(t *testing.T) {
 	if !bytes.Contains(daysPage, []byte("/days/session")) ||
 		!bytes.Contains(daysPage, []byte("history.replaceState")) {
 		t.Fatal("DAYS does not exchange and remove its one-time QR code")
+	}
+	if bytes.Contains(petPage, []byte("localStorage")) || bytes.Contains(petPage, []byte("sessionStorage")) {
+		t.Fatal("PET persists the broker bearer in browser storage")
+	}
+	if !bytes.Contains(petPage, []byte("/pet/session")) ||
+		!bytes.Contains(petPage, []byte("history.replaceState")) {
+		t.Fatal("PET does not exchange and remove its one-time QR code")
 	}
 
 	w := httptest.NewRecorder()

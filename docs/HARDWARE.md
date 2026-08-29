@@ -973,6 +973,14 @@ parked fork's intent, if anyone retries with the chip's datasheet in hand:
    ~160 ms tap, so the key appears dead. Wake logic must test the pin **level**,
    not a debounced edge — then swallow the release so it does not also fire that
    key's action. PWR is immune only because the PMU latches it in hardware.
+   The awake loop has the same trap at its own scale: at 20 ms polls a genuinely
+   fast tap is down on one poll and up by the next, under the 50 ms debounce, so
+   no debounced press ever exists and the release completes nothing. Symptom
+   from the glass: "an extremely quick press does nothing" while ordinary taps
+   work. `btn_poll()` therefore treats down-then-up raw edges with the debounced
+   state still released as a completed `BTN_SHORT` — safe because real contact
+   bounce settles in under ~10 ms, so opposite samples a full poll apart are a
+   finger, not a bounce.
 4. **Hardcoded serial ports in tooling.** The board re-enumerates between
    `/dev/cu.usbmodemX101` numbers across replugs. A capture script with a fixed
    port silently returns zero bytes and looks exactly like a dead board. Glob
@@ -1252,6 +1260,91 @@ parked fork's intent, if anyone retries with the chip's datasheet in hand:
     Two lessons: read the register dump before theorising — EXCVADDR 0 in a
     ROM string loop is a five-second diagnosis; and a harness that drives the
     firmware by enum must skip what the build compiled out.
+32. **Tilt-as-input read from the autorotate base detector is dead on
+    arrival, and it dies silently.** `s_base_rot` only flips once an axis
+    DOMINATES: 45 degrees plus `QMI_TILT_MARGIN`, so "tilt to steer" built on
+    it ignores every tilt short of tipping the cube onto its edge — on the
+    glass it reads as "motion controls don't work at all", with zero errors
+    anywhere. Steering needs the raw gravity COMPONENT along the screen edge
+    (see `pet_lean_signal()`), with the direction-to-axis mapping still routed
+    through `rot_from_base()` so all 8 mounting calibrations keep working.
+    Related: that mapping has exactly ONE free handedness bit ("does screen-
+    left correspond to rotation +1 or +3"), it cannot be settled from the
+    bezel edge arithmetic on paper — the derivation produced the wrong bit
+    with full confidence — and one hardware test settles it instantly. Budget
+    the test, not the proof.
+33. **An event reaction that is overwritten in the same frame looks like the
+    event never fired.** Shake detection worked from day one — the log said
+    so — while the user reported "shaking does nothing": the tilt handler ran
+    right after the shake handler and its `walk_to()` replaced the jump
+    animation before a single frame drew. When an input's visible effect is
+    an activity/animation, every OTHER input path must yield until it
+    finishes; a log line proving the event fired says nothing about whether
+    its effect survived to the panel. Same family as pitfall #23 (one writer
+    per output), applied to animations.
+
+34. **A rounded rect with a huge radius is a crash, not a slow draw.** Ground
+    circles of radius 1500-2400 px (flat-world horizons) sent LVGL's software
+    corner mask (`lv_draw_sw_mask_radius_init` → `circ_calc_aa4`) into a
+    repeating "Guru Meditation (Cache error)" panic on full redraws, while the
+    long-serving 270 px planet circle was always fine. The panic does not point
+    anywhere near the cause — it looks like a memory-system fault. Two
+    lessons: keep `lv_obj` corner radii in the low hundreds and draw a "flat"
+    horizon as a radius-0 slab (the walking-surface math can stay curved —
+    nobody can see a 5 px sag); and `xtensa-esp32s3-elf-addr2line -pfiaC -e
+    build/facet.elf <backtrace addrs>` turns a raw Guru backtrace into named
+    frames in seconds — the fastest diagnosis in this file, provided the ELF
+    still matches the flashed image.
+
+35. **A dark panel is not an inert one — the whole UI is still live under it,
+    and it will take clicks you cannot see.** Symptom as reported from the
+    glass: "the screen is off but the playback controls work and change the
+    song". `esp_lcd_panel_disp_on_off(panel, false)` stops the CO5300 emitting
+    and scanning (§7b). It does not stop the CST9220, the LVGL indev, the widget
+    tree, or a single event — so the lock screen's transport buttons really did
+    skip tracks from inside a pocket, with the panel dark and the device
+    dozing at 80 MHz.
+    The trap is that it *looked* guarded. Two handlers, `lock_tap_cb` and
+    `lock_np_tap_cb`, each tested `s_screen_on` and returned a wake request
+    instead of acting — which covered the screen and the cover art, and read
+    like a policy. It was not a policy, it was two widgets: prev, play and next
+    were added later and inherited nothing, because there was nothing central to
+    inherit it FROM. **A gate written per widget is a hole per widget anyone
+    adds afterwards**, and the same shape as the stale one-owner comment in §7f.
+    Fix: one gate on the pointer indev's `LV_EVENT_PRESSED`, which every touch
+    passes through — raise the wake request, then `lv_indev_wait_release()`.
+    That is not merely a cooldown: `lv_indev.c:1476` sends `PRESS_LOST` and then
+    nulls `pointer.act_obj`, so the release path has no object left to deliver
+    to. Since `CLICKED` is sent on release, cancelling the release kills clicks,
+    gestures and scrolls together, on every screen, for widgets not yet written.
+    Verified on hardware both ways: with the panel dark a touch registered in
+    LVGL (`idle=2093` in the status line) and produced no wake and no command,
+    while the same buttons still worked normally with the screen on.
+
+36. **`translate_x/y` on a SCREEN is a silent no-op — it works on every other
+    object, which is what makes it dangerous.** A burn-in drift for the
+    desk-clock dim set `lv_obj_set_style_translate_x/y()` on
+    `lv_screen_active()` and did nothing at all: no error, no warning, and at
+    4 px on a panel already at 12% there was no symptom an eye could ever have
+    caught. It would have passed a hardware test and shipped as a feature that
+    never once executed.
+    Cause: screens are created `lv_obj_create(NULL)`, so `obj->parent` is NULL,
+    and `lv_obj_refr_pos()` (`lv_obj_pos.c:781`) returns at
+    `if(parent == NULL) { lv_obj_move_to(obj, x, y); return; }` — twenty lines
+    **before** it reads `translate_x`/`translate_y` at :804. Translate is
+    applied on top of the position a parent gives you, so an object with no
+    parent never gets it. The same applies to `lv_layer_top()` and
+    `lv_layer_bottom()`, which are also parentless.
+    Fix: translate the screen's **children** (`lv_obj_get_child_count()` /
+    `lv_obj_get_child()`), which do have parents. That also keeps the property
+    that made a whole-screen shift attractive — everything moves together, and a
+    widget added later joins in without knowing.
+    The general lesson is the one worth keeping: **a styling call that is a
+    no-op only in one context looks identical to one that worked.** This was
+    found by reading `lv_obj_pos.c` to check an assumption a confident comment
+    had already been written about, not by testing. When a visual effect is
+    small enough that you cannot tell success from nothing, the source is the
+    instrument, not the glass.
 
 ## 11. Debugging method that worked
 

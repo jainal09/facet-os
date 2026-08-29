@@ -327,8 +327,76 @@ def done():
     return pad(reverb(buf, mix=0.34, feedback=0.80, tail=0.60)), -11.0
 
 
+# ---------------------------------------------------------------- the pet
+#
+# PET clips sit several dB below the UI set on purpose: the pet only ever
+# *responds* to being touched, fed or greeted, and a creature on your desk that
+# is louder than your keypresses stops being company and starts being a device.
+
+
+def chirp():
+    """The pet notices you — picked up, petted, knocked on. Two tiny struck
+    notes a sixth apart, close enough together to read as one bird-like
+    syllable rather than a melody."""
+    buf = silence(0.16)
+    add(buf, 0.000, air(0.012, 0.18, 3400, 1.5, 0.003))
+    add(buf, 0.000, struck(1975.5, 0.10, 0.55,               # B6
+                           ratios=[1.0, 2.4], amps=[1.0, 0.22],
+                           decays=[0.30, 0.16], attack=0.0015))
+    add(buf, 0.045, struck(2489.0, 0.12, 0.70,               # D#7
+                           ratios=[1.0, 2.4], amps=[1.0, 0.18],
+                           decays=[0.34, 0.16], attack=0.0015))
+    return pad(reverb(buf, mix=0.18, feedback=0.60, tail=0.14)), -16.0
+
+
+def munch():
+    """Feeding. Two soft bites: mostly filtered noise with a dull knock under
+    it, pitched where the driver is strong but shaped to read as texture, not
+    tone. The second bite lands lower and quieter, like the mouthful shrank."""
+    def bite(hz, amp):
+        out = silence(0.070)
+        add(out, 0.000, air(0.030, amp, hz, 0.8, 0.010))
+        add(out, 0.000, struck(hz * 0.62, 0.060, amp * 0.35,
+                               ratios=[1.0, 1.83], amps=[1.0, 0.30],
+                               decays=[0.30, 0.15], attack=0.0012))
+        return out
+    buf = silence(0.30)
+    add(buf, 0.000, bite(1900, 0.90))
+    add(buf, 0.150, bite(1500, 0.62))
+    return pad(reverb(buf, mix=0.12, feedback=0.55, tail=0.10)), -15.0
+
+
+def hatch():
+    """Egg opens / evolution lands. The one PET moment allowed some ceremony:
+    a rising major arpeggio in struck glass with a shimmer strike on top,
+    and a longer room so it blooms instead of beeping."""
+    buf = silence(0.62)
+    add(buf, 0.000, air(0.018, 0.22, 3200, 1.4, 0.004))
+    add(buf, 0.000, struck(1046.5, 0.30, 0.65))              # C6
+    add(buf, 0.110, struck(1318.5, 0.30, 0.75))              # E6
+    add(buf, 0.220, struck(1568.0, 0.34, 0.85))              # G6
+    add(buf, 0.330, air(0.020, 0.24, 4400, 1.5, 0.005))
+    add(buf, 0.330, struck(2093.0, 0.46, 0.95,               # C7, the shimmer
+                           ratios=[1.0, 2.01, 3.42], amps=[1.0, 0.30, 0.10],
+                           decays=[0.60, 0.34, 0.18]))
+    return pad(reverb(buf, mix=0.36, feedback=0.78, tail=0.55)), -13.0
+
+
+def trombone():
+    """The gentle 'aw'. Two held notes falling a minor third, with enough
+    second harmonic to read as a comic little horn rather than a sine. For the
+    funny moments — a declined snack, the lazy adult reveal — so it must smile,
+    never scold: short, quiet, and rounder than any UI cue."""
+    buf = silence(0.46)
+    add(buf, 0.000, tone(1480.0, 0.16, 0.70, attack=0.018, release=0.06, harm2=0.45))
+    add(buf, 0.200, tone(1244.5, 0.24, 0.80, attack=0.020, release=0.10, harm2=0.45))
+    return pad(reverb(buf, mix=0.24, feedback=0.66, tail=0.30)), -16.0
+
+
 if __name__ == "__main__":
     for name, fn in (("tick", tick), ("start", start), ("pause", pause),
-                     ("resume", resume), ("done", done)):
+                     ("resume", resume), ("done", done),
+                     ("chirp", chirp), ("munch", munch), ("hatch", hatch),
+                     ("trombone", trombone)):
         buf, peak = fn()
         write_wav("%s.wav" % name, buf, peak)
