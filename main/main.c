@@ -6728,22 +6728,21 @@ static void cfg_aodim_cb(lv_event_t *e) {
     ESP_LOGI(TAG, "desk-clock dim pref %s", s_ao_dim_on ? "ON" : "OFF");
 }
 
-/* Same shape as cfg_care_cb and for the same reasons: the label is rewritten on
- * RELEASED only, because a label that changes width inside an LV_SIZE_CONTENT
- * card re-lays out the whole scrolling column and moves the slider out from
- * under the finger; and NVS waits for the main loop, because committing per
- * VALUE_CHANGED erases flash on every pixel of a drag. */
+/* Same shape as cfg_care_cb and for the same reasons: the readout is rewritten
+ * on every VALUE_CHANGED so the delay reads true while the knob is moving — see
+ * cfg_vol_cb for why that is safe now — and NVS waits for the main loop, because
+ * committing per VALUE_CHANGED erases flash on every pixel of a drag. */
 static void cfg_aodim_delay_cb(lv_event_t *e) {
     int i = clampi((int)lv_slider_get_value(lv_event_get_target(e)),
                    0, AO_DIM_STOPS - 1);
     s_ao_dim_s = s_ao_dim_stops[i];
-    if (lv_event_get_code(e) != LV_EVENT_RELEASED) return;
-
     if (s_cfg_aodim_val) {
         char buf[32];
         ao_dim_label(buf, sizeof buf, s_ao_dim_s);
         lv_label_set_text(s_cfg_aodim_val, buf);
     }
+    if (lv_event_get_code(e) != LV_EVENT_RELEASED) return;
+
     s_req_lock_pref_save = true;
     ESP_LOGI(TAG, "desk-clock dim delay -> %d s", s_ao_dim_s);
 }
@@ -6794,19 +6793,23 @@ static int chg_slider_to_mode(int val)  { return CHG_LIFESPAN - val; }
 
 /* Three stops on a slider rather than three buttons: it inherits the 76 px
  * touch sizing and the widened hit area that this panel needs, and a row of
- * buttons would have to fight the card's flex column for width. Label on
- * release only, for the reason cfg_vol_cb spells out above. */
+ * buttons would have to fight the card's flex column for width. Percentage and
+ * hint both follow the knob, for the reason cfg_vol_cb spells out above; three
+ * stops is also the case that needed it most, since the knob alone cannot say
+ * which of three unlabelled positions it landed on. chg_mode_pct() is pure
+ * arithmetic on the CV table, not a charger read, so it is free to call per
+ * step. */
 static void cfg_care_cb(lv_event_t *e) {
     int val = clampi((int)lv_slider_get_value(lv_event_get_target(e)),
                      CHG_FULL, CHG_LIFESPAN);
     s_chg_mode = chg_slider_to_mode(val);
-    if (lv_event_get_code(e) != LV_EVENT_RELEASED) return;
-
     if (s_cfg_care_val) {
         lv_label_set_text_fmt(s_cfg_care_val, "charge limit  %d%%",
                               chg_mode_pct(s_chg_mode));
     }
     if (s_cfg_care_sub) lv_label_set_text(s_cfg_care_sub, chg_mode_hint(s_chg_mode));
+    if (lv_event_get_code(e) != LV_EVENT_RELEASED) return;
+
     s_req_chg_save = true;
     ESP_LOGI(TAG, "battery care -> charge to %d%%", chg_mode_pct(s_chg_mode));
 }
@@ -6832,45 +6835,54 @@ static void cfg_care_once_cb(lv_event_t *e) {
     ESP_LOGI(TAG, "one-shot full charge %s", s_chg_once ? "ARMED" : "cancelled");
 }
 
-/* Same shape as cfg_vol_cb and for the same three reasons: the label is only
- * rewritten on release, because resizing it mid-drag re-lays out the card and
- * moves the slider under the finger; the panel write is left to the main loop,
- * because it is QSPI IO that needs the LVGL lock this callback already holds;
- * and NVS waits too, because committing per VALUE_CHANGED would erase flash on
- * every pixel of the drag. */
+/* Same shape as cfg_vol_cb and for the same three reasons: the readout is
+ * rewritten on every VALUE_CHANGED, which is safe because the label's geometry
+ * is pinned (see cfg_vol_cb); the panel write is left to the main loop, because
+ * it is QSPI IO that needs the LVGL lock this callback already holds; and NVS
+ * waits too, because committing per VALUE_CHANGED would erase flash on every
+ * pixel of the drag. The glass is already brightening under the finger — the
+ * number was the one part of this control that lagged behind it. */
 static void cfg_bright_cb(lv_event_t *e) {
     s_bright = clampi((int)lv_slider_get_value(lv_event_get_target(e)),
                       BRIGHT_MIN, 100);
     s_req_bright_apply = true;
-    if (lv_event_get_code(e) != LV_EVENT_RELEASED) return;
-
     if (s_cfg_bright_val) {
         lv_label_set_text_fmt(s_cfg_bright_val, "brightness  %d%%", s_bright);
     }
+    if (lv_event_get_code(e) != LV_EVENT_RELEASED) return;
+
     s_req_bright_save = true;
 }
 
-/* Deliberately does almost nothing while the knob is moving.
+/* The number follows the knob; only the commits wait for the finger to lift.
+ * This is the comment the other three sliders on this panel point at.
  *
- * Rewriting the label on every LV_EVENT_VALUE_CHANGED was a crash: the text
- * length changes, the label sits in a LV_SIZE_CONTENT flex card, so the card and
- * the whole scrolling column re-laid out dozens of times a second — which moves
- * the slider itself while LVGL is midway through delivering an input event to
- * that very slider. The knob position is feedback enough during a drag; the
- * numbers land when you let go.
+ * Rewriting the label on every LV_EVENT_VALUE_CHANGED USED to be a crash, and
+ * the reason is worth keeping: the text length changes, the label sat in a
+ * LV_SIZE_CONTENT flex card, so the card and the whole scrolling column re-laid
+ * out dozens of times a second — which moves the slider itself while LVGL is
+ * midway through delivering an input event to that very slider. What removed
+ * the hazard was not the release guard but the fix underneath it: every readout
+ * above a slider here is now pinned to lv_pct(100) by one montserrat_20 line
+ * (26 px), so the text can change all it likes and the geometry does not. The
+ * guard outlived the bug it was standing in for, and a value that only appears
+ * after you let go reads as a control that did not hear you. Those pinned
+ * heights are now load-bearing: a readout on this panel that goes back to
+ * LV_SIZE_CONTENT brings the crash back with it.
  *
  * NVS is written from the main loop rather than here, because a commit erases
- * flash and can block for tens of milliseconds with the LVGL lock held. */
+ * flash and can block for tens of milliseconds with the LVGL lock held. The
+ * confirmation clip waits for release too — one per drag, not one per pixel. */
 static void cfg_vol_cb(lv_event_t *e) {
     s_vol = (int)lv_slider_get_value(lv_event_get_target(e));
-    if (lv_event_get_code(e) != LV_EVENT_RELEASED) return;
-
     if (s_cfg_vol_val) {
         /* integer dB, not %f: newlib's float formatting is stack-hungry and this
          * runs on the LVGL task, whose 8 KB is already carrying the renderer */
         lv_label_set_text_fmt(s_cfg_vol_val, "volume  %d%%   /   %+d dB",
                               s_vol, (int)vol_db(s_vol));
     }
+    if (lv_event_get_code(e) != LV_EVENT_RELEASED) return;
+
     s_req_vol_save = true;
     sfx_play(SFX_DONE);      /* the loudest clip: the one to judge a level by */
 }
@@ -10120,16 +10132,27 @@ static void sp_vol_hud_paint(bool with_title) {
 }
 
 /* Dragging the gauge sets the level directly. Guarded on s_sp_vol_ok because a
- * device that refuses remote volume must not appear to accept a drag. */
+ * device that refuses remote volume must not appear to accept a drag.
+ *
+ * The readout follows the knob on every VALUE_CHANGED and the PUT waits for
+ * RELEASED — the two halves of this callback answer to different costs. The
+ * borrowed title line is absolutely positioned on this screen, so repainting it
+ * mid-drag moves nothing (unlike CONTROL's flex cards, see cfg_vol_cb); a
+ * Spotify round trip per pixel of drag is a different matter entirely. */
 static void sp_vol_slider_cb(lv_event_t *e) {
     if (!s_sp_vol_ok) return;
     int v = lv_slider_get_value(s_sp_vol_bar);
-    if (v == s_sp_vol) return;
-    s_sp_vol = v;
-    s_sp_vol_painted = v;
+    if (v != s_sp_vol) {
+        s_sp_vol = v;
+        s_sp_vol_painted = v;
+        s_sp_vol_shown = now_ms();
+        sp_vol_hud_paint(true);
+    }
+    if (lv_event_get_code(e) != LV_EVENT_RELEASED) return;
+
+    /* sp_push_volume() weighs the level against s_sp_vol_sent, so a drag that
+     * ended where it began costs nothing on the wire. */
     sp_send(SP_CMD_VOLUME);
-    s_sp_vol_shown = now_ms();
-    sp_vol_hud_paint(true);
 }
 
 static void sp_vol_hud_show(void) {
@@ -10478,9 +10501,10 @@ static void build_music_app(lv_obj_t *scr) {
     lv_obj_set_style_bg_opa(s_sp_vol_bar, LV_OPA_COVER, 0);
     lv_obj_set_style_pad_all(s_sp_vol_bar, 10, LV_PART_KNOB);
     lv_obj_set_style_bg_color(s_sp_vol_bar, lv_color_hex(0xF2E9DC), LV_PART_KNOB);
-    /* Commit on RELEASED only. A VALUE_CHANGED handler fires on every pixel of
-     * drag, which would be one Spotify PUT per pixel — and the volume slider in
-     * CONTROL hard-crashed this board for the sibling reason. */
+    /* Both events, one callback: it repaints on VALUE_CHANGED and only commits
+     * on RELEASED, so the number tracks the thumb without spending a Spotify PUT
+     * per pixel of drag. */
+    lv_obj_add_event_cb(s_sp_vol_bar, sp_vol_slider_cb, LV_EVENT_VALUE_CHANGED, NULL);
     lv_obj_add_event_cb(s_sp_vol_bar, sp_vol_slider_cb, LV_EVENT_RELEASED, NULL);
     /* LVGL sets LV_OBJ_FLAG_GESTURE_BUBBLE on every child that has a parent
      * (lv_obj.c:593), so a drag here reached the screen's gesture handler and

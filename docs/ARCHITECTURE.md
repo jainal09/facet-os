@@ -1280,9 +1280,23 @@ and survives a reboot. It is also the only way to re-calibrate the fuel gauge,
 which needs a complete cycle it otherwise never gets.
 
 **The charge countdown counts to the limit, and that is the whole feature.** The
-AXP2101 reports no time-to-full, so `chg_eta_track()` derives one from the only
-signal that moves — the same `s_batt_pct` the ring draws, so the caption and the
-gauge can never disagree. It reads "1H 05M TO 90%" on the lock screen and takes
+AXP2101 reports no time-to-full, so `chg_eta_track()` builds one from two
+different measurements, and keeping them straight is the thing to understand
+here. **Rate** comes from the gauge: milliseconds per `s_batt_pct` point,
+smoothed, because that is the signal that moves in usable steps. **Distance**
+comes from the ADC: millivolts to the CV target, at the 9 mV per point the
+firmware's own voltage scale implies. Rate is a gauge quantity, distance is a
+voltage one, and they are deliberately not the same number.
+
+That split is why the caption and the ring **can** disagree — an earlier version
+of this paragraph claimed they never could, which was true only while distance
+was also measured in gauge points. Counting in gauge points made the countdown
+vanish when the gauge crossed the label rather than when charging actually
+stopped, because the two cross at different moments; counting in millivolts ends
+it where the charger ends. The visible cost is that a cell can read 87% under a
+caption saying "TO 90%", which is the gauge and the voltage scale disagreeing by
+a couple of points near the top of the curve, not a bug in either. It reads
+"1H 05M TO 90%" on the lock screen and takes
 over the CONTROL drain line while charging, where the drain figure was not merely
 uninteresting but unmeasurable and read "measuring..." for the whole of every
 charge.
