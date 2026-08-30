@@ -102,7 +102,7 @@ static const char *TAG = "funnel";
 
 /* AXP2101 PMU */
 #define AXP2101_ADDR          0x34
-#define AXP_REG_STATUS1       0x00      /* b5 VBUS good, b4 BATFET, b3 battery present, b0 in ILIM */
+#define AXP_REG_STATUS1       0x00      /* b5 VBUS good, b4 BATFET, b3 battery present */
 #define AXP_REG_STATUS2       0x01      /* b[6:5] 00 idle/01 charge/10 discharge, b[2:0] charge state */
 #define AXP_REG_GAUGE_CTRL    0x18      /* bit3: fuel-gauge module enable */
 #define AXP_REG_ADC_CH_CTRL   0x30      /* bit0: battery voltage ADC enable */
@@ -2061,46 +2061,6 @@ static int chg_target_pct(void) {
  * two-point wait. */
 static volatile bool s_chg_eta_on;
 
-/* ---- charger speed ----
- *
- * Classified from the rate the estimator already learns, which is the honest
- * place to measure it: ms-per-point is the OUTCOME, so it catches a weak
- * adapter, a shared USB2 port and a thermally throttled cell alike, where
- * reading the ICC register would only report what we asked the PMU for.
- *
- * Latched from the CC phase and never revised, which is the part that matters.
- * Every charger slows down as the cell approaches CV — that is the taper the
- * ETA's own open-segment term exists to model — so a rate sampled near the top
- * would label a perfectly good supply "slow". Below CV-60 mV the charger is
- * still in constant current and the rate means what it appears to mean.
- *
- * The thresholds are estimates, and honestly so: this cube measured 30-91 s
- * per point on a healthy supply, and a charger delivering half the current
- * lands at roughly double that. No genuinely slow charger has been measured
- * yet, so the latch logs the value it decided on — retune from that log rather
- * than from argument, and leave the dead band between the two: refusing to
- * classify is better than guessing wrong in either direction. */
-#define CHG_FAST_MS_PP  (150 * 1000)   /* at or under this per point: keeping up */
-#define CHG_SLOW_MS_PP  (240 * 1000)   /* at or over this: the supply is the limit */
-
-/* The latch may not fire until the smoothed rate has actually been smoothed.
- * It used to classify on the FIRST interval it learned, where the 3:1 EWMA has
- * nothing to average against and simply takes that one sample whole — and the
- * first interval of a session is the least trustworthy one there is. Measured:
- * "charger looks FAST — 12 s/point" on a supply whose real rate, from the same
- * capture, was 30-75 s/point. The gauge steps twice in quick succession as it
- * catches up to a voltage the cell already reached, that 12 s clears the 10 s
- * floor meant only to reject gauge jumps, and the one-shot latch fires on it.
- *
- * The bias is one-directional and that is what made it dangerous: a catch-up
- * burst can only make a charger look FASTER than it is, so the classifier would
- * have reported FAST for a weak supply and the error would have looked like a
- * pass. Five samples leaves the first contributing ~32% of the EWMA. */
-#define CHG_SPEED_MIN_STEPS 5
-
-static volatile int  s_chg_speed;   /* 0 unknown, 1 fast, -1 slow */
-static volatile bool s_chg_ilim;    /* PMU is input-current-limited (reg 0x00 b0) */
-
 static volatile int s_chg_eta_mins = -1;   /* -1 = no honest answer to give */
 static int64_t s_chg_eta_mark;             /* when the gauge last stepped up */
 static int     s_chg_eta_pct;              /* the value it stepped to */
@@ -2117,7 +2077,6 @@ static void chg_eta_track(void) {
         s_chg_eta_ms_pp = 0;
         s_chg_eta_steps = 0;
         s_chg_eta_mins = -1;
-        s_chg_speed = 0;      /* the next session may be a different cable */
         return;
     }
 
@@ -2150,27 +2109,6 @@ static void chg_eta_track(void) {
              * real slowdown still lands within a few points. */
             s_chg_eta_ms_pp = s_chg_eta_ms_pp
                             ? (s_chg_eta_ms_pp * 3 + ms_pp) / 4 : ms_pp;
-
-            /* Latch once, and only from the constant-current phase — see the
-             * threshold note above. ILIM is logged rather than used: it is the
-             * PMU's own "this supply cannot give me what I asked for", which
-             * would be a better primary signal than a timing threshold, but
-             * the two circulating AXP2101 datasheets disagree enough (§7) that
-             * it needs corroborating on a genuinely weak charger before
-             * anything depends on it. This line is how that gets collected. */
-            int cv = chg_cv_mv(chg_cv_code());
-            if (!s_chg_speed && s_chg_eta_steps >= CHG_SPEED_MIN_STEPS &&
-                cv && s_batt_mv > 0 && s_batt_mv < cv - 60) {
-                if (s_chg_eta_ms_pp <= CHG_FAST_MS_PP)      s_chg_speed = 1;
-                else if (s_chg_eta_ms_pp >= CHG_SLOW_MS_PP) s_chg_speed = -1;
-                if (s_chg_speed) {
-                    ESP_LOGI(TAG, "charger looks %s — %d s/point at %d mV "
-                                  "(CV %d mV, ILIM=%d, %d samples)",
-                             s_chg_speed > 0 ? "FAST" : "SLOW",
-                             s_chg_eta_ms_pp / 1000, s_batt_mv, cv,
-                             s_chg_ilim ? 1 : 0, s_chg_eta_steps);
-                }
-            }
         }
     }
 
@@ -2224,16 +2162,9 @@ static void chg_eta_track(void) {
 static void chg_eta_text(char *buf, size_t n, int mins) {
     if (mins > 15) mins = (mins + 2) / 5 * 5;
     int target = chg_target_pct();
-    /* A word, not a glyph. A tortoise was the ask and there is no tortoise to
-     * be had: LVGL's symbol set has no animal and the hud fonts are ASCII-only,
-     * so any emoji renders as an empty box. Drawing one from arcs the way the
-     * FOCUS padlock is drawn was the alternative and it was not worth it at
-     * this size. Empty in the dead band, so a normal charge says nothing. */
-    const char *speed = s_chg_speed > 0 ? " - fast"
-                      : s_chg_speed < 0 ? " - slow" : "";
-    if (mins >= 60) snprintf(buf, n, "%dh %02dm to %d%%%s",
-                             mins / 60, mins % 60, target, speed);
-    else            snprintf(buf, n, "%dm to %d%%%s", mins, target, speed);
+    if (mins >= 60) snprintf(buf, n, "%dh %02dm to %d%%",
+                             mins / 60, mins % 60, target);
+    else            snprintf(buf, n, "%dm to %d%%", mins, target);
 }
 
 /* Write the charge cap if the PMU is not already holding it.
@@ -2307,7 +2238,6 @@ static void battery_poll(void) {
      * "not in VINDPM", which reads as unplugged whenever the supply droops —
      * exactly the case a charge cap makes more likely, not less. */
     s_vbus      = (st1 >> 5) & 0x01;
-    s_chg_ilim  = st1 & 0x01;      /* free: st1 is already in hand */
     s_chg_state = st2 & 0x07;
     s_bypass    = s_vbus && s_chg_state == AXP_CHG_DONE;
 

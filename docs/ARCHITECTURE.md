@@ -1302,6 +1302,28 @@ Three consequences worth knowing:
 and survives a reboot. It is also the only way to re-calibrate the fuel gauge,
 which needs a complete cycle it otherwise never gets.
 
+**A charger fast/slow indicator was built here and removed.** It classified the
+supply from the rate the estimator already learns — ms per gauge point, latched
+from the constant-current phase — and it does not work on this board, for a
+reason no threshold can fix: **the cube asks the PMU for 400 mA** (`0x62` step
+10), and essentially any supply delivers that. Measured, a deliberately weak
+charger came in at 78 s/point against a good one's 30-75. There is no speed
+difference to detect because there is barely any speed difference.
+
+It also shipped a bug worth remembering, because the failure was silent and
+one-directional: the latch classified on the FIRST interval it learned, where
+the 3:1 EWMA has nothing to average against and takes that one sample whole. The
+first interval of a session is the gauge catching up to a voltage the cell
+already reached, so it reported "FAST — 12 s/point" on a supply whose real rate
+was 30-75. A catch-up burst can only make a charger look *faster*, so the
+classifier would have called a weak supply FAST and the wrong answer would have
+looked like a passing test.
+
+If it is ever revived, the signal is **ILIM** — reg `0x00` bit 0, the PMU's own
+"this supply cannot give me what I asked for" — not a timing threshold. That
+reports the condition directly instead of inferring it from a rate that does not
+vary.
+
 **The charge countdown counts to the limit, and that is the whole feature.** The
 AXP2101 reports no time-to-full, so `chg_eta_track()` builds one from two
 different measurements, and keeping them straight is the thing to understand
