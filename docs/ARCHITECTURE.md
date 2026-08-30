@@ -1142,6 +1142,19 @@ on this device — `s_lock_ao_ring` is the same amber. The normal colour is
 recorded into `s_lock_time_col` at build time rather than duplicated as a
 constant, so retuning the clock cannot leave it coming back the wrong shade.
 
+**Open defect: the now-playing transport renders malformed while dimmed.**
+Captured with `CFG_DIM_SNAP`, two frames from one run seconds apart on the same
+screen: undimmed the transport is clean — a correct pause glyph, three round
+buttons on the card's translucent panel; dimmed, the play glyph is distorted,
+a second green shape appears beside it, and the buttons carry dark notches. It
+is not capture corruption — all 1200 chunks of that frame arrived, only the
+final partial one was padded — and it is not pre-existing, because the undimmed
+frame from the same run is clean. The dim touches only two things on this
+screen, the wallpaper's HIDDEN flag and the clock's colour, so the likely
+mechanism is the card's translucent backgrounds compositing over the screen's
+own black rather than over the wallpaper. Seen once and not yet reduced; the
+shots are the evidence to start from.
+
 **None of this is measured.** The saving is argued from how the panel works, not
 from evidence, and HARDWARE.md §7b is deliberately untouched because it opens
 "All measured on hardware". The number that would settle it is mV/hour from

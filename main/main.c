@@ -6068,6 +6068,27 @@ static int       s_cfg_slider_n;
  * shot; a debug affordance for a dev cube, requested by the user. */
 #define CFG_SNAP_CHORD 1
 
+/* One-shot experiment: prove the desk-clock burn-in drift actually MOVES
+ * PIXELS. The log line only proves ao_drift_apply() was called, and the first
+ * version of that function was a silent no-op (HARDWARE.md #36) — a styling
+ * call that does nothing looks exactly like one that worked, and 4 px on a 12%
+ * panel is invisible to an eye either way. A framebuffer snapshot is the only
+ * instrument that settles it: it captures what LVGL rendered, so panel
+ * brightness does not enter into it.
+ *
+ * Streams two frames of the same screen in the same clock minute, differing
+ * only by an exaggerated 8 px drift, and freezes the main loop's own dim while
+ * it runs so nothing else can move between them. Keep 0 in commits — same
+ * contract as CFG_PERF_SCROLL_SELFTEST. */
+#define CFG_DIM_SNAP 0
+#if CFG_DIM_SNAP
+/* Declared HERE, under the flag, not beside the drift state it guards: that
+ * state lives thousands of lines above this #define, where CFG_DIM_SNAP is
+ * still undefined and the #if silently evaluates to 0 — the declaration
+ * vanishes and only the use sites fail to compile. */
+static volatile bool s_dim_snap_busy;   /* holds the main loop off mid-capture */
+#endif
+
 #if CFG_PERF_SCROLL_SELFTEST || CFG_SNAP_CHORD
 #include "mbedtls/base64.h"
 #endif
@@ -13050,6 +13071,45 @@ static __attribute__((unused)) void snap_stream(lv_draw_buf_t *snap, const char 
     lv_draw_buf_destroy(snap);
 }
 
+#if CFG_DIM_SNAP
+/* Two frames, one clock minute, one variable. Runs on the LVGL task, which is
+ * where snap_stream() is safe to call from, and holds the main loop's dim off
+ * for the whole ~2 min so the only thing that can differ between the frames is
+ * the drift. 8 px rather than the production 4, so the shift cannot be confused
+ * with a one-pixel rounding difference in the diff. */
+static void dim_snap_cb(lv_timer_t *t) {
+    lv_timer_delete(t);
+    s_dim_snap_busy = true;
+
+    ao_drift_apply(0, 0);
+    lv_refr_now(NULL);
+    ESP_LOGW(TAG, "dimsnap: frame A (drift 0,0), dimmed=%d", (int)s_ao_dimmed);
+    snap_stream(snap_take(lv_screen_active(), LV_COLOR_FORMAT_RGB565, "driftA"),
+                "driftA");
+
+    /* Now the state nobody has ever seen: driven straight rather than waited
+     * for, because always-on may be off and the dim is otherwise unreachable
+     * without a finger. ao_dim_set() advances its own fade one step per call,
+     * so this pumps it until the blackout lands. */
+    int64_t t0 = now_ms();
+    while (!s_ao_wall_hidden && now_ms() - t0 < 10000) {
+        ao_dim_set(true);
+        vTaskDelay(pdMS_TO_TICKS(40));
+    }
+    ESP_LOGW(TAG, "dimsnap: frame B (dimmed=%d wall_hidden=%d)",
+             (int)s_ao_dimmed, (int)s_ao_wall_hidden);
+    lv_refr_now(NULL);
+    snap_stream(snap_take(lv_screen_active(), LV_COLOR_FORMAT_RGB565, "dimmed"),
+                "dimmed");
+    ao_dim_set(false);
+
+    ao_drift_apply(0, 0);
+    lv_refr_now(NULL);
+    s_dim_snap_busy = false;
+    ESP_LOGW(TAG, "dimsnap: done");
+}
+#endif
+
 #if CFG_SNAP_CHORD
 /* Capture handler for both chords. The screen snapshot alone NEVER contains
  * the bezel lobes — they live on lv_layer_top() — so the plain shot is clean
@@ -13454,6 +13514,12 @@ void app_main(void) {
          * cold boot without touching anything. */
         app_open(APP_LOCK);
         log_mem("ui-built");
+#if CFG_DIM_SNAP
+        /* 40 s: past boot settle and past the 10 s dim delay, so both frames
+         * are of a genuinely dimmed lock screen — wallpaper hidden, clock
+         * amber — which is the state the drift actually runs in. */
+        lv_timer_create(dim_snap_cb, 40000, NULL);
+#endif
 
 
     }
@@ -13760,6 +13826,9 @@ void app_main(void) {
              * Runs before pomo_poll() and before the s_req_bright_apply write
              * further down this loop, so a touch restores in the same pass that
              * observed it rather than one pass later. */
+#if CFG_DIM_SNAP
+            if (!s_dim_snap_busy)
+#endif
             ao_dim_set(s_ao_dim_on && s_always_on && s_screen_on &&
                        s_app != APP_POMO &&
                        idle > (int64_t)s_ao_dim_s * 1000);

@@ -1345,6 +1345,16 @@ parked fork's intent, if anyone retries with the chip's datasheet in hand:
     had already been written about, not by testing. When a visual effect is
     small enough that you cannot tell success from nothing, the source is the
     instrument, not the glass.
+    **Verified on hardware afterwards, and the method generalises to any
+    "did that styling call do anything?" question.** `CFG_DIM_SNAP` streams two
+    framebuffer snapshots of the same screen in the same clock minute, differing
+    only by an exaggerated 8 px drift, with the main loop's dim frozen so nothing
+    else can move between them. A 2-D correlation over the pair peaks
+    unambiguously at **dx=+8, dy=-8** — the sign of dy inverted because a BMP with
+    positive height is stored bottom-up — with clean falloff to its neighbours.
+    A snapshot captures what LVGL *rendered*, so panel brightness never enters
+    into it and a 12% screen photographs identically to a lit one. That is what
+    makes this the right instrument for anything invisible to an eye.
 
 ## 11. Debugging method that worked
 
