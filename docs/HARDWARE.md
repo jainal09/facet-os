@@ -530,13 +530,34 @@ are rebound to volume.
   at `0xA4`; battery voltage at `0x34`/`0x35` as `((hi & 0x1F) << 8) | lo` mV.
   Battery-present is `0x00` bit 3; charging is `0x01` bits[6:5] == 01.
 - Voltage is a good sanity check and fallback: 3.30 V ≈ 0%, 4.20 V ≈ 100%.
+  **Subtract the IR drop before using it while charging.** Terminal voltage is
+  not open-circuit voltage, and at this board's 400 mA charge target the gap
+  measured **90 mV** — ten points on that 900 mV scale. Uncompensated, the
+  reading jumped ten points every time the cable moved and looked random from
+  the glass while being a faithful report of a voltage that genuinely changed.
 - **The gauge at `0xA4` latches, and it will lie confidently.** It read a flat
   **100% while the ADC said 3964 mV** — nearer 60% — and held that for a five-hour
   soak. It is a coulomb counter: it only re-learns across a full charge and
   discharge, so on a device that lives on a charger it can stay wrong indefinitely.
-  **No library fixes this.** `XPowersLib` is the de-facto AXP2101 driver and its
-  `getBatteryPercent()` reads this same register; the chip *is* the fuel gauge, and
-  the calibration lives in silicon. Cross-check it against the ADC instead:
+  **No library fixes this, but the CHIP does — reg `0x17` bit 3 resets the
+  gauge, and this firmware went its whole life never writing it.** That was the
+  expensive half of the mistake: "no library fixes this" was true and was read as
+  "nothing fixes this", so a latched gauge stayed latched forever and the voltage
+  cross-check below quietly became the permanent reading instead of a fallback.
+  Datasheet §7.11: the gauge is an **Rdc + OCV + coulomb-counter engine with its
+  own calibration module**, `0x17` bit 3 is `reset_guage` (bit 2 is
+  `reset_lgc_gauge`, "reset the gauge besides registers"), and firmware is
+  additionally *expected* to write per-design cell calibration into **`REGA1` on
+  each boot** — which this firmware also does not do.
+  Verified on hardware: a gauge reading a flat 100% at 3792 mV was reset once
+  and came back reporting **53%**, stable, close enough to the ADC estimate that
+  the cross-check stopped overriding it at all. Issue the reset **once per boot
+  and only after the reading has been contradicted** — it discards the learned
+  capacity and Rdc, so resetting on a timer would keep destroying what the chip
+  is trying to learn.
+  `XPowersLib` is the de-facto driver and its `getBatteryPercent()` reads the
+  same `0xA4`, so it inherits the same stale answer; the fix is the reset, not a
+  different driver. Cross-check against the ADC as well:
   a disagreement over ~25 points, **or** a claim of ≥95% while measuring under
   4.10 V — a cell at full charge does not read below that even while charging,
   when terminal voltage is at its most flattering, so that pairing is a

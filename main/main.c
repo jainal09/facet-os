@@ -113,7 +113,17 @@ static const char *TAG = "funnel";
 #define AXP_REG_CHG_ICC       0x62      /* bits[4:0]: constant-current charge step */
 #define AXP_REG_CHG_CV        0x64      /* bits[2:0]: charge target (CV) voltage */
 #define AXP_REG_BAT_DET_CTRL  0x68      /* bit0: battery detection enable */
+#define AXP_REG_GAUGE_RESET   0x17      /* bit3: reset the fuel gauge (RWAC) */
 #define AXP_REG_BAT_PERCENT   0xA4
+
+/* Terminal voltage is not open-circuit voltage, and the gap is this cell's
+ * internal resistance times the charge current. MEASURED on this board rather
+ * than assumed: at a 400 mA charge target, unplugging dropped the reading from
+ * 3768 mV to ~3678 mV at the same state of charge — 90 mV, or ten points on the
+ * 900 mV scale, which is exactly the jump that made the percentage look random
+ * every time the cable moved. Subtracting it while charging is what makes the
+ * voltage fallback stop lying about a cell that has not changed. */
+#define BATT_IR_CHG_MV        90
 #define AXP_PKEY_SHORT_BIT    3
 /* PWRKEY is not short-press-only. The PMU distinguishes four states, and the
  * two edge IRQs give the middle key a real press-down and release — they are
@@ -2073,6 +2083,21 @@ static volatile bool s_chg_eta_on;
 #define CHG_FAST_MS_PP  (150 * 1000)   /* at or under this per point: keeping up */
 #define CHG_SLOW_MS_PP  (240 * 1000)   /* at or over this: the supply is the limit */
 
+/* The latch may not fire until the smoothed rate has actually been smoothed.
+ * It used to classify on the FIRST interval it learned, where the 3:1 EWMA has
+ * nothing to average against and simply takes that one sample whole — and the
+ * first interval of a session is the least trustworthy one there is. Measured:
+ * "charger looks FAST — 12 s/point" on a supply whose real rate, from the same
+ * capture, was 30-75 s/point. The gauge steps twice in quick succession as it
+ * catches up to a voltage the cell already reached, that 12 s clears the 10 s
+ * floor meant only to reject gauge jumps, and the one-shot latch fires on it.
+ *
+ * The bias is one-directional and that is what made it dangerous: a catch-up
+ * burst can only make a charger look FASTER than it is, so the classifier would
+ * have reported FAST for a weak supply and the error would have looked like a
+ * pass. Five samples leaves the first contributing ~32% of the EWMA. */
+#define CHG_SPEED_MIN_STEPS 5
+
 static volatile int  s_chg_speed;   /* 0 unknown, 1 fast, -1 slow */
 static volatile bool s_chg_ilim;    /* PMU is input-current-limited (reg 0x00 b0) */
 
@@ -2134,15 +2159,16 @@ static void chg_eta_track(void) {
              * it needs corroborating on a genuinely weak charger before
              * anything depends on it. This line is how that gets collected. */
             int cv = chg_cv_mv(chg_cv_code());
-            if (!s_chg_speed && cv && s_batt_mv > 0 && s_batt_mv < cv - 60) {
+            if (!s_chg_speed && s_chg_eta_steps >= CHG_SPEED_MIN_STEPS &&
+                cv && s_batt_mv > 0 && s_batt_mv < cv - 60) {
                 if (s_chg_eta_ms_pp <= CHG_FAST_MS_PP)      s_chg_speed = 1;
                 else if (s_chg_eta_ms_pp >= CHG_SLOW_MS_PP) s_chg_speed = -1;
                 if (s_chg_speed) {
                     ESP_LOGI(TAG, "charger looks %s — %d s/point at %d mV "
-                                  "(CV %d mV, ILIM=%d)",
+                                  "(CV %d mV, ILIM=%d, %d samples)",
                              s_chg_speed > 0 ? "FAST" : "SLOW",
                              s_chg_eta_ms_pp / 1000, s_batt_mv, cv,
-                             s_chg_ilim ? 1 : 0);
+                             s_chg_ilim ? 1 : 0, s_chg_eta_steps);
                 }
             }
         }
@@ -2301,8 +2327,9 @@ static void battery_poll(void) {
     }
     /* Voltage first, because it is the number that can be checked. 3.30 V ~ 0%,
      * 4.20 V ~ 100%. */
+    int ocv = s_batt_mv - (s_batt_charging ? BATT_IR_CHG_MV : 0);
     int vpct = (s_batt_mv > 2500)
-             ? clampi((s_batt_mv - 3300) * 100 / 900, 0, 100) : -1;
+             ? clampi((ocv - 3300) * 100 / 900, 0, 100) : -1;
 
     if (axp_read(AXP_REG_BAT_PERCENT, &pct) == ESP_OK && pct > 0 && pct <= 100) {
         s_batt_pct = pct;
@@ -2334,6 +2361,32 @@ static void battery_poll(void) {
                               "using voltage", pct, s_batt_mv, vpct);
             }
             s_batt_pct = vpct;
+
+            /* Ask the chip to fix itself before working around it. The gauge is
+             * an OCV + coulomb-counter engine with its own calibration module
+             * (datasheet 7.11), and reg 0x17 bit 3 exists precisely to reset a
+             * counter that has drifted — which is what "100% at 3719 mV" is.
+             * Nothing in this firmware had ever written it, so a latched gauge
+             * stayed latched for the life of the board and the voltage fallback
+             * became permanent rather than transitional.
+             *
+             * ONCE per boot, and only after the reading has been contradicted:
+             * a reset discards the learned capacity and Rdc, so doing it on a
+             * timer would keep destroying the thing the chip is trying to
+             * learn. 60 s of uptime first, because the ADC and the gauge both
+             * need to settle before their disagreement means anything. */
+            static bool gauge_reset_done;
+            if (!gauge_reset_done && now_ms() > 60000) {
+                gauge_reset_done = true;
+                uint8_t r = 0;
+                if (axp_read(AXP_REG_GAUGE_RESET, &r) == ESP_OK &&
+                    axp_write(AXP_REG_GAUGE_RESET, (uint8_t)(r | (1u << 3))) == ESP_OK) {
+                    ESP_LOGW(TAG, "fuel gauge reset issued (0x17 b3) — "
+                                  "was %d%% at %d mV", pct, s_batt_mv);
+                } else {
+                    ESP_LOGW(TAG, "fuel gauge reset FAILED to write 0x17");
+                }
+            }
         }
     } else if (vpct >= 0) {
         s_batt_pct = vpct;
