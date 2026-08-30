@@ -1155,10 +1155,20 @@ mechanism is the card's translucent backgrounds compositing over the screen's
 own black rather than over the wallpaper. Seen once and not yet reduced; the
 shots are the evidence to start from.
 
-**None of this is measured.** The saving is argued from how the panel works, not
-from evidence, and HARDWARE.md §7b is deliberately untouched because it opens
-"All measured on hardware". The number that would settle it is mV/hour from
-`pwrlog3.csv`: one hour always-on dimmed against one hour always-on bright.
+**Measured, and it does not save power.** A 13.7-hour A/B soak on battery
+alternating 30-minute dimmed and bright phases put the dim at 49.4 mV/h against
+51.5 mV/h bright — a paired saving of +2.8 mV/h with a 95% interval of -3.5 to
++9.1, on a ~50 mV/h baseline, with 13 of 25 pairs favouring the dim against 12.5
+by chance. Indistinguishable from noise. The numbers and the reasoning are in
+[HARDWARE.md §7b](HARDWARE.md#7b-power-management-and-idle-drain).
+
+The AMOLED argument above is not wrong — those pixels really are off — but the
+conclusion drawn from it was. "The panel gets cheaper" is not "the system gets
+cheaper", and with Wi-Fi associated and the CPU at 240 MHz the panel was never
+the dominant load. **So the honest justification for this feature is the other
+two: burn-in, and not having a lit panel in your face at night.** Both stand on
+their own. The battery claim does not, and should not be made again without a
+soak with the radio down.
 
 
 

@@ -6081,6 +6081,26 @@ static int       s_cfg_slider_n;
  * it runs so nothing else can move between them. Keep 0 in commits — same
  * contract as CFG_PERF_SCROLL_SELFTEST. */
 #define CFG_DIM_SNAP 0
+
+/* A/B soak: does the desk-clock dim actually save power? Nothing in this
+ * firmware has ever measured that — the feature is argued from how an AMOLED
+ * works, which is why HARDWARE.md §7b, whose first line is "All measured on
+ * hardware", says nothing about it.
+ *
+ * The cube has to be ON BATTERY for the question to exist at all: on USB with a
+ * full cell the PMU has opened BATFET and the board runs from VBUS with the
+ * battery disconnected, so there is no drain to measure and no software can
+ * create one (§7: BATFET cannot be commanded, there is no ship mode).
+ *
+ * So: pin brightness, force always-on so the panel never sleeps, and flip the
+ * dim every AB_PHASE_MIN minutes, marking each flip in the existing power log.
+ * Alternating twice rather than once because a single dim-then-bright pair
+ * confounds the dim with everything that drifts over an hour — cell voltage
+ * curve, Wi-Fi traffic, whether the now-playing card is up. Two paired phases
+ * let the comparison survive that. Keep 0 in commits. */
+#define CFG_DIM_AB 0
+#define AB_PHASE_MIN 30
+#define AB_BRIGHT    60   /* fixed, so both halves start from the same level */
 #if CFG_DIM_SNAP
 /* Declared HERE, under the flag, not beside the drift state it guards: that
  * state lives thousands of lines above this #define, where CFG_DIM_SNAP is
@@ -13514,6 +13534,24 @@ void app_main(void) {
          * cold boot without touching anything. */
         app_open(APP_LOCK);
         log_mem("ui-built");
+#if CFG_DIM_AB
+        /* Pinned, not merely preferred: always-on so the panel never sleeps or
+         * auto-locks out from under the soak, and one fixed brightness so the
+         * two phases start from the same level. Assigned rather than saved, so
+         * the user's own setting comes back on the next ordinary boot. */
+        s_always_on = true;
+        s_ao_dim_on = true;
+        /* The DELAY has to be pinned too, and forgetting it nearly cost a
+         * two-hour run: it is a saved preference, so whatever the CONTROL
+         * slider was last left on decides how much of each phase is actually
+         * dimmed. At the 10-minute stop, a 30-minute "dimmed" phase spends a
+         * third of itself bright and the comparison measures almost nothing. */
+        s_ao_dim_s = 30;
+        s_bright = AB_BRIGHT;
+        bright_apply(s_bright);
+        ESP_LOGW(TAG, "dim A/B: armed, %d min per phase, bright=%d%%",
+                 AB_PHASE_MIN, AB_BRIGHT);
+#endif
 #if CFG_DIM_SNAP
         /* 40 s: past boot settle and past the 10 s dim delay, so both frames
          * are of a genuinely dimmed lock screen — wallpaper hidden, clock
@@ -13826,6 +13864,47 @@ void app_main(void) {
              * Runs before pomo_poll() and before the s_req_bright_apply write
              * further down this loop, so a touch restores in the same pass that
              * observed it rather than one pass later. */
+#if CFG_DIM_AB
+            /* On the main loop, not an lv_timer: telemetry_row() writes FATFS,
+             * and SD writes belong to this task. Phase boundaries go into the
+             * existing power log as events, so segmenting the run afterwards is
+             * a grep rather than a guess at where an hour started. */
+            {
+                static int64_t ab_at;
+                static int ab_phase;
+                /* Re-asserted every pass, not set once at boot. The boot
+                 * assignment was silently undone: the saved lock prefs load
+                 * AFTER app_main's arming block, so s_ao_dim_s came back as the
+                 * user's 600 s and a "dimmed" phase would have spent all 30
+                 * minutes bright. The gate log is what named it — five inputs,
+                 * one wrong, indistinguishable from the status line.
+                 * s_ao_dim_on is deliberately NOT re-asserted: it is the
+                 * variable the experiment flips. */
+                s_always_on = true;
+                s_ao_dim_s  = 30;
+                if (!ab_at) { ab_at = t; telemetry_row("ab-dim-on"); }
+                /* Name every term of the gate rather than reasoning about which
+                 * one is false. The dim not engaging looks identical from the
+                 * status line whichever input is wrong, and there are five. */
+                static int64_t ab_dbg;
+                if (t - ab_dbg > 15000) {
+                    ab_dbg = t;
+                    ESP_LOGW(TAG, "A/B gate: dim_on=%d always=%d scr_on=%d "
+                                  "app=%d idle=%lld delay=%d dimmed=%d",
+                             (int)s_ao_dim_on, (int)s_always_on,
+                             (int)s_screen_on, (int)s_app,
+                             (long long)idle, s_ao_dim_s, (int)s_ao_dimmed);
+                }
+                if (t - ab_at >= (int64_t)AB_PHASE_MIN * 60 * 1000) {
+                    ab_at = t;
+                    s_ao_dim_on = !s_ao_dim_on;
+                    ab_phase++;
+                    telemetry_row(s_ao_dim_on ? "ab-dim-on" : "ab-dim-off");
+                    ESP_LOGW(TAG, "dim A/B: phase %d -> dim %s", ab_phase,
+                             s_ao_dim_on ? "ON" : "OFF");
+                }
+            }
+#endif
 #if CFG_DIM_SNAP
             if (!s_dim_snap_busy)
 #endif

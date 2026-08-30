@@ -562,6 +562,31 @@ measured on hardware:
   graduated dimming; use `esp_lcd_panel_disp_on_off()` when you actually want the
   panel to stop scanning. `backlight_on`/`backlight_off` are just
   `brightness_set(100)` and `(0)`.
+- **The desk-clock dim saves no measurable power, and this is the measurement.**
+  A 13.7-hour A/B soak on battery (`CFG_DIM_AB`), alternating 30-minute phases
+  between dimmed (panel 7%, wallpaper hidden) and bright (panel 60%), lock
+  screen, always-on, untouched, 4187 mV -> 3638 mV:
+
+  | | n | mean drain |
+  |---|---|---|
+  | dimmed | 13 | **49.4 mV/h** |
+  | bright | 13 | **51.5 mV/h** |
+
+  Pairing each phase with its neighbour so the discharge curve's own shape
+  cancels: mean saving **+2.8 mV/h, 95% CI -3.5 to +9.1** against a ~50 mV/h
+  baseline — 6%, with an interval spanning zero. 13 of 25 pairs favoured the
+  dim, against 12.5 expected by chance. **The effect is indistinguishable from
+  noise.** The upper bound does not exclude a ~18% saving, but nothing dramatic
+  survives, and the point estimate is a coin flip.
+  Why, in terms of the list above: with Wi-Fi associated and the CPU at
+  240 MHz, panel emission is simply not the dominant load on this board. Taking
+  0x51 from 60 to 7 and blanking 230,400 wallpaper pixels changes something too
+  small to find under a 16 mV/h standard deviation. **The AMOLED argument was
+  sound and the conclusion drawn from it was not** — "black pixels are off"
+  says the panel gets cheaper, not that the system does. Dim for glare or for
+  burn-in; do not sell it as battery life without re-measuring with the radio
+  down.
+
 - **Stop LVGL redrawing what nobody can see.** A once-per-second clock label was
   causing a full render + QSPI flush every second with the screen dark. Guard
   periodic UI timers on the screen-power flag.
