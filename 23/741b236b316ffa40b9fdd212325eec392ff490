@@ -1,0 +1,19 @@
+main/main.c
+  s_55600c771b083f::t_782c2c26c3b204 105,2165-2167
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "23741b236b316ffa40b9fdd212325eec392ff490",
+  "prompts": {},
+  "sessions": {
+    "s_55600c771b083f": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "cc48e402-10a8-412e-bea2-7732ca7db3ad",
+        "model": "claude-opus-5"
+      },
+      "human_author": "Jainal Gosaliya <jainal09gosalia@gmail.com>"
+    }
+  }
+}
