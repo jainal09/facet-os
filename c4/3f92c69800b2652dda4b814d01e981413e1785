@@ -1,0 +1,28 @@
+docs/ARCHITECTURE.md
+  s_55600c771b083f::t_04babc043d97f3 1158-1171
+docs/HARDWARE.md
+  s_55600c771b083f::t_04babc043d97f3 565-589
+main/main.c
+  s_55600c771b083f::t_8490635b394550 13544-13549
+  s_55600c771b083f::t_b1a5ef0e933717 13875-13884
+  s_55600c771b083f::t_3e36a7fb46bc70 6084-6100,6102-6103
+  s_55600c771b083f::t_cf84ace06cf348 13537-13543,13550-13554,13867-13874,13885,13898-13907
+  s_55600c771b083f::t_9cb65c84a557e2 13886-13897
+  s_55600c771b083f::t_00b9a252bbcbd6 6101
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "c43f92c69800b2652dda4b814d01e981413e1785",
+  "prompts": {},
+  "sessions": {
+    "s_55600c771b083f": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "cc48e402-10a8-412e-bea2-7732ca7db3ad",
+        "model": "claude-opus-5"
+      },
+      "human_author": "Jainal Gosaliya <jainal09gosalia@gmail.com>"
+    }
+  }
+}
